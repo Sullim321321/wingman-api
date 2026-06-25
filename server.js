@@ -63,9 +63,18 @@ async function bootstrapDB() {
         email TEXT UNIQUE NOT NULL,
         push_token TEXT,
         preferences JSONB DEFAULT '{}',
+        subscription_tier TEXT DEFAULT 'free',
+        subscription_status TEXT DEFAULT 'inactive',
+        stripe_customer_id TEXT,
+        stripe_subscription_id TEXT,
         created_at TIMESTAMPTZ DEFAULT NOW()
       )
     `;
+    // Add subscription columns to existing users tables (idempotent)
+    await sql`ALTER TABLE users ADD COLUMN IF NOT EXISTS subscription_tier TEXT DEFAULT 'free'`;
+    await sql`ALTER TABLE users ADD COLUMN IF NOT EXISTS subscription_status TEXT DEFAULT 'inactive'`;
+    await sql`ALTER TABLE users ADD COLUMN IF NOT EXISTS stripe_customer_id TEXT`;
+    await sql`ALTER TABLE users ADD COLUMN IF NOT EXISTS stripe_subscription_id TEXT`;
     await sql`
       CREATE TABLE IF NOT EXISTS refresh_tokens (
         id SERIAL PRIMARY KEY,
@@ -1155,7 +1164,7 @@ async function pollDisruptions() {
     const legs = await sql`
       SELECT tl.id, tl.trip_id, tl.carrier, tl.flight_number, tl.origin, tl.destination,
              tl.departs_at, tl.status as prev_status,
-             t.user_email, t.title as trip_title
+             t.user_email, t.title as trip_title, t.mode as trip_mode
       FROM trip_legs tl
       JOIN trips t ON t.id = tl.trip_id
       WHERE tl.type = 'flight'
@@ -1218,6 +1227,10 @@ async function pollDisruptions() {
         activityTitle = `${ident} landed`;
         activityBody = `Your ${leg.origin} → ${leg.destination} flight has landed.`;
         activityType = "landed";
+        pushTitle = `🛬 ${ident} Landed`;
+        pushBody = `You've landed at ${leg.destination}. Wingman is arranging your ride.`;
+        // Auto-dispatch Uber based on trip mode
+        dispatchUberOnLanding(leg).catch(e => console.error("[uber-dispatch]", e.message));
       } else {
         activityTitle = `${ident} status: ${newStatus}`;
         activityBody = `${leg.origin} → ${leg.destination}`;
@@ -1246,6 +1259,373 @@ async function pollDisruptions() {
     console.log("[poll] done");
   } catch (e) {
     console.error("[poll] error:", e.message);
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Uber for Business — auto-dispatch on landing
+// ---------------------------------------------------------------------------
+// Uber product IDs by mode and region (fallback to uberx if not found)
+const UBER_PRODUCTS = {
+  client: {
+    default: "d4abaae7-f4d6-4152-91cc-77523e8165a6", // UberBlack
+    JFK: "d4abaae7-f4d6-4152-91cc-77523e8165a6",
+    LAX: "d4abaae7-f4d6-4152-91cc-77523e8165a6",
+    LHR: "d4abaae7-f4d6-4152-91cc-77523e8165a6",
+    CDG: "d4abaae7-f4d6-4152-91cc-77523e8165a6",
+  },
+  partner: {
+    default: "d4abaae7-f4d6-4152-91cc-77523e8165a6", // UberBlack
+  },
+  solo: {
+    default: "a1111c8c-c720-46c3-8534-2fcdd730040d", // UberX
+  },
+};
+
+// Airport IATA → approximate GPS coordinates for pickup
+const AIRPORT_COORDS = {
+  JFK: { lat: 40.6413, lng: -73.7781 }, EWR: { lat: 40.6895, lng: -74.1745 },
+  LGA: { lat: 40.7769, lng: -73.8740 }, LAX: { lat: 33.9425, lng: -118.4081 },
+  SFO: { lat: 37.6213, lng: -122.3790 }, ORD: { lat: 41.9742, lng: -87.9073 },
+  ATL: { lat: 33.6407, lng: -84.4277 }, DFW: { lat: 32.8998, lng: -97.0403 },
+  MIA: { lat: 25.7959, lng: -80.2870 }, BOS: { lat: 42.3656, lng: -71.0096 },
+  SEA: { lat: 47.4502, lng: -122.3088 }, DEN: { lat: 39.8561, lng: -104.6737 },
+  LHR: { lat: 51.4700, lng: -0.4543 }, CDG: { lat: 49.0097, lng: 2.5479 },
+  AMS: { lat: 52.3105, lng: 4.7683 }, FRA: { lat: 50.0379, lng: 8.5622 },
+  NRT: { lat: 35.7720, lng: 140.3929 }, HND: { lat: 35.5494, lng: 139.7798 },
+  SIN: { lat: 1.3644, lng: 103.9915 }, DXB: { lat: 25.2532, lng: 55.3657 },
+  SYD: { lat: -33.9399, lng: 151.1753 }, GRU: { lat: -23.4356, lng: -46.4731 },
+};
+
+async function dispatchUberOnLanding(leg) {
+  const apiKey = process.env.UBER_SERVER_TOKEN;
+  if (!apiKey) {
+    console.log("[uber] UBER_SERVER_TOKEN not set — skipping dispatch");
+    return;
+  }
+  const mode = (leg.trip_mode || "solo").toLowerCase();
+  const airport = leg.destination; // IATA code
+  const coords = AIRPORT_COORDS[airport];
+  if (!coords) {
+    console.log(`[uber] no coords for airport ${airport} — skipping dispatch`);
+    return;
+  }
+  // Fetch user's home/destination address from preferences
+  const userRows = await sql`SELECT preferences, push_token FROM users WHERE email = ${leg.user_email}`;
+  const prefs = userRows[0]?.preferences || {};
+  const dropoffAddr = prefs.home_address || null;
+  const pushToken = userRows[0]?.push_token || null;
+  // Determine product
+  const productMap = UBER_PRODUCTS[mode] || UBER_PRODUCTS.solo;
+  const productId = productMap[airport] || productMap.default;
+  // Build ride request
+  const ridePayload = {
+    fare_id: null, // will be set after price estimate
+    product_id: productId,
+    start_latitude: coords.lat,
+    start_longitude: coords.lng,
+    start_address: `${airport} Airport`,
+    end_address: dropoffAddr || "Home",
+    rider_email: leg.user_email,
+    rider_name: leg.user_email.split("@")[0],
+    rider_phone: prefs.phone || null,
+    payment_method_id: process.env.UBER_PAYMENT_METHOD_ID || null,
+    note_for_driver: mode === "client" ? "Business trip — please have water available" : "",
+  };
+  // Step 1: Get price estimate
+  let fareId = null;
+  try {
+    const estimateResp = await fetch(
+      `https://api.uber.com/v1.2/requests/estimate`,
+      {
+        method: "POST",
+        headers: {
+          "Authorization": `Token ${apiKey}`,
+          "Content-Type": "application/json",
+          "Accept-Language": "en_US",
+        },
+        body: JSON.stringify({
+          product_id: productId,
+          start_latitude: coords.lat,
+          start_longitude: coords.lng,
+          end_address: dropoffAddr || undefined,
+        }),
+      }
+    );
+    const estimateData = await estimateResp.json();
+    fareId = estimateData.fare?.fare_id || null;
+    const eta = estimateData.pickup_estimate || "unknown";
+    const price = estimateData.fare?.display || estimateData.price?.estimate || "unknown";
+    // Log estimate to activity — user can confirm or cancel
+    await logActivity(
+      leg.user_email, "uber",
+      `Ride ready at ${airport}`,
+      `${mode === "client" || mode === "partner" ? "UberBlack" : "UberX"} is ${eta} min away. Estimated fare: ${price}. Tap to confirm or cancel.`,
+      leg.trip_id, leg.id,
+      { airport, mode, productId, fareId, eta, price, status: "pending_confirmation" }
+    );
+    // Send push notification with deep link to confirm
+    if (pushToken) {
+      await sendPushToUser(
+        leg.user_email,
+        `🚗 Ride ready at ${airport}`,
+        `${mode === "client" || mode === "partner" ? "UberBlack" : "UberX"} is ${eta} min away · ${price}. Tap to confirm.`,
+        { route: "UberConfirm", legId: leg.id, fareId, productId, airport, price, eta, mode }
+      );
+    }
+    console.log(`[uber] ride estimate ready for ${leg.user_email} at ${airport}: ${price}, ETA ${eta} min`);
+  } catch (e) {
+    console.error("[uber] estimate error:", e.message);
+    // Fallback: just notify user to open Uber
+    await logActivity(
+      leg.user_email, "uber",
+      `Open Uber at ${airport}`,
+      `You've landed at ${airport}. Wingman couldn't auto-dispatch — tap to open Uber.`,
+      leg.trip_id, leg.id,
+      { airport, mode, status: "fallback" }
+    );
+  }
+}
+
+// POST /uber/confirm — user confirms the ride from the push notification
+app.post("/uber/confirm", async (req, res) => {
+  try {
+    const authHeader = req.headers.authorization || "";
+    const token = authHeader.replace("Bearer ", "");
+    const { email } = jwt.verify(token, JWT_SECRET);
+    const { fare_id, product_id, airport } = req.body;
+    const apiKey = process.env.UBER_SERVER_TOKEN;
+    if (!apiKey) return res.status(503).json({ error: "Uber not configured" });
+    const coords = AIRPORT_COORDS[airport];
+    if (!coords) return res.status(400).json({ error: "Unknown airport" });
+    const userRows = await sql`SELECT preferences FROM users WHERE email = ${email}`;
+    const prefs = userRows[0]?.preferences || {};
+    const mode = prefs.default_mode || "solo";
+    const resp = await fetch("https://api.uber.com/v1.2/requests", {
+      method: "POST",
+      headers: {
+        "Authorization": `Token ${apiKey}`,
+        "Content-Type": "application/json",
+      },
+      body: JSON.stringify({
+        fare_id,
+        product_id,
+        start_latitude: coords.lat,
+        start_longitude: coords.lng,
+        start_address: `${airport} Airport`,
+        end_address: prefs.home_address || "Home",
+        rider_email: email,
+        payment_method_id: process.env.UBER_PAYMENT_METHOD_ID || undefined,
+        note_for_driver: mode === "client" ? "Business trip — please have water available" : "",
+      }),
+    });
+    const data = await resp.json();
+    if (data.errors || data.error) {
+      return res.status(400).json({ error: data.errors?.[0]?.message || data.error });
+    }
+    await logActivity(
+      email, "uber",
+      `Ride confirmed at ${airport}`,
+      `Your ${mode === "client" || mode === "partner" ? "UberBlack" : "UberX"} has been requested. Driver will be at arrivals shortly.`,
+      null, null,
+      { airport, rideId: data.request_id, status: "confirmed" }
+    );
+    res.json({ ok: true, ride: data });
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
+// GET /uber/estimate — manual ride estimate from the app
+app.get("/uber/estimate", async (req, res) => {
+  try {
+    const authHeader = req.headers.authorization || "";
+    const token = authHeader.replace("Bearer ", "");
+    const { email } = jwt.verify(token, JWT_SECRET);
+    const { airport, mode } = req.query;
+    const apiKey = process.env.UBER_SERVER_TOKEN;
+    if (!apiKey) return res.status(503).json({ error: "Uber not configured" });
+    const coords = AIRPORT_COORDS[airport];
+    if (!coords) return res.status(400).json({ error: "Unknown airport" });
+    const productMap = UBER_PRODUCTS[mode?.toLowerCase() || "solo"] || UBER_PRODUCTS.solo;
+    const productId = productMap[airport] || productMap.default;
+    const userRows = await sql`SELECT preferences FROM users WHERE email = ${email}`;
+    const prefs = userRows[0]?.preferences || {};
+    const resp = await fetch("https://api.uber.com/v1.2/requests/estimate", {
+      method: "POST",
+      headers: {
+        "Authorization": `Token ${apiKey}`,
+        "Content-Type": "application/json",
+      },
+      body: JSON.stringify({
+        product_id: productId,
+        start_latitude: coords.lat,
+        start_longitude: coords.lng,
+        end_address: prefs.home_address || undefined,
+      }),
+    });
+    const data = await resp.json();
+    res.json({
+      eta: data.pickup_estimate,
+      price: data.fare?.display || data.price?.estimate,
+      fare_id: data.fare?.fare_id,
+      product_id: productId,
+      mode,
+    });
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
+// ---------------------------------------------------------------------------
+// Apple Wallet — PassKit .pkpass generation
+// ---------------------------------------------------------------------------
+const { PKPass } = require("passkit-generator");
+const fs = require("fs");
+const os = require("os");
+
+// GET /wallet/pass/:legId — generate a .pkpass for a flight or hotel leg
+app.get("/wallet/pass/:legId", async (req, res) => {
+  try {
+    const authHeader = req.headers.authorization || "";
+    const token = authHeader.replace("Bearer ", "");
+    const { email } = jwt.verify(token, JWT_SECRET);
+    const { legId } = req.params;
+    // Fetch leg + trip
+    const rows = await sql`
+      SELECT tl.*, t.title as trip_title, t.mode as trip_mode
+      FROM trip_legs tl
+      JOIN trips t ON t.id = tl.trip_id
+      WHERE tl.id = ${legId} AND t.user_email = ${email}
+    `;
+    if (!rows.length) return res.status(404).json({ error: "Leg not found" });
+    const leg = rows[0];
+    // Check if Apple Wallet certs are configured
+    const certPem = process.env.APPLE_WALLET_CERT_PEM;
+    const keyPem = process.env.APPLE_WALLET_KEY_PEM;
+    const wwdrPem = process.env.APPLE_WALLET_WWDR_PEM;
+    const passTypeId = process.env.APPLE_WALLET_PASS_TYPE_ID || "pass.app.wingmantravel";
+    const teamId = process.env.APPLE_TEAM_ID || "7BXHSR34RG";
+    if (!certPem || !keyPem || !wwdrPem) {
+      // Return a JSON representation of what the pass would contain
+      // so the mobile app can show a preview
+      return res.json({
+        preview: true,
+        type: leg.type,
+        data: buildPassData(leg, email, passTypeId, teamId),
+        message: "Apple Wallet certificates not yet configured. Add APPLE_WALLET_CERT_PEM, APPLE_WALLET_KEY_PEM, and APPLE_WALLET_WWDR_PEM to Render environment.",
+      });
+    }
+    const passData = buildPassData(leg, email, passTypeId, teamId);
+    const pass = new PKPass({}, {
+      wwdr: Buffer.from(wwdrPem),
+      signerCert: Buffer.from(certPem),
+      signerKey: Buffer.from(keyPem),
+    }, passData);
+    // Add Wingman logo (white on dark background)
+    // In production, serve from a CDN; here we use a placeholder
+    const logoPath = path.join(__dirname, "assets", "wallet", "logo.png");
+    if (fs.existsSync(logoPath)) {
+      pass.addBuffer("logo.png", fs.readFileSync(logoPath));
+      pass.addBuffer("logo@2x.png", fs.readFileSync(logoPath));
+      pass.addBuffer("icon.png", fs.readFileSync(logoPath));
+      pass.addBuffer("icon@2x.png", fs.readFileSync(logoPath));
+    }
+    const pkpassBuffer = await pass.getAsBuffer();
+    res.set({
+      "Content-Type": "application/vnd.apple.pkpass",
+      "Content-Disposition": `attachment; filename="wingman-${leg.type}-${leg.id}.pkpass"`,
+    });
+    res.send(pkpassBuffer);
+  } catch (e) {
+    console.error("[wallet]", e.message);
+    res.status(500).json({ error: e.message });
+  }
+});
+
+function buildPassData(leg, email, passTypeId, teamId) {
+  const serial = `wingman-${leg.type}-${leg.id}`;
+  const base = {
+    formatVersion: 1,
+    passTypeIdentifier: passTypeId,
+    serialNumber: serial,
+    teamIdentifier: teamId,
+    organizationName: "Wingman",
+    description: leg.type === "flight" ? `${leg.carrier || ""}${leg.flight_number || ""} — ${leg.origin} → ${leg.destination}` : `Hotel: ${leg.carrier || leg.destination || "Reservation"}`,
+    foregroundColor: "rgb(255, 255, 255)",
+    backgroundColor: "rgb(15, 23, 42)",
+    labelColor: "rgb(148, 163, 184)",
+    logoText: "Wingman",
+    // Relevance: show on lock screen at departure time and airport location
+    relevantDate: leg.departs_at || undefined,
+    locations: leg.origin && AIRPORT_COORDS[leg.origin] ? [{
+      latitude: AIRPORT_COORDS[leg.origin].lat,
+      longitude: AIRPORT_COORDS[leg.origin].lng,
+      relevantText: leg.type === "flight" ? `Your ${leg.carrier || ""}${leg.flight_number || ""} flight departs soon` : `Check-in at ${leg.carrier || "hotel"}`,
+    }] : [],
+    barcode: {
+      message: leg.confirmation || serial,
+      format: "PKBarcodeFormatQR",
+      messageEncoding: "iso-8859-1",
+      altText: leg.confirmation || "Wingman",
+    },
+  };
+  if (leg.type === "flight") {
+    const depTime = leg.departs_at ? new Date(leg.departs_at).toLocaleTimeString("en-US", { hour: "2-digit", minute: "2-digit", hour12: true }) : "TBD";
+    const arrTime = leg.arrives_at ? new Date(leg.arrives_at).toLocaleTimeString("en-US", { hour: "2-digit", minute: "2-digit", hour12: true }) : "TBD";
+    const depDate = leg.departs_at ? new Date(leg.departs_at).toLocaleDateString("en-US", { weekday: "short", month: "short", day: "numeric" }) : "";
+    return {
+      ...base,
+      boardingPass: {
+        transitType: "PKTransitTypeAir",
+        primaryFields: [
+          { key: "origin", label: "FROM", value: leg.origin || "" },
+          { key: "destination", label: "TO", value: leg.destination || "" },
+        ],
+        headerFields: [
+          { key: "flight", label: "FLIGHT", value: `${leg.carrier || ""}${leg.flight_number || ""}` },
+        ],
+        secondaryFields: [
+          { key: "departs", label: "DEPARTS", value: depTime },
+          { key: "arrives", label: "ARRIVES", value: arrTime },
+          { key: "date", label: "DATE", value: depDate },
+        ],
+        auxiliaryFields: [
+          { key: "status", label: "STATUS", value: leg.status || "Scheduled" },
+          { key: "confirmation", label: "CONFIRMATION", value: leg.confirmation || "" },
+        ],
+        backFields: [
+          { key: "managed_by", label: "MANAGED BY", value: "Wingman" },
+          { key: "user", label: "TRAVELER", value: email },
+          { key: "trip", label: "TRIP", value: leg.trip_title || "" },
+        ],
+      },
+    };
+  } else {
+    // Hotel or generic booking
+    const checkIn = leg.departs_at ? new Date(leg.departs_at).toLocaleDateString("en-US", { weekday: "short", month: "short", day: "numeric" }) : "TBD";
+    const checkOut = leg.arrives_at ? new Date(leg.arrives_at).toLocaleDateString("en-US", { weekday: "short", month: "short", day: "numeric" }) : "TBD";
+    return {
+      ...base,
+      generic: {
+        primaryFields: [
+          { key: "hotel", label: "HOTEL", value: leg.carrier || leg.destination || "Hotel" },
+        ],
+        secondaryFields: [
+          { key: "checkin", label: "CHECK-IN", value: checkIn },
+          { key: "checkout", label: "CHECK-OUT", value: checkOut },
+        ],
+        auxiliaryFields: [
+          { key: "confirmation", label: "CONFIRMATION", value: leg.confirmation || "" },
+          { key: "destination", label: "CITY", value: leg.destination || "" },
+        ],
+        backFields: [
+          { key: "managed_by", label: "MANAGED BY", value: "Wingman" },
+          { key: "user", label: "TRAVELER", value: email },
+          { key: "trip", label: "TRIP", value: leg.trip_title || "" },
+        ],
+      },
+    };
   }
 }
 
@@ -1463,5 +1843,186 @@ setTimeout(() => {
   pollDisruptions();
   setInterval(pollDisruptions, 15 * 60 * 1000);
 }, 30 * 1000);
+
+// ---------------------------------------------------------------------------
+// Stripe — subscriptions + Apple Pay
+// ---------------------------------------------------------------------------
+const Stripe = require("stripe");
+let _stripe = null;
+function getStripe() {
+  if (!_stripe) {
+    if (!process.env.STRIPE_SECRET_KEY) throw new Error("STRIPE_SECRET_KEY not set");
+    _stripe = Stripe(process.env.STRIPE_SECRET_KEY);
+  }
+  return _stripe;
+}
+
+// Subscription tiers
+const PLANS = {
+  pro: {
+    name: "Wingman Pro",
+    price_id: process.env.STRIPE_PRO_PRICE_ID || "price_pro_monthly",
+    amount: 999, // $9.99/month
+    currency: "usd",
+    interval: "month",
+    features: ["Live flight monitoring", "Gmail auto-import", "AI Concierge", "Seat alerts", "Hotel preference emails"],
+  },
+  elite: {
+    name: "Wingman Elite",
+    price_id: process.env.STRIPE_ELITE_PRICE_ID || "price_elite_monthly",
+    amount: 2999, // $29.99/month
+    currency: "usd",
+    interval: "month",
+    features: ["Everything in Pro", "Uber auto-dispatch", "Apple Wallet passes", "Editorial recommendations", "Priority support"],
+  },
+};
+
+// GET /subscription/plans — return available plans
+app.get("/subscription/plans", async (req, res) => {
+  try {
+    const authHeader = req.headers.authorization || "";
+    const token = authHeader.replace("Bearer ", "");
+    const { email } = jwt.verify(token, JWT_SECRET);
+    const userRows = await sql`SELECT subscription_tier, subscription_status FROM users WHERE email = ${email}`;
+    const user = userRows[0] || {};
+    res.json({
+      plans: PLANS,
+      current_tier: user.subscription_tier || "free",
+      current_status: user.subscription_status || "inactive",
+    });
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
+// POST /subscription/create-intent — create a Stripe PaymentIntent for Apple Pay
+app.post("/subscription/create-intent", async (req, res) => {
+  try {
+    const authHeader = req.headers.authorization || "";
+    const token = authHeader.replace("Bearer ", "");
+    const { email } = jwt.verify(token, JWT_SECRET);
+    const { plan } = req.body;
+    const stripe = getStripe();
+    const planData = PLANS[plan];
+    if (!planData) return res.status(400).json({ error: "Unknown plan" });
+    // Get or create Stripe customer
+    let userRows = await sql`SELECT stripe_customer_id FROM users WHERE email = ${email}`;
+    let customerId = userRows[0]?.stripe_customer_id;
+    if (!customerId) {
+      const customer = await stripe.customers.create({ email, metadata: { wingman_email: email } });
+      customerId = customer.id;
+      await sql`UPDATE users SET stripe_customer_id = ${customerId} WHERE email = ${email}`;
+    }
+    // Create a SetupIntent for subscription (so Apple Pay saves the card)
+    const setupIntent = await stripe.setupIntents.create({
+      customer: customerId,
+      payment_method_types: ["card"],
+      usage: "off_session",
+      metadata: { plan, email },
+    });
+    res.json({
+      client_secret: setupIntent.client_secret,
+      customer_id: customerId,
+      plan: planData,
+    });
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
+// POST /subscription/activate — after Apple Pay succeeds, create the subscription
+app.post("/subscription/activate", async (req, res) => {
+  try {
+    const authHeader = req.headers.authorization || "";
+    const token = authHeader.replace("Bearer ", "");
+    const { email } = jwt.verify(token, JWT_SECRET);
+    const { plan, payment_method_id } = req.body;
+    const stripe = getStripe();
+    const planData = PLANS[plan];
+    if (!planData) return res.status(400).json({ error: "Unknown plan" });
+    const userRows = await sql`SELECT stripe_customer_id FROM users WHERE email = ${email}`;
+    const customerId = userRows[0]?.stripe_customer_id;
+    if (!customerId) return res.status(400).json({ error: "No Stripe customer" });
+    // Attach payment method
+    await stripe.paymentMethods.attach(payment_method_id, { customer: customerId });
+    await stripe.customers.update(customerId, { invoice_settings: { default_payment_method: payment_method_id } });
+    // Create subscription
+    const subscription = await stripe.subscriptions.create({
+      customer: customerId,
+      items: [{ price: planData.price_id }],
+      default_payment_method: payment_method_id,
+      metadata: { email, plan },
+    });
+    // Update user in DB
+    await sql`
+      UPDATE users
+      SET subscription_tier = ${plan},
+          subscription_status = 'active',
+          stripe_subscription_id = ${subscription.id}
+      WHERE email = ${email}
+    `;
+    await logActivity(
+      email, "subscription",
+      `Wingman ${planData.name} activated`,
+      `Your ${planData.name} subscription is now active. All features are unlocked.`,
+      null, null,
+      { plan, subscriptionId: subscription.id }
+    );
+    res.json({ ok: true, subscription_id: subscription.id, tier: plan });
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
+// POST /subscription/webhook — Stripe webhook for payment events
+app.post("/subscription/webhook", express.raw({ type: "application/json" }), async (req, res) => {
+  const sig = req.headers["stripe-signature"];
+  const webhookSecret = process.env.STRIPE_WEBHOOK_SECRET;
+  let event;
+  try {
+    if (webhookSecret) {
+      event = getStripe().webhooks.constructEvent(req.body, sig, webhookSecret);
+    } else {
+      event = JSON.parse(req.body.toString());
+    }
+  } catch (e) {
+    return res.status(400).send(`Webhook Error: ${e.message}`);
+  }
+  try {
+    switch (event.type) {
+      case "invoice.payment_succeeded": {
+        const invoice = event.data.object;
+        const email = invoice.customer_email;
+        if (email) {
+          await sql`UPDATE users SET subscription_status = 'active' WHERE email = ${email}`;
+          await logActivity(email, "subscription", "Subscription renewed", `Your Wingman subscription was renewed. Next billing date: ${new Date(invoice.period_end * 1000).toLocaleDateString()}.`);
+        }
+        break;
+      }
+      case "invoice.payment_failed": {
+        const invoice = event.data.object;
+        const email = invoice.customer_email;
+        if (email) {
+          await sql`UPDATE users SET subscription_status = 'past_due' WHERE email = ${email}`;
+          await sendPushToUser(email, "💳 Payment failed", "Your Wingman subscription payment failed. Tap to update your payment method.", { route: "Subscription" });
+        }
+        break;
+      }
+      case "customer.subscription.deleted": {
+        const sub = event.data.object;
+        const rows = await sql`SELECT email FROM users WHERE stripe_subscription_id = ${sub.id}`;
+        if (rows[0]) {
+          await sql`UPDATE users SET subscription_tier = 'free', subscription_status = 'cancelled' WHERE email = ${rows[0].email}`;
+          await logActivity(rows[0].email, "subscription", "Subscription cancelled", "Your Wingman subscription has been cancelled. You can resubscribe at any time.");
+        }
+        break;
+      }
+    }
+    res.json({ received: true });
+  } catch (e) {
+    console.error("[stripe-webhook]", e.message);
+    res.status(500).json({ error: e.message });
+  }
+});
 
 app.listen(PORT, () => console.log("Wingman API on http://localhost:" + PORT));
