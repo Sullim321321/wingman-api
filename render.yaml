@@ -1,0 +1,20 @@
+# One-click-ish deploy of the Wingman API to Render (render.com).
+# 1. Push wingman-api to a GitHub repo.
+# 2. Render dashboard → New → Blueprint → pick the repo. This file does the rest.
+# 3. Copy the service's https URL into wingman-app/src/config.js (API_BASE).
+services:
+  - type: web
+    name: wingman-api
+    runtime: node
+    plan: free
+    buildCommand: npm install
+    startCommand: npm start
+    healthCheckPath: /health
+    envVars:
+      # "beta" (not "production") keeps the dev sign-in code auto-filling, so
+      # TestFlight testers can sign in without an email provider wired up.
+      # Switch to "production" + a real email sender before a public launch.
+      - key: NODE_ENV
+        value: beta
+      - key: JWT_SECRET
+        generateValue: true
