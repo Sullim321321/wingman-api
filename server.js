@@ -13,7 +13,7 @@ const { Redis } = require("@upstash/redis");
 const { neon } = require("@neondatabase/serverless");
 const { Resend } = require("resend");
 const { google } = require("googleapis");
-const OpenAI = require("openai");
+const Anthropic = require("@anthropic-ai/sdk");
 const path = require("path");
 
 const app = express();
@@ -33,7 +33,15 @@ const redis = new Redis({
 });
 const sql = neon(process.env.DATABASE_URL);
 const resend = new Resend(process.env.RESEND_API_KEY);
-const openai = new OpenAI({ apiKey: process.env.OPENAI_API_KEY });
+// Anthropic lazy-loaded so server starts even if key is missing
+let _anthropic = null;
+function getAnthropic() {
+  if (!_anthropic) {
+    if (!process.env.ANTHROPIC_API_KEY) throw new Error("ANTHROPIC_API_KEY not set");
+    _anthropic = new Anthropic({ apiKey: process.env.ANTHROPIC_API_KEY });
+  }
+  return _anthropic;
+}
 
 // Google OAuth2 client
 function makeOAuth2Client() {
@@ -400,16 +408,15 @@ Return this exact JSON structure (null for unknown fields):
   "is_travel_booking": true or false
 }`;
 
-    const completion = await openai.chat.completions.create({
-      model: "gpt-4o-mini",
-      messages: [{ role: "user", content: prompt }],
+    const claudeResp = await getAnthropic().messages.create({
+      model: "claude-haiku-4-5",
       max_tokens: 400,
-      temperature: 0,
+      messages: [{ role: "user", content: prompt }],
     });
 
     let parsed;
     try {
-      const raw = completion.choices[0].message.content.trim();
+      const raw = claudeResp.content[0].text.trim();
       const jsonStr = raw.replace(/^```json\n?/, "").replace(/\n?```$/, "").trim();
       parsed = JSON.parse(jsonStr);
     } catch {
@@ -597,14 +604,17 @@ Be concise, friendly, and proactive. If you don't have real-time flight status, 
       { role: "user", content: message },
     ];
 
-    const completion = await openai.chat.completions.create({
-      model: "gpt-4o-mini",
-      messages,
+    // Claude requires system prompt separate from messages array
+    const systemMsg = messages.find(m => m.role === "system")?.content || "";
+    const chatMessages = messages.filter(m => m.role !== "system");
+    const claudeResp = await getAnthropic().messages.create({
+      model: "claude-haiku-4-5",
       max_tokens: 600,
-      temperature: 0.7,
+      system: systemMsg,
+      messages: chatMessages,
     });
 
-    const reply = completion.choices[0].message.content;
+    const reply = claudeResp.content[0].text;
     res.json({ ok: true, reply });
   } catch (e) {
     console.error("[concierge]", e.message);

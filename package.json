@@ -1,7 +1,7 @@
 {
   "name": "wingman-api",
   "version": "0.2.0",
-  "description": "Wingman backend — Gmail OAuth, trips DB, Concierge LLM, disruption prediction",
+  "description": "Wingman backend \u2014 Gmail OAuth, trips DB, Concierge LLM, disruption prediction",
   "main": "server.js",
   "type": "commonjs",
   "scripts": {
@@ -12,13 +12,13 @@
     "node": ">=18"
   },
   "dependencies": {
+    "@anthropic-ai/sdk": "^0.39.0",
     "@neondatabase/serverless": "^1.1.0",
     "@upstash/redis": "^1.38.0",
     "cors": "^2.8.5",
     "express": "^4.19.2",
     "googleapis": "^173.0.0",
     "jsonwebtoken": "^9.0.3",
-    "openai": "^6.45.0",
     "resend": "^6.14.0"
   }
 }
