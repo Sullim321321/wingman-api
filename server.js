@@ -113,12 +113,40 @@ async function bootstrapDB() {
         created_at TIMESTAMPTZ DEFAULT NOW()
       )
     `;
+    await sql`
+      CREATE TABLE IF NOT EXISTS activity_events (
+        id SERIAL PRIMARY KEY,
+        user_email TEXT NOT NULL,
+        type TEXT NOT NULL,
+        title TEXT NOT NULL,
+        body TEXT,
+        trip_id INTEGER REFERENCES trips(id) ON DELETE CASCADE,
+        leg_id INTEGER REFERENCES trip_legs(id) ON DELETE SET NULL,
+        metadata JSONB,
+        created_at TIMESTAMPTZ DEFAULT NOW()
+      )
+    `;
+    await sql`CREATE INDEX IF NOT EXISTS idx_activity_user ON activity_events(user_email, created_at DESC)`;
     console.log("[db] tables ready");
   } catch (e) {
     console.error("[db] bootstrap error:", e.message);
   }
 }
 bootstrapDB();
+
+// ---------------------------------------------------------------------------
+// Activity helpers
+// ---------------------------------------------------------------------------
+async function logActivity(userEmail, type, title, body, tripId = null, legId = null, metadata = null) {
+  try {
+    await sql`
+      INSERT INTO activity_events (user_email, type, title, body, trip_id, leg_id, metadata)
+      VALUES (${userEmail}, ${type}, ${title}, ${body || null}, ${tripId || null}, ${legId || null}, ${metadata ? JSON.stringify(metadata) : null})
+    `;
+  } catch (e) {
+    console.error("[activity] log error:", e.message);
+  }
+}
 
 // ---------------------------------------------------------------------------
 // Auth helpers
@@ -229,6 +257,30 @@ app.post("/notify", async (req, res) => {
     res.json({ ok: true, data });
   } catch (e) {
     res.status(500).json({ error: "push failed" });
+  }
+});
+
+// ---------------------------------------------------------------------------
+// GET /activity — fetch activity feed for current user
+// ---------------------------------------------------------------------------
+app.get("/activity", async (req, res) => {
+  const email = await verifyAccessToken(req);
+  if (!email) return res.status(401).json({ error: "unauthorized" });
+  try {
+    const limit = Math.min(parseInt(req.query.limit || "50"), 100);
+    const events = await sql`
+      SELECT ae.id, ae.type, ae.title, ae.body, ae.trip_id, ae.leg_id, ae.metadata, ae.created_at,
+             t.title as trip_title
+      FROM activity_events ae
+      LEFT JOIN trips t ON t.id = ae.trip_id
+      WHERE ae.user_email = ${email}
+      ORDER BY ae.created_at DESC
+      LIMIT ${limit}
+    `;
+    res.json({ events });
+  } catch (e) {
+    console.error("[activity]", e.message);
+    res.status(500).json({ error: e.message });
   }
 });
 
@@ -453,6 +505,12 @@ Return this exact JSON structure (null for unknown fields):
         ${JSON.stringify(parsed)}
       )
     `;
+    await logActivity(
+      userEmail, "import",
+      `Imported from Gmail: ${tripTitle}`,
+      `Booking confirmation found in your inbox and linked automatically.`,
+      tripId
+    );
     console.log("[gmail] stored trip:", tripTitle, "for", userEmail);
   } catch (e) {
     console.error("[gmail/parse]", e.message);
@@ -534,6 +592,14 @@ app.post("/trips", async (req, res) => {
       FROM trips t LEFT JOIN trip_legs tl ON tl.trip_id = t.id
       WHERE t.id = ${tripId} GROUP BY t.id
     `;
+    // Log activity event
+    const legCount = (legs || []).length;
+    await logActivity(
+      email, "trip",
+      `Trip added: ${title}`,
+      legCount > 0 ? `${legCount} leg${legCount !== 1 ? "s" : ""} added. Wingman is now monitoring.` : "Wingman is now monitoring.",
+      tripId
+    );
     res.json({ ok: true, trip: result[0] });
   } catch (e) {
     console.error("[trips/create]", e.message);
@@ -830,5 +896,130 @@ app.get("/privacy", (_req, res) => {
 // Health check
 // ---------------------------------------------------------------------------
 app.get("/health", (_req, res) => res.json({ ok: true, ts: Date.now() }));
+
+// ---------------------------------------------------------------------------
+// Disruption polling cron — runs every 15 min
+// Checks all upcoming flight legs, detects status changes, sends push + logs activity
+// ---------------------------------------------------------------------------
+async function sendPushToUser(userEmail, title, body, data = {}) {
+  try {
+    const rows = await sql`SELECT push_token FROM users WHERE email = ${userEmail}`;
+    const token = rows[0]?.push_token;
+    if (!token) return;
+    await fetch("https://exp.host/--/api/v2/push/send", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ to: token, title, body, data }),
+    });
+  } catch (e) {
+    console.error("[push]", e.message);
+  }
+}
+
+async function pollDisruptions() {
+  console.log("[poll] checking upcoming flights...");
+  try {
+    // Get all flight legs departing in the next 48 hours that aren't already cancelled/landed
+    const now = new Date();
+    const cutoff = new Date(now.getTime() + 48 * 60 * 60 * 1000);
+    const legs = await sql`
+      SELECT tl.id, tl.trip_id, tl.carrier, tl.flight_number, tl.origin, tl.destination,
+             tl.departs_at, tl.status as prev_status,
+             t.user_email, t.title as trip_title
+      FROM trip_legs tl
+      JOIN trips t ON t.id = tl.trip_id
+      WHERE tl.type = 'flight'
+        AND tl.flight_number IS NOT NULL
+        AND tl.departs_at IS NOT NULL
+        AND tl.departs_at BETWEEN ${now.toISOString()} AND ${cutoff.toISOString()}
+        AND tl.status NOT IN ('Cancelled', 'Landed')
+    `;
+    console.log(`[poll] checking ${legs.length} upcoming flight legs`);
+
+    for (const leg of legs) {
+      const ident = (leg.carrier || "") + leg.flight_number;
+      const live = await getFlightStatus(ident);
+      if (!live || !live.status) continue;
+
+      const newStatus = live.status;
+      const prevStatus = leg.prev_status || "Scheduled";
+
+      // Only act on meaningful status changes
+      if (newStatus === prevStatus) continue;
+
+      console.log(`[poll] ${ident}: ${prevStatus} -> ${newStatus}`);
+
+      // Update the leg status in DB
+      await sql`UPDATE trip_legs SET status = ${newStatus} WHERE id = ${leg.id}`;
+
+      // Build notification content based on new status
+      let pushTitle, pushBody, activityTitle, activityBody, activityType;
+
+      if (newStatus === "Cancelled") {
+        pushTitle = `✈ ${ident} Cancelled`;
+        pushBody = `Your flight from ${leg.origin} to ${leg.destination} has been cancelled. Tap to see options.`;
+        activityTitle = `${ident} cancelled`;
+        activityBody = `Your ${leg.origin} → ${leg.destination} flight was cancelled. Open Wingman for rebooking help.`;
+        activityType = "disruption";
+      } else if (newStatus === "Delayed") {
+        const delayMins = live.delay ? Math.round(live.delay / 60) : null;
+        const delayStr = delayMins ? ` by ${delayMins}m` : "";
+        pushTitle = `⏱ ${ident} Delayed${delayStr}`;
+        pushBody = `Your ${leg.origin} → ${leg.destination} flight is delayed${delayStr}.${live.gate ? ` Gate ${live.gate}.` : ""}`;
+        activityTitle = `${ident} delayed${delayStr}`;
+        activityBody = `Your ${leg.origin} → ${leg.destination} flight is delayed${delayStr}.${live.gate ? ` Gate ${live.gate}.` : ""}`;
+        activityType = "delay";
+      } else if (newStatus === "On Time" && ["Delayed", "Watching"].includes(prevStatus)) {
+        pushTitle = `✅ ${ident} Back on Time`;
+        pushBody = `Your ${leg.origin} → ${leg.destination} flight is now showing on time.`;
+        activityTitle = `${ident} back on time`;
+        activityBody = `Your ${leg.origin} → ${leg.destination} flight recovered to on-time status.`;
+        activityType = "recovery";
+      } else if (newStatus === "In Air") {
+        activityTitle = `${ident} is airborne`;
+        activityBody = `${leg.origin} → ${leg.destination} departed.`;
+        activityType = "departed";
+        // No push for in-air unless it was previously delayed
+        if (prevStatus === "Delayed") {
+          pushTitle = `🛫 ${ident} Departed`;
+          pushBody = `Your delayed ${leg.origin} → ${leg.destination} flight has taken off.`;
+        }
+      } else if (newStatus === "Landed") {
+        activityTitle = `${ident} landed`;
+        activityBody = `Your ${leg.origin} → ${leg.destination} flight has landed.`;
+        activityType = "landed";
+      } else {
+        activityTitle = `${ident} status: ${newStatus}`;
+        activityBody = `${leg.origin} → ${leg.destination}`;
+        activityType = "status";
+      }
+
+      // Log to activity feed
+      await logActivity(
+        leg.user_email,
+        activityType,
+        activityTitle,
+        activityBody,
+        leg.trip_id,
+        leg.id,
+        { ident, prevStatus, newStatus, delay: live.delay, gate: live.gate, terminal: live.terminal }
+      );
+
+      // Send push notification (only for actionable events)
+      if (pushTitle) {
+        await sendPushToUser(leg.user_email, pushTitle, pushBody, { route: "Activity" });
+      }
+    }
+    console.log("[poll] done");
+  } catch (e) {
+    console.error("[poll] error:", e.message);
+  }
+}
+
+// Run poll on startup (after 30s delay to let server settle) and every 15 min
+setTimeout(() => {
+  pollDisruptions();
+  setInterval(pollDisruptions, 15 * 60 * 1000);
+}, 30 * 1000);
 
 app.listen(PORT, () => console.log("Wingman API on http://localhost:" + PORT));
