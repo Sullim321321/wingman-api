@@ -696,6 +696,75 @@ app.get("/predict", async (req, res) => {
 });
 
 // ---------------------------------------------------------------------------
+// FlightAware AeroAPI — live flight status
+// ---------------------------------------------------------------------------
+const AEROAPI_BASE = "https://aeroapi.flightaware.com/aeroapi";
+async function getFlightStatus(flightIdent) {
+  const key = process.env.FLIGHTAWARE_API_KEY;
+  if (!key) return null;
+  try {
+    const r = await fetch(`${AEROAPI_BASE}/flights/${encodeURIComponent(flightIdent)}`, {
+      headers: { "x-apikey": key, "Accept": "application/json" }
+    });
+    if (!r.ok) return null;
+    const j = await r.json();
+    const flights = j.flights || [];
+    const now = Date.now();
+    const upcoming = flights.filter(f => {
+      const dep = f.scheduled_out || f.estimated_out || f.actual_out;
+      return dep ? new Date(dep).getTime() > now - 3 * 60 * 60 * 1000 : false;
+    });
+    const flight = upcoming[0] || flights[0];
+    if (!flight) return null;
+    const status = flight.status || "Unknown";
+    const delay = flight.departure_delay ? Math.round(flight.departure_delay / 60) : 0;
+    const gate = flight.gate_origin || null;
+    const terminal = flight.terminal_origin || null;
+    const actualDep = flight.actual_out || flight.estimated_out || null;
+    const scheduledDep = flight.scheduled_out || null;
+    return { status, delay, gate, terminal, actualDep, scheduledDep };
+  } catch (e) {
+    console.error("[aeroapi]", e.message);
+    return null;
+  }
+}
+
+// GET /flight-status?ident=UA412
+app.get("/flight-status", async (req, res) => {
+  const email = await verifyAccessToken(req);
+  if (!email) return res.status(401).json({ error: "unauthorized" });
+  const ident = String(req.query.ident || "").toUpperCase().replace(/\s/g, "");
+  if (!ident) return res.status(400).json({ error: "ident required" });
+  const status = await getFlightStatus(ident);
+  if (!status) return res.json({ ident, status: "Unknown", live: false });
+  res.json({ ident, live: true, ...status });
+});
+
+// POST /trips/:id/refresh — refresh all leg statuses for a trip
+app.post("/trips/:id/refresh", async (req, res) => {
+  const email = await verifyAccessToken(req);
+  if (!email) return res.status(401).json({ error: "unauthorized" });
+  try {
+    const tripRows = await sql`SELECT id FROM trips WHERE id=${req.params.id} AND user_email=${email}`;
+    if (!tripRows.length) return res.status(404).json({ error: "not found" });
+    const legs = await sql`SELECT * FROM trip_legs WHERE trip_id=${req.params.id} ORDER BY departs_at`;
+    const updated = [];
+    for (const leg of legs) {
+      if (!leg.flight_number) continue;
+      const s = await getFlightStatus(leg.flight_number);
+      if (s) {
+        await sql`UPDATE trip_legs SET status=${s.status} WHERE id=${leg.id}`;
+        updated.push({ id: leg.id, flight_number: leg.flight_number, ...s });
+      }
+    }
+    res.json({ refreshed: updated.length, legs: updated });
+  } catch (e) {
+    console.error("[trips/refresh]", e.message);
+    res.status(500).json({ error: e.message });
+  }
+});
+
+// ---------------------------------------------------------------------------
 // Privacy Policy
 // ---------------------------------------------------------------------------
 app.get("/privacy", (_req, res) => {
