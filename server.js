@@ -140,6 +140,68 @@ bootstrapDB();
 // ---------------------------------------------------------------------------
 // Hotel pre-arrival preference email helper
 // ---------------------------------------------------------------------------
+// ---------------------------------------------------------------------------
+// Look up hotel contact email via Google Places API
+// Returns { email, phone, website, placeId } or null
+// ---------------------------------------------------------------------------
+async function lookupHotelContact(hotelName, city) {
+  try {
+    const apiKey = process.env.GOOGLE_PLACES_API_KEY;
+    if (!apiKey) return null;
+    const query = encodeURIComponent(`${hotelName} hotel ${city || ""}`);
+    // Step 1: Find Place from Text
+    const findUrl = `https://maps.googleapis.com/maps/api/place/findplacefromtext/json?input=${query}&inputtype=textquery&fields=place_id,name,formatted_address&key=${apiKey}`;
+    const findResp = await fetch(findUrl);
+    const findData = await findResp.json();
+    const placeId = findData.candidates?.[0]?.place_id;
+    if (!placeId) return null;
+    // Step 2: Get Place Details (website + phone)
+    const detailUrl = `https://maps.googleapis.com/maps/api/place/details/json?place_id=${placeId}&fields=name,formatted_phone_number,website,url&key=${apiKey}`;
+    const detailResp = await fetch(detailUrl);
+    const detailData = await detailResp.json();
+    const result = detailData.result || {};
+    const website = result.website || null;
+    const phone = result.formatted_phone_number || null;
+    // Step 3: Try to extract email from hotel website's contact page
+    let email = null;
+    if (website) {
+      try {
+        const contactUrls = [
+          website.replace(/\/$/, "") + "/contact",
+          website.replace(/\/$/, "") + "/contact-us",
+          website.replace(/\/$/, "") + "/en/contact",
+          website,
+        ];
+        for (const contactUrl of contactUrls) {
+          const pageResp = await fetch(contactUrl, {
+            headers: { "User-Agent": "Mozilla/5.0 (compatible; Wingman/1.0; +https://wingmantravel.app)" },
+            signal: AbortSignal.timeout(6000),
+          });
+          const html = await pageResp.text();
+          // Extract email addresses from HTML
+          const emailMatches = html.match(/[a-zA-Z0-9._%+\-]+@[a-zA-Z0-9.\-]+\.[a-zA-Z]{2,}/g) || [];
+          // Filter out generic/noreply addresses and prefer concierge/reservations/info
+          const preferred = emailMatches.find(e =>
+            /concierge|reservations|front.?desk|info|contact|guest/i.test(e) &&
+            !/noreply|no-reply|donotreply|example|test/i.test(e)
+          );
+          const fallback = emailMatches.find(e =>
+            !/noreply|no-reply|donotreply|example|test/i.test(e)
+          );
+          email = preferred || fallback || null;
+          if (email) break;
+        }
+      } catch (scrapeErr) {
+        console.log("[hotel-contact] website scrape failed:", scrapeErr.message);
+      }
+    }
+    return { email, phone, website, placeId };
+  } catch (e) {
+    console.error("[hotel-contact] lookup error:", e.message);
+    return null;
+  }
+}
+
 async function sendHotelPreferenceEmail(userEmail, parsedBooking, tripTitle) {
   try {
     // Fetch user preferences
@@ -160,9 +222,15 @@ async function sendHotelPreferenceEmail(userEmail, parsedBooking, tripTitle) {
       ...foodPrefs.length > 0 ? [`dietary requirements: ${foodPrefs.join(", ")}`] : [],
     ];
     const hotelName = parsedBooking.carrier || parsedBooking.destination || "the hotel";
+    const city = parsedBooking.destination || "";
     const checkIn = parsedBooking.departs_at
       ? new Date(parsedBooking.departs_at).toLocaleDateString("en-US", { weekday: "long", year: "numeric", month: "long", day: "numeric" })
       : "my upcoming stay";
+    // Try to find the hotel's direct email
+    const hotelContact = await lookupHotelContact(hotelName, city);
+    const hotelEmail = hotelContact?.email || null;
+    const hotelPhone = hotelContact?.phone || null;
+    const hotelWebsite = hotelContact?.website || null;
     const emailBody = `
 <div style="font-family:sans-serif;max-width:560px;margin:0 auto;padding:32px;color:#222">
   <p>Dear ${hotelName} Team,</p>
@@ -174,13 +242,45 @@ async function sendHotelPreferenceEmail(userEmail, parsedBooking, tripTitle) {
   <p>Thank you in advance — I look forward to my stay.</p>
   <p style="color:#666;font-size:12px;margin-top:24px">This message was sent automatically by <strong>Wingman</strong>, a travel assistant acting on behalf of ${userEmail}.</p>
 </div>`;
-    await resend.emails.send({
-      from: "Wingman <noreply@wingmantravel.app>",
-      to: userEmail, // For now, send to the user as a draft preview — in production, hotel email would be sourced
-      subject: `Pre-arrival preferences for your stay at ${hotelName}`,
-      html: emailBody,
-    });
-    console.log("[hotel-pref-email] sent preferences preview to", userEmail);
+    if (hotelEmail) {
+      // Send directly to the hotel AND CC the user
+      await resend.emails.send({
+        from: "Wingman <noreply@wingmantravel.app>",
+        to: hotelEmail,
+        cc: userEmail,
+        reply_to: userEmail,
+        subject: `Pre-arrival preferences — ${userEmail} — checking in ${checkIn}`,
+        html: emailBody,
+      });
+      // Log activity
+      await logActivity(
+        userEmail, "hotel_email",
+        `Pre-arrival email sent to ${hotelName}`,
+        `Wingman sent your room preferences directly to ${hotelName} (${hotelEmail}). You were CC'd. Preferences: ${prefLines.slice(0, 3).join("; ")}.`,
+        null, null,
+        { hotelName, hotelEmail, hotelPhone, hotelWebsite, sentDirect: true }
+      );
+      console.log("[hotel-pref-email] sent directly to hotel:", hotelEmail);
+    } else {
+      // Fallback: send to user as a draft with hotel contact info
+      const fallbackNote = hotelPhone
+        ? `<p style="background:#f5f5f5;padding:12px;border-radius:8px;font-size:13px"><strong>Note from Wingman:</strong> We could not find a direct email for ${hotelName}. You can forward this email or call them at <strong>${hotelPhone}</strong>${hotelWebsite ? ` or visit <a href="${hotelWebsite}">${hotelWebsite}</a>` : ""}.</p>`
+        : `<p style="background:#f5f5f5;padding:12px;border-radius:8px;font-size:13px"><strong>Note from Wingman:</strong> We could not find a direct email for ${hotelName}. Please forward this to the hotel's concierge or front desk.</p>`;
+      await resend.emails.send({
+        from: "Wingman <noreply@wingmantravel.app>",
+        to: userEmail,
+        subject: `[Draft] Pre-arrival preferences for your stay at ${hotelName}`,
+        html: fallbackNote + emailBody,
+      });
+      await logActivity(
+        userEmail, "hotel_email",
+        `Pre-arrival draft ready for ${hotelName}`,
+        `Wingman prepared your room preferences for ${hotelName} but could not find a direct email. ${hotelPhone ? `Hotel phone: ${hotelPhone}.` : ""} Check your email to forward it.`,
+        null, null,
+        { hotelName, hotelEmail: null, hotelPhone, hotelWebsite, sentDirect: false }
+      );
+      console.log("[hotel-pref-email] no hotel email found, sent draft to user");
+    }
   } catch (e) {
     console.error("[hotel-pref-email] error:", e.message);
   }
@@ -1149,8 +1249,113 @@ async function pollDisruptions() {
   }
 }
 
+// ---------------------------------------------------------------------------
+// Amadeus OAuth2 token cache
+// ---------------------------------------------------------------------------
+let _amadeusToken = null;
+let _amadeusTokenExpiry = 0;
+async function getAmadeusToken() {
+  if (_amadeusToken && Date.now() < _amadeusTokenExpiry - 60000) return _amadeusToken;
+  const key = process.env.AMADEUS_API_KEY;
+  const secret = process.env.AMADEUS_API_SECRET;
+  if (!key || !secret) throw new Error("AMADEUS_API_KEY / AMADEUS_API_SECRET not set");
+  const resp = await fetch("https://test.api.amadeus.com/v1/security/oauth2/token", {
+    method: "POST",
+    headers: { "Content-Type": "application/x-www-form-urlencoded" },
+    body: `grant_type=client_credentials&client_id=${encodeURIComponent(key)}&client_secret=${encodeURIComponent(secret)}`,
+  });
+  const data = await resp.json();
+  if (!data.access_token) throw new Error("Amadeus auth failed: " + JSON.stringify(data));
+  _amadeusToken = data.access_token;
+  _amadeusTokenExpiry = Date.now() + (data.expires_in || 1799) * 1000;
+  return _amadeusToken;
+}
+
+// ---------------------------------------------------------------------------
+// Fetch seat map from Amadeus for a given flight leg
+// Returns array of { designator, cabin, available, characteristics }
+// ---------------------------------------------------------------------------
+async function getAmadeusSeatMap(leg) {
+  try {
+    const token = await getAmadeusToken();
+    // Amadeus SeatMap Display requires a flight offer — we use the by-flight endpoint
+    const depDate = leg.departs_at ? leg.departs_at.split("T")[0] : null;
+    if (!depDate || !leg.carrier || !leg.flight_number || !leg.origin || !leg.destination) return null;
+    // Strip carrier prefix from flight number if present (e.g. "UA412" -> "412")
+    const flightNum = leg.flight_number.replace(/^[A-Z]{2}/i, "").trim();
+    const url = `https://test.api.amadeus.com/v1/shopping/seatmaps?flightOrderId=&originDestinationId=1&segmentId=1`;
+    // Use the flight-offers/seatmaps endpoint with a search
+    const searchUrl = `https://test.api.amadeus.com/v1/shopping/seatmaps`;
+    // Build a minimal flight offer search to get an offer ID for the seat map
+    const offersUrl = `https://test.api.amadeus.com/v2/shopping/flight-offers?originLocationCode=${leg.origin}&destinationLocationCode=${leg.destination}&departureDate=${depDate}&adults=1&travelClass=ECONOMY&includedAirlineCodes=${leg.carrier}&max=1`;
+    const offersResp = await fetch(offersUrl, {
+      headers: { Authorization: `Bearer ${token}` },
+    });
+    const offersData = await offersResp.json();
+    if (!offersData.data || offersData.data.length === 0) return null;
+    // Get seat map for the first matching offer
+    const seatResp = await fetch(searchUrl, {
+      method: "POST",
+      headers: { Authorization: `Bearer ${token}`, "Content-Type": "application/json" },
+      body: JSON.stringify({ data: [offersData.data[0]] }),
+    });
+    const seatData = await seatResp.json();
+    if (!seatData.data || seatData.data.length === 0) return null;
+    // Flatten all seats from all decks and cabins
+    const seats = [];
+    for (const seatMap of seatData.data) {
+      for (const deck of seatMap.decks || []) {
+        const cabin = deck.deckConfiguration?.startSeatRow ? "economy" : "unknown";
+        for (const row of deck.seats || []) {
+          seats.push({
+            designator: row.number + row.characteristicsCodes?.join(""),
+            cabin: deck.deckType || cabin,
+            available: row.travelerPricing?.[0]?.seatAvailabilityStatus === "AVAILABLE",
+            characteristics: row.characteristicsCodes || [],
+            number: row.number,
+            column: row.characteristicsCodes?.find(c => /^[A-K]$/.test(c)) || "",
+          });
+        }
+      }
+    }
+    return seats;
+  } catch (e) {
+    console.error("[amadeus-seatmap]", e.message);
+    return null;
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Map user seat preference IDs to Amadeus seat characteristics
+// ---------------------------------------------------------------------------
+const SEAT_PREF_TO_CHARACTERISTICS = {
+  econ_aisle: { cabin: "ECONOMY", chars: ["A"] },       // A = aisle
+  econ_window: { cabin: "ECONOMY", chars: ["W"] },      // W = window
+  econ_exit_row: { cabin: "ECONOMY", chars: ["E"] },    // E = exit row
+  econ_bulkhead: { cabin: "ECONOMY", chars: ["B"] },    // B = bulkhead
+  pe_aisle: { cabin: "PREMIUM_ECONOMY", chars: ["A"] },
+  pe_window: { cabin: "PREMIUM_ECONOMY", chars: ["W"] },
+  pe_bulkhead: { cabin: "PREMIUM_ECONOMY", chars: ["B"] },
+  biz_window_suite: { cabin: "BUSINESS", chars: ["W"] },
+  biz_aisle: { cabin: "BUSINESS", chars: ["A"] },
+  biz_bulkhead_behind: { cabin: "BUSINESS", chars: ["B"] },
+  biz_forward_facing: { cabin: "BUSINESS", chars: ["F"] },
+  first_suite: { cabin: "FIRST", chars: ["W", "1S"] },
+  first_forward: { cabin: "FIRST", chars: ["F"] },
+  first_window: { cabin: "FIRST", chars: ["W"] },
+};
+
 async function checkSeatPreferenceAlerts(legs) {
-  // Group legs by user so we only fetch preferences once per user
+  const SEAT_LABELS = {
+    econ_aisle: "aisle (Economy)", econ_window: "window (Economy)",
+    econ_exit_row: "exit row (Economy)", econ_bulkhead: "bulkhead (Economy)",
+    pe_aisle: "aisle (Premium Economy)", pe_window: "window (Premium Economy)",
+    pe_bulkhead: "bulkhead (Premium Economy)", biz_window_suite: "window suite (Business)",
+    biz_aisle: "direct aisle access (Business)", biz_bulkhead_behind: "bulkhead behind (Business)",
+    biz_forward_facing: "forward facing (Business)", first_suite: "enclosed suite (First)",
+    first_forward: "forward facing (First)", first_window: "window/wall side (First)",
+  };
+  // Group legs by user
   const byUser = {};
   for (const leg of legs) {
     if (!byUser[leg.user_email]) byUser[leg.user_email] = [];
@@ -1162,41 +1367,82 @@ async function checkSeatPreferenceAlerts(legs) {
       const prefs = userRows[0]?.preferences || {};
       const seatPrefs = prefs.seat_prefs || [];
       if (seatPrefs.length === 0) continue;
-      // Map seat pref IDs to human-readable labels for the notification
-      const SEAT_LABELS = {
-        econ_aisle: "aisle (Economy)", econ_window: "window (Economy)",
-        econ_exit_row: "exit row (Economy)", econ_bulkhead: "bulkhead (Economy)",
-        pe_aisle: "aisle (Premium Economy)", pe_window: "window (Premium Economy)",
-        pe_bulkhead: "bulkhead (Premium Economy)", biz_window_suite: "window suite (Business)",
-        biz_aisle: "direct aisle access (Business)", biz_bulkhead_behind: "bulkhead behind (Business)",
-        biz_forward_facing: "forward facing (Business)", first_suite: "enclosed suite (First)",
-        first_forward: "forward facing (First)", first_window: "window/wall side (First)",
-      };
       for (const leg of userLegs) {
-        // Check if a seat alert was already sent for this leg in the last 24h
+        const hoursUntilDep = (new Date(leg.departs_at) - new Date()) / (1000 * 60 * 60);
+        if (hoursUntilDep > 72 || hoursUntilDep < 1) continue; // only check 72h-1h window
+        // Skip if already alerted in last 12h
         const recentAlerts = await sql`
           SELECT id FROM activity_events
           WHERE user_email = ${userEmail}
             AND leg_id = ${leg.id}
             AND type = 'seat_alert'
-            AND created_at > NOW() - INTERVAL '24 hours'
+            AND created_at > NOW() - INTERVAL '12 hours'
         `;
         if (recentAlerts.length > 0) continue;
-        // Determine cabin from leg data (rough heuristic from booking class if available)
-        // For now, check if any seat pref matches the leg's cabin context
-        // In production this would call ExpertFlyer/SeatGuru API
         const ident = (leg.carrier || "") + leg.flight_number;
-        const prefLabels = seatPrefs.map(p => SEAT_LABELS[p] || p).filter(Boolean);
-        if (prefLabels.length === 0) continue;
-        // Log a seat preference reminder 48h before departure
-        const hoursUntilDep = (new Date(leg.departs_at) - new Date()) / (1000 * 60 * 60);
-        if (hoursUntilDep < 48 && hoursUntilDep > 23) {
+        // Try to get real seat map from Amadeus
+        let matchingSeats = [];
+        let usedLiveData = false;
+        const seatMap = await getAmadeusSeatMap(leg);
+        if (seatMap && seatMap.length > 0) {
+          usedLiveData = true;
+          // Check each user pref against the live seat map
+          for (const pref of seatPrefs) {
+            const criteria = SEAT_PREF_TO_CHARACTERISTICS[pref];
+            if (!criteria) continue;
+            const matches = seatMap.filter(s =>
+              s.available &&
+              s.characteristics.some(c => criteria.chars.includes(c))
+            );
+            if (matches.length > 0) {
+              matchingSeats.push({
+                pref,
+                label: SEAT_LABELS[pref] || pref,
+                seats: matches.slice(0, 3).map(s => s.designator || (s.number + s.column)),
+                count: matches.length,
+              });
+            }
+          }
+        }
+        if (usedLiveData && matchingSeats.length === 0) {
+          // Live data available but no preferred seats found — log a no-match event
+          await logActivity(
+            userEmail, "seat_alert",
+            `No preferred seats on ${ident}`,
+            `Wingman checked the live seat map for ${leg.origin} → ${leg.destination} — your preferred seats are not currently available. Will check again.`,
+            leg.trip_id, leg.id, { ident, seatPrefs, liveData: true, found: false }
+          );
+          continue;
+        }
+        if (matchingSeats.length > 0) {
+          const best = matchingSeats[0];
+          const seatList = best.seats.join(", ");
+          const activityBody = usedLiveData
+            ? `Live seat map check: ${best.count} ${best.label} seat${best.count !== 1 ? "s" : ""} available on ${leg.origin} → ${leg.destination}. Best options: ${seatList}.`
+            : `Your preferred seat (${best.label}) may be available on ${leg.origin} → ${leg.destination}. Check the airline app to confirm.`;
+          await logActivity(
+            userEmail, "seat_alert",
+            `🪑 ${best.label} available on ${ident}`,
+            activityBody,
+            leg.trip_id, leg.id,
+            { ident, seatPrefs, matchingSeats, liveData: usedLiveData }
+          );
+          await sendPushToUser(
+            userEmail,
+            `🪑 Preferred seat open on ${ident}`,
+            usedLiveData
+              ? `${best.count} ${best.label} seat${best.count !== 1 ? "s" : ""} available on ${leg.origin} → ${leg.destination}. Tap to check.`
+              : `Your preferred seat may be available on ${leg.origin} → ${leg.destination}. Tap to check.`,
+            { route: "Activity", legId: leg.id }
+          );
+        } else if (!usedLiveData) {
+          // No live data available — fall back to reminder
+          const prefLabels = seatPrefs.map(p => SEAT_LABELS[p] || p).filter(Boolean);
           await logActivity(
             userEmail, "seat_alert",
             `Check seat on ${ident}`,
-            `Your preferred seat (${prefLabels.slice(0, 2).join(" or ")}) may be available on ${leg.origin} → ${leg.destination}. Check the seat map now.`,
-            leg.trip_id, leg.id,
-            { ident, seatPrefs }
+            `Seat map unavailable via API. Check the airline app for your preferred seat (${prefLabels.slice(0, 2).join(" or ")}) on ${leg.origin} → ${leg.destination}.`,
+            leg.trip_id, leg.id, { ident, seatPrefs, liveData: false }
           );
           await sendPushToUser(
             userEmail,
