@@ -62,6 +62,7 @@ async function bootstrapDB() {
         id SERIAL PRIMARY KEY,
         email TEXT UNIQUE NOT NULL,
         push_token TEXT,
+        preferences JSONB DEFAULT '{}',
         created_at TIMESTAMPTZ DEFAULT NOW()
       )
     `;
@@ -91,6 +92,7 @@ async function bootstrapDB() {
         title TEXT NOT NULL,
         status TEXT DEFAULT 'upcoming',
         source TEXT DEFAULT 'manual',
+        mode TEXT DEFAULT 'solo',
         raw_email_id TEXT,
         created_at TIMESTAMPTZ DEFAULT NOW(),
         updated_at TIMESTAMPTZ DEFAULT NOW()
@@ -135,6 +137,55 @@ async function bootstrapDB() {
 bootstrapDB();
 
 // ---------------------------------------------------------------------------
+// ---------------------------------------------------------------------------
+// Hotel pre-arrival preference email helper
+// ---------------------------------------------------------------------------
+async function sendHotelPreferenceEmail(userEmail, parsedBooking, tripTitle) {
+  try {
+    // Fetch user preferences
+    const userRows = await sql`SELECT preferences FROM users WHERE email = ${userEmail}`;
+    const prefs = userRows[0]?.preferences || {};
+    const hotelPrefs = prefs.hotel_prefs || [];
+    const foodPrefs = prefs.food_prefs || [];
+    if (hotelPrefs.length === 0 && foodPrefs.length === 0) return; // nothing to send
+    const HOTEL_LABELS = {
+      high_floor: "a high floor room", quiet_room: "a quiet room away from street noise",
+      away_elevator: "a room away from the elevator", bathtub: "a room with a bathtub (not just a shower)",
+      firm_pillow: "firm pillows", late_checkout: "late checkout if possible",
+      room_service: "24-hour room service availability", fast_wifi: "high-speed Wi-Fi",
+      no_resort_fee: "waiver of resort fees if possible", gym: "gym access",
+    };
+    const prefLines = [
+      ...hotelPrefs.map(p => HOTEL_LABELS[p] || p),
+      ...foodPrefs.length > 0 ? [`dietary requirements: ${foodPrefs.join(", ")}`] : [],
+    ];
+    const hotelName = parsedBooking.carrier || parsedBooking.destination || "the hotel";
+    const checkIn = parsedBooking.departs_at
+      ? new Date(parsedBooking.departs_at).toLocaleDateString("en-US", { weekday: "long", year: "numeric", month: "long", day: "numeric" })
+      : "my upcoming stay";
+    const emailBody = `
+<div style="font-family:sans-serif;max-width:560px;margin:0 auto;padding:32px;color:#222">
+  <p>Dear ${hotelName} Team,</p>
+  <p>I have an upcoming reservation (confirmation: ${parsedBooking.confirmation || "on file"}) checking in ${checkIn}. I wanted to reach out in advance to share a few preferences for my stay:</p>
+  <ul style="line-height:1.8">
+    ${prefLines.map(p => `<li>${p}</li>`).join("\n    ")}
+  </ul>
+  <p>I would be very grateful if the team could accommodate these where possible. Please let me know if you need any additional information.</p>
+  <p>Thank you in advance — I look forward to my stay.</p>
+  <p style="color:#666;font-size:12px;margin-top:24px">This message was sent automatically by <strong>Wingman</strong>, a travel assistant acting on behalf of ${userEmail}.</p>
+</div>`;
+    await resend.emails.send({
+      from: "Wingman <noreply@wingmantravel.app>",
+      to: userEmail, // For now, send to the user as a draft preview — in production, hotel email would be sourced
+      subject: `Pre-arrival preferences for your stay at ${hotelName}`,
+      html: emailBody,
+    });
+    console.log("[hotel-pref-email] sent preferences preview to", userEmail);
+  } catch (e) {
+    console.error("[hotel-pref-email] error:", e.message);
+  }
+}
+
 // Activity helpers
 // ---------------------------------------------------------------------------
 async function logActivity(userEmail, type, title, body, tripId = null, legId = null, metadata = null) {
@@ -291,7 +342,7 @@ app.get("/me", async (req, res) => {
   const email = await verifyAccessToken(req);
   if (!email) return res.status(401).json({ error: "unauthorized" });
   try {
-    const rows = await sql`SELECT email, push_token, created_at FROM users WHERE email = ${email}`;
+    const rows = await sql`SELECT email, push_token, preferences, created_at FROM users WHERE email = ${email}`;
     if (!rows[0]) return res.status(404).json({ error: "user not found" });
     // Check if Gmail is connected
     const gmailRows = await sql`SELECT id FROM gmail_tokens WHERE user_email = ${email}`;
@@ -301,6 +352,29 @@ app.get("/me", async (req, res) => {
   }
 });
 
+// ---------------------------------------------------------------------------
+// PATCH /profile — save user preferences (taste graph, seat prefs, hotel soft-specs)
+// ---------------------------------------------------------------------------
+app.patch("/profile", async (req, res) => {
+  const email = await verifyAccessToken(req);
+  if (!email) return res.status(401).json({ error: "unauthorized" });
+  try {
+    const { preferences } = req.body || {};
+    if (!preferences || typeof preferences !== "object") {
+      return res.status(400).json({ error: "preferences object required" });
+    }
+    await sql`
+      UPDATE users
+      SET preferences = COALESCE(preferences, '{}'::jsonb) || ${JSON.stringify(preferences)}::jsonb
+      WHERE email = ${email}
+    `;
+    const rows = await sql`SELECT preferences FROM users WHERE email = ${email}`;
+    res.json({ preferences: rows[0].preferences });
+  } catch (e) {
+    console.error("PATCH /profile error:", e);
+    res.status(500).json({ error: "db error" });
+  }
+});
 // ---------------------------------------------------------------------------
 // Gmail OAuth — GET /auth/gmail/connect — returns URL to open in browser
 // ---------------------------------------------------------------------------
@@ -511,6 +585,12 @@ Return this exact JSON structure (null for unknown fields):
       `Booking confirmation found in your inbox and linked automatically.`,
       tripId
     );
+    // Feature C: Hotel pre-arrival preference injection
+    if ((parsed.type || "flight") === "hotel") {
+      sendHotelPreferenceEmail(userEmail, parsed, tripTitle).catch(e =>
+        console.error("[hotel-pref-email]", e.message)
+      );
+    }
     console.log("[gmail] stored trip:", tripTitle, "for", userEmail);
   } catch (e) {
     console.error("[gmail/parse]", e.message);
@@ -560,12 +640,13 @@ app.get("/trips", async (req, res) => {
 app.post("/trips", async (req, res) => {
   const email = await verifyAccessToken(req);
   if (!email) return res.status(401).json({ error: "unauthorized" });
-  const { title, legs } = req.body || {};
+  const { title, legs, mode } = req.body || {};
   if (!title) return res.status(400).json({ error: "title required" });
+  const tripMode = ["solo", "client", "partner"].includes(mode) ? mode : "solo";
   try {
     const tripRows = await sql`
-      INSERT INTO trips (user_email, title, source)
-      VALUES (${email}, ${title}, 'manual')
+      INSERT INTO trips (user_email, title, source, mode)
+      VALUES (${email}, ${title}, 'manual', ${tripMode})
       RETURNING id
     `;
     const tripId = tripRows[0].id;
@@ -630,18 +711,21 @@ app.post("/concierge", async (req, res) => {
   const { message, history } = req.body || {};
   if (!message) return res.status(400).json({ error: "message required" });
   try {
-    // Fetch user's trips for context
-    const trips = await sql`
-      SELECT t.id, t.title, t.status, t.created_at,
+    // Fetch user preferences (taste graph) and trips in parallel
+    const [userRows, trips] = await Promise.all([
+      sql`SELECT preferences FROM users WHERE email = ${email}`,
+      sql`
+      SELECT t.id, t.title, t.status, t.mode, t.created_at,
         json_agg(tl.* ORDER BY tl.departs_at ASC NULLS LAST) FILTER (WHERE tl.id IS NOT NULL) as legs
       FROM trips t
       LEFT JOIN trip_legs tl ON tl.trip_id = t.id
       WHERE t.user_email = ${email}
       GROUP BY t.id
       ORDER BY t.created_at DESC
-      LIMIT 10
-    `;
-
+            LIMIT 10
+    `
+    ]);
+    const prefs = userRows[0]?.preferences || {};
     const today = new Date().toISOString();
 
     // Enrich trips with live flight status + weather risk (in parallel, best-effort)
@@ -693,30 +777,76 @@ app.post("/concierge", async (req, res) => {
             if (leg.type === "hotel") return `  - Hotel: ${leg.carrier || leg.destination || "Hotel"} check-in ${leg.departs_at || "TBD"}`;
             return `  - ${leg.type}: ${leg.carrier || leg.destination || "Booking"}`;
           }).join("\n");
-          return `Trip: "${trip.title}"\n${legLines || "  (no legs)"}`.trim();
+          const modeLabel = trip.mode === "client" ? " [CLIENT TRIP]" : trip.mode === "partner" ? " [PARTNER/LEISURE TRIP]" : "";
+          return `Trip: "${trip.title}"${modeLabel}\n${legLines || "  (no legs)"}`.trim();
         }).join("\n\n");
 
-    const systemPrompt = `You are Wingman, a smart travel concierge AI. You have real-time access to the user's trips, live flight statuses, and weather disruption risk scores.
-
+        // Build taste profile section from user preferences
+    const editorialSources = (prefs.editorial_sources || []);
+    const hotelPrefs = (prefs.hotel_prefs || []);
+    const seatPrefs = (prefs.seat_prefs || []);
+    const foodPrefs = (prefs.food_prefs || []);
+    const SOURCE_LABELS = {
+      nyt36: "NYT 36 Hours (dense city itineraries)",
+      service95: "Service95 (Dua Lipa's cultural concierge — arts, dining, nightlife)",
+      hotelsabovepar: "Hotels Above Par (design-forward boutique hotels only)",
+      slh: "Small Luxury Hotels of the World (750-criteria inspected independent luxury)",
+      afar: "AFAR (experiential travel, cultural immersion, sustainability)",
+      travelandleisure: "Travel + Leisure (established luxury, World's Best lists)",
+      cntraveler: "Condé Nast Traveler (Gold List, Hot List, prestige picks)",
+      monocle: "Monocle (city intelligence, quality of life, local business culture)",
+      tablet: "Tablet Hotels (curated independent hotels, no chains)",
+      eater: "Eater (restaurant openings, heat maps, dining culture)",
+    };
+    const HOTEL_LABELS = {
+      high_floor: "high floor", quiet_room: "quiet room", away_elevator: "away from elevator",
+      bathtub: "bathtub required", firm_pillow: "firm pillow", late_checkout: "late checkout",
+      room_service: "24h room service", fast_wifi: "fast Wi-Fi", no_resort_fee: "no resort fees", gym: "gym access",
+    };
+    const SEAT_LABELS = {
+      econ_aisle: "Economy: aisle", econ_window: "Economy: window", econ_exit_row: "Economy: exit row",
+      econ_bulkhead: "Economy: bulkhead", pe_aisle: "Premium Economy: aisle", pe_window: "Premium Economy: window",
+      pe_bulkhead: "Premium Economy: bulkhead", biz_window_suite: "Business: window suite",
+      biz_aisle: "Business: direct aisle access", biz_bulkhead_behind: "Business: bulkhead behind (privacy)",
+      biz_forward_facing: "Business: forward facing only", first_suite: "First: enclosed suite",
+      first_forward: "First: forward facing", first_window: "First: window/wall side",
+    };
+    const tasteSection = [
+      editorialSources.length > 0
+        ? `Editorial sources this user trusts (use these as your recommendation lens):\n${editorialSources.map(s => `  - ${SOURCE_LABELS[s] || s}`).join("\n")}`
+        : null,
+      hotelPrefs.length > 0
+        ? `Hotel preferences (always mention/prioritize when recommending hotels):\n  ${hotelPrefs.map(p => HOTEL_LABELS[p] || p).join(", ")}`
+        : null,
+      seatPrefs.length > 0
+        ? `Seat preferences (use when advising on seat selection or upgrades):\n  ${seatPrefs.map(p => SEAT_LABELS[p] || p).join(", ")}`
+        : null,
+      foodPrefs.length > 0
+        ? `Dietary preferences (apply to restaurant and airline meal recommendations):\n  ${foodPrefs.join(", ")}`
+        : null,
+    ].filter(Boolean).join("\n\n");
+    const systemPrompt = `You are Wingman, a world-class AI travel concierge. You have real-time access to the user's trips, live flight statuses, and weather disruption risk scores. You also know this user's personal taste profile and editorial preferences — use them to give recommendations that feel like they came from a trusted friend with impeccable taste, not a generic algorithm.
 Today's date/time: ${today}
 User: ${email}
-
+${tasteSection ? `=== USER'S TASTE PROFILE ===\n${tasteSection}\n` : ""}
 === USER'S TRIPS (with live data) ===
 ${tripsSummary}
-
 You help with:
 - Explaining live flight status, delays, gate changes
 - Assessing disruption risk based on weather data above
 - Rebooking options and airline policies when flights are cancelled or heavily delayed
-- Hotel and restaurant recommendations at layover airports
+- Hotel, restaurant, and experience recommendations — always filtered through the user's editorial taste profile above
+- Seat selection advice based on the user's preferences above
 - General travel advice and packing tips
-
 Guidelines:
 - Be concise and direct — the user is likely in a stressful travel situation
 - Always reference the user's actual trip data and live statuses above
 - If a flight shows a delay or high weather risk, proactively mention it
 - For rebooking, mention the airline's app/phone and same-day change policies
-- If data is missing or stale, say so honestly`;
+- When recommending hotels or restaurants, reason like an editor from the user's trusted sources above
+- If the user has hotel soft-specs (bathtub, quiet room, etc.), factor them into every hotel recommendation
+- If data is missing or stale, say so honestly
+- Trip modes: [CLIENT TRIP] = prioritize prestige, optics, private dining, car service over Uber; [PARTNER/LEISURE TRIP] = prioritize romance, design-forward boutique hotels, bathtub, no 6am flights, chef's table dinners; no mode label = solo/efficiency mode`;
 
 
     const messages = [
@@ -1010,9 +1140,75 @@ async function pollDisruptions() {
         await sendPushToUser(leg.user_email, pushTitle, pushBody, { route: "Activity" });
       }
     }
+    // Feature E: Seat preference alerts — check if preferred seat type is available
+    // Run once per poll for upcoming legs (not just on status change)
+    await checkSeatPreferenceAlerts(legs);
     console.log("[poll] done");
   } catch (e) {
     console.error("[poll] error:", e.message);
+  }
+}
+
+async function checkSeatPreferenceAlerts(legs) {
+  // Group legs by user so we only fetch preferences once per user
+  const byUser = {};
+  for (const leg of legs) {
+    if (!byUser[leg.user_email]) byUser[leg.user_email] = [];
+    byUser[leg.user_email].push(leg);
+  }
+  for (const [userEmail, userLegs] of Object.entries(byUser)) {
+    try {
+      const userRows = await sql`SELECT preferences FROM users WHERE email = ${userEmail}`;
+      const prefs = userRows[0]?.preferences || {};
+      const seatPrefs = prefs.seat_prefs || [];
+      if (seatPrefs.length === 0) continue;
+      // Map seat pref IDs to human-readable labels for the notification
+      const SEAT_LABELS = {
+        econ_aisle: "aisle (Economy)", econ_window: "window (Economy)",
+        econ_exit_row: "exit row (Economy)", econ_bulkhead: "bulkhead (Economy)",
+        pe_aisle: "aisle (Premium Economy)", pe_window: "window (Premium Economy)",
+        pe_bulkhead: "bulkhead (Premium Economy)", biz_window_suite: "window suite (Business)",
+        biz_aisle: "direct aisle access (Business)", biz_bulkhead_behind: "bulkhead behind (Business)",
+        biz_forward_facing: "forward facing (Business)", first_suite: "enclosed suite (First)",
+        first_forward: "forward facing (First)", first_window: "window/wall side (First)",
+      };
+      for (const leg of userLegs) {
+        // Check if a seat alert was already sent for this leg in the last 24h
+        const recentAlerts = await sql`
+          SELECT id FROM activity_events
+          WHERE user_email = ${userEmail}
+            AND leg_id = ${leg.id}
+            AND type = 'seat_alert'
+            AND created_at > NOW() - INTERVAL '24 hours'
+        `;
+        if (recentAlerts.length > 0) continue;
+        // Determine cabin from leg data (rough heuristic from booking class if available)
+        // For now, check if any seat pref matches the leg's cabin context
+        // In production this would call ExpertFlyer/SeatGuru API
+        const ident = (leg.carrier || "") + leg.flight_number;
+        const prefLabels = seatPrefs.map(p => SEAT_LABELS[p] || p).filter(Boolean);
+        if (prefLabels.length === 0) continue;
+        // Log a seat preference reminder 48h before departure
+        const hoursUntilDep = (new Date(leg.departs_at) - new Date()) / (1000 * 60 * 60);
+        if (hoursUntilDep < 48 && hoursUntilDep > 23) {
+          await logActivity(
+            userEmail, "seat_alert",
+            `Check seat on ${ident}`,
+            `Your preferred seat (${prefLabels.slice(0, 2).join(" or ")}) may be available on ${leg.origin} → ${leg.destination}. Check the seat map now.`,
+            leg.trip_id, leg.id,
+            { ident, seatPrefs }
+          );
+          await sendPushToUser(
+            userEmail,
+            `🪑 Check your seat on ${ident}`,
+            `Your preferred seat may be available on ${leg.origin} → ${leg.destination}. Tap to check.`,
+            { route: "Activity" }
+          );
+        }
+      }
+    } catch (e) {
+      console.error("[seat-alert]", e.message);
+    }
   }
 }
 
