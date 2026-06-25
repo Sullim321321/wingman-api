@@ -566,7 +566,7 @@ app.post("/concierge", async (req, res) => {
   try {
     // Fetch user's trips for context
     const trips = await sql`
-      SELECT t.title, t.status, t.created_at,
+      SELECT t.id, t.title, t.status, t.created_at,
         json_agg(tl.* ORDER BY tl.departs_at ASC NULLS LAST) FILTER (WHERE tl.id IS NOT NULL) as legs
       FROM trips t
       LEFT JOIN trip_legs tl ON tl.trip_id = t.id
@@ -577,26 +577,81 @@ app.post("/concierge", async (req, res) => {
     `;
 
     const today = new Date().toISOString();
-    const tripsContext = trips.length > 0
-      ? JSON.stringify(trips, null, 2)
-      : "No trips found yet.";
 
-    const systemPrompt = `You are Wingman, a smart travel concierge AI. You have access to the user's upcoming trips and bookings.
+    // Enrich trips with live flight status + weather risk (in parallel, best-effort)
+    const enrichedTrips = await Promise.all(trips.map(async (trip) => {
+      const legs = trip.legs || [];
+      const enrichedLegs = await Promise.all(legs.map(async (leg) => {
+        if (leg.type !== "flight" || !leg.flight_number) return leg;
+        const ident = (leg.carrier || "") + leg.flight_number;
+        const [liveStatus, weatherData] = await Promise.allSettled([
+          getFlightStatus(ident),
+          (leg.origin && leg.destination)
+            ? (async () => {
+                const depI = ICAO[leg.origin] || "K" + leg.origin;
+                const arrI = ICAO[leg.destination] || "K" + leg.destination;
+                const [dm, am] = await Promise.all([metar(depI), metar(arrI)]);
+                const dw = weatherScore(dm);
+                const aw = weatherScore(am);
+                const mtn = (MOUNTAIN.has(leg.destination) ? 1 : 0) * 0.85 + (MOUNTAIN.has(leg.origin) ? 1 : 0) * 0.2;
+                const risk = Math.min(
+                  Math.round(dw.score * 34) + Math.round(aw.score * 32) + Math.round(Math.min(mtn, 1) * 20) + 6,
+                  95
+                );
+                return { risk, depNotes: dw.notes, arrNotes: aw.notes };
+              })()
+            : Promise.resolve(null),
+        ]);
+        return {
+          ...leg,
+          live_status: liveStatus.status === "fulfilled" ? liveStatus.value : null,
+          weather_risk: weatherData.status === "fulfilled" ? weatherData.value : null,
+        };
+      }));
+      return { ...trip, legs: enrichedLegs };
+    }));
 
-Today's date: ${today}
-User email: ${email}
+    // Build a concise human-readable summary for the system prompt
+    const tripsSummary = enrichedTrips.length === 0
+      ? "No trips found yet."
+      : enrichedTrips.map(trip => {
+          const legs = trip.legs || [];
+          const legLines = legs.map(leg => {
+            if (leg.type === "flight") {
+              const ls = leg.live_status;
+              const wr = leg.weather_risk;
+              const statusStr = ls ? `Status: ${ls.status}${ls.delay ? ` (${Math.round(ls.delay / 60)}m delay)` : ""}${ls.gate ? `, Gate ${ls.gate}` : ""}` : "Status: unknown";
+              const weatherStr = wr ? `Weather risk: ${wr.risk}%` : "";
+              return `  - Flight ${leg.carrier || ""}${leg.flight_number || ""}: ${leg.origin || "?"} → ${leg.destination || "?"} at ${leg.departs_at || "TBD"}. ${statusStr}. ${weatherStr}`.trim();
+            }
+            if (leg.type === "hotel") return `  - Hotel: ${leg.carrier || leg.destination || "Hotel"} check-in ${leg.departs_at || "TBD"}`;
+            return `  - ${leg.type}: ${leg.carrier || leg.destination || "Booking"}`;
+          }).join("\n");
+          return `Trip: "${trip.title}"\n${legLines || "  (no legs)"}`.trim();
+        }).join("\n\n");
 
-User's trips:
-${tripsContext}
+    const systemPrompt = `You are Wingman, a smart travel concierge AI. You have real-time access to the user's trips, live flight statuses, and weather disruption risk scores.
+
+Today's date/time: ${today}
+User: ${email}
+
+=== USER'S TRIPS (with live data) ===
+${tripsSummary}
 
 You help with:
-- Flight status and disruption risk (use the /predict endpoint data if asked)
-- Trip planning and recommendations
-- Rebooking suggestions when flights are disrupted
-- Hotel and restaurant recommendations
-- General travel advice
+- Explaining live flight status, delays, gate changes
+- Assessing disruption risk based on weather data above
+- Rebooking options and airline policies when flights are cancelled or heavily delayed
+- Hotel and restaurant recommendations at layover airports
+- General travel advice and packing tips
 
-Be concise, friendly, and proactive. If you don't have real-time flight status, say so clearly and suggest checking the airline app. Always refer to the user's actual trip data when relevant.`;
+Guidelines:
+- Be concise and direct — the user is likely in a stressful travel situation
+- Always reference the user's actual trip data and live statuses above
+- If a flight shows a delay or high weather risk, proactively mention it
+- For rebooking, mention the airline's app/phone and same-day change policies
+- If data is missing or stale, say so honestly`;
+
 
     const messages = [
       { role: "system", content: systemPrompt },
