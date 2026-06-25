@@ -138,6 +138,28 @@ async function bootstrapDB() {
       )
     `;
     await sql`CREATE INDEX IF NOT EXISTS idx_activity_user ON activity_events(user_email, created_at DESC)`;
+    await sql`
+      CREATE TABLE IF NOT EXISTS loyalty_accounts (
+        id SERIAL PRIMARY KEY,
+        user_email TEXT NOT NULL,
+        program TEXT NOT NULL,
+        provider_code TEXT NOT NULL,
+        account_number TEXT,
+        member_name TEXT,
+        points_balance BIGINT DEFAULT 0,
+        elite_status TEXT,
+        elite_level_next TEXT,
+        points_to_next_level BIGINT,
+        nights_ytd INTEGER,
+        segments_ytd INTEGER,
+        expiration_date TIMESTAMPTZ,
+        last_synced TIMESTAMPTZ,
+        aw_account_id TEXT,
+        metadata JSONB,
+        created_at TIMESTAMPTZ DEFAULT NOW(),
+        UNIQUE(user_email, provider_code)
+      )
+    `;
     console.log("[db] tables ready");
   } catch (e) {
     console.error("[db] bootstrap error:", e.message);
@@ -443,6 +465,235 @@ app.get("/activity", async (req, res) => {
     res.status(500).json({ error: e.message });
   }
 });
+
+// ---------------------------------------------------------------------------
+// LOYALTY PROGRAM ENDPOINTS (AwardWallet Web Parsing API)
+// ---------------------------------------------------------------------------
+
+const AW_BASE = "https://loyalty.awardwallet.com/v2";
+
+// Map our program keys to AwardWallet provider codes
+const LOYALTY_PROGRAMS = {
+  marriott:  { code: "marriott",  name: "Marriott Bonvoy",        icon: "🏨", kind: "hotel" },
+  hilton:    { code: "hhonors",   name: "Hilton Honors",          icon: "🏩", kind: "hotel" },
+  united:    { code: "united",    name: "United MileagePlus",     icon: "✈️", kind: "airline" },
+  delta:     { code: "delta",     name: "Delta SkyMiles",         icon: "🔵", kind: "airline" },
+  american:  { code: "aa",        name: "American AAdvantage",    icon: "🦅", kind: "airline" },
+  hyatt:     { code: "hyatt",     name: "World of Hyatt",         icon: "🏛️", kind: "hotel" },
+  ihg:       { code: "ihg",       name: "IHG One Rewards",        icon: "🌐", kind: "hotel" },
+  british:   { code: "ba",        name: "British Airways Avios",  icon: "🇬🇧", kind: "airline" },
+  emirates:  { code: "emirates",  name: "Emirates Skywards",      icon: "🇦🇪", kind: "airline" },
+  amex_mr:   { code: "amex",      name: "Amex Membership Rewards",icon: "💳", kind: "credit_card" },
+};
+
+async function awRequest(path, opts = {}) {
+  const awUser = process.env.AWARDWALLET_API_USER;
+  const awPass = process.env.AWARDWALLET_API_PASS;
+  if (!awUser || !awPass) throw new Error("AWARDWALLET_API_USER / AWARDWALLET_API_PASS not set");
+  const auth = Buffer.from(`${awUser}:${awPass}`).toString("base64");
+  const resp = await fetch(`${AW_BASE}${path}`, {
+    ...opts,
+    headers: {
+      "X-Authentication": `${awUser}:${awPass}`,
+      "Content-Type": "application/json",
+      ...(opts.headers || {}),
+    },
+  });
+  if (!resp.ok) throw new Error(`AwardWallet API error ${resp.status}`);
+  return resp.json();
+}
+
+// GET /loyalty — list all connected loyalty accounts for user
+app.get("/loyalty", async (req, res) => {
+  const email = await verifyAccessToken(req);
+  if (!email) return res.status(401).json({ error: "unauthorized" });
+  try {
+    const accounts = await sql`
+      SELECT * FROM loyalty_accounts WHERE user_email = ${email} ORDER BY program ASC
+    `;
+    res.json({ accounts, programs: LOYALTY_PROGRAMS });
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
+// POST /loyalty/connect — connect a loyalty account
+app.post("/loyalty/connect", async (req, res) => {
+  const email = await verifyAccessToken(req);
+  if (!email) return res.status(401).json({ error: "unauthorized" });
+  const { program, login, password, login2 } = req.body || {};
+  if (!program || !login || !password) return res.status(400).json({ error: "program, login, password required" });
+  const prog = LOYALTY_PROGRAMS[program];
+  if (!prog) return res.status(400).json({ error: "unknown program" });
+  try {
+    // Submit account to AwardWallet for initial sync
+    const awResp = await awRequest("/accounts", {
+      method: "POST",
+      body: JSON.stringify({
+        provider: prog.code,
+        login,
+        password,
+        ...(login2 ? { login2 } : {}),
+        userId: email,
+        userData: JSON.stringify({ userEmail: email, program }),
+      }),
+    });
+    // awResp contains accountId — store it
+    const awAccountId = awResp.accountId || awResp.id || null;
+    await sql`
+      INSERT INTO loyalty_accounts (user_email, program, provider_code, aw_account_id, last_synced)
+      VALUES (${email}, ${program}, ${prog.code}, ${awAccountId}, NOW())
+      ON CONFLICT (user_email, provider_code)
+      DO UPDATE SET aw_account_id = EXCLUDED.aw_account_id, last_synced = NOW()
+    `;
+    // Trigger an immediate sync
+    syncLoyaltyAccount(email, program).catch(e => console.error("[loyalty-sync]", e.message));
+    await logActivity(email, "loyalty", `${prog.name} connected`,
+      `Wingman is now tracking your ${prog.name} balance and status. Syncing now…`);
+    res.json({ ok: true, program, awAccountId });
+  } catch (e) {
+    console.error("[loyalty-connect]", e.message);
+    // If AwardWallet not configured, store the account anyway for manual sync later
+    if (e.message.includes("not set")) {
+      await sql`
+        INSERT INTO loyalty_accounts (user_email, program, provider_code, last_synced)
+        VALUES (${email}, ${program}, ${prog.code}, NOW())
+        ON CONFLICT (user_email, provider_code) DO NOTHING
+      `;
+      await logActivity(email, "loyalty", `${prog.name} added`,
+        `${prog.name} account saved. Configure AWARDWALLET_API_USER/PASS on Render to enable auto-sync.`);
+      return res.json({ ok: true, program, note: "stored without sync — AwardWallet not configured" });
+    }
+    res.status(500).json({ error: e.message });
+  }
+});
+
+// POST /loyalty/sync — manually trigger a sync for one or all accounts
+app.post("/loyalty/sync", async (req, res) => {
+  const email = await verifyAccessToken(req);
+  if (!email) return res.status(401).json({ error: "unauthorized" });
+  const { program } = req.body || {};
+  try {
+    const accounts = program
+      ? await sql`SELECT * FROM loyalty_accounts WHERE user_email = ${email} AND program = ${program}`
+      : await sql`SELECT * FROM loyalty_accounts WHERE user_email = ${email}`;
+    const results = await Promise.allSettled(accounts.map(a => syncLoyaltyAccount(email, a.program)));
+    const synced = results.filter(r => r.status === "fulfilled").length;
+    res.json({ ok: true, synced, total: accounts.length });
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
+// DELETE /loyalty/:program — disconnect a loyalty account
+app.delete("/loyalty/:program", async (req, res) => {
+  const email = await verifyAccessToken(req);
+  if (!email) return res.status(401).json({ error: "unauthorized" });
+  const { program } = req.params;
+  try {
+    await sql`DELETE FROM loyalty_accounts WHERE user_email = ${email} AND program = ${program}`;
+    const prog = LOYALTY_PROGRAMS[program];
+    await logActivity(email, "loyalty", `${prog?.name || program} disconnected`,
+      `Wingman is no longer tracking your ${prog?.name || program} account.`);
+    res.json({ ok: true });
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
+// Core sync function — fetches latest data from AwardWallet and updates DB
+async function syncLoyaltyAccount(userEmail, program) {
+  const prog = LOYALTY_PROGRAMS[program];
+  if (!prog) return;
+  const rows = await sql`SELECT * FROM loyalty_accounts WHERE user_email = ${userEmail} AND program = ${program}`;
+  const acct = rows[0];
+  if (!acct) return;
+  try {
+    const awUser = process.env.AWARDWALLET_API_USER;
+    const awPass = process.env.AWARDWALLET_API_PASS;
+    if (!awUser || !awPass) {
+      console.log("[loyalty-sync] AwardWallet not configured — skipping");
+      return;
+    }
+    // Request account update from AwardWallet
+    if (acct.aw_account_id) {
+      await awRequest(`/accounts/${acct.aw_account_id}/update`, { method: "POST" });
+      // Poll for completion (AwardWallet is async — wait up to 30s)
+      let data = null;
+      for (let i = 0; i < 6; i++) {
+        await new Promise(r => setTimeout(r, 5000));
+        const status = await awRequest(`/accounts/${acct.aw_account_id}`);
+        if (status.status === "done" || status.balance !== undefined) {
+          data = status;
+          break;
+        }
+      }
+      if (!data) return; // timed out
+      // Parse AwardWallet response into our schema
+      const balance = parseInt(data.balance || data.PointsValue || 0);
+      const eliteStatus = data.Level || data.eliteLevel || null;
+      const eliteNext = data.NextLevel || null;
+      const pointsToNext = parseInt(data.PointsToNextLevel || 0) || null;
+      const nightsYtd = parseInt(data.Nights || 0) || null;
+      const segmentsYtd = parseInt(data.Segments || 0) || null;
+      const memberName = data.Name || null;
+      const accountNumber = data.Number || null;
+      const expirationDate = data.Expiration ? new Date(data.Expiration) : null;
+      // Detect status changes for activity logging
+      const prevBalance = acct.points_balance || 0;
+      const prevStatus = acct.elite_status;
+      await sql`
+        UPDATE loyalty_accounts SET
+          points_balance = ${balance},
+          elite_status = ${eliteStatus},
+          elite_level_next = ${eliteNext},
+          points_to_next_level = ${pointsToNext},
+          nights_ytd = ${nightsYtd},
+          segments_ytd = ${segmentsYtd},
+          member_name = ${memberName},
+          account_number = ${accountNumber},
+          expiration_date = ${expirationDate},
+          last_synced = NOW()
+        WHERE user_email = ${userEmail} AND program = ${program}
+      `;
+      // Log notable changes
+      if (prevStatus && eliteStatus && prevStatus !== eliteStatus) {
+        await logActivity(userEmail, "loyalty",
+          `${prog.name} status changed: ${eliteStatus}`,
+          `Your ${prog.name} elite status changed from ${prevStatus} to ${eliteStatus}.`);
+        await sendPushToUser(userEmail,
+          `${prog.icon} ${prog.name} status update`,
+          `Your status changed to ${eliteStatus}!`,
+          { route: "Loyalty" });
+      } else if (balance > prevBalance) {
+        const earned = (balance - prevBalance).toLocaleString();
+        await logActivity(userEmail, "loyalty",
+          `${prog.name} +${earned} ${prog.kind === "airline" ? "miles" : "points"}`,
+          `Your ${prog.name} balance increased by ${earned}. New balance: ${balance.toLocaleString()}.`);
+      }
+      console.log(`[loyalty-sync] ${userEmail} ${program}: ${balance} pts, status: ${eliteStatus}`);
+    }
+  } catch (e) {
+    console.error(`[loyalty-sync] ${userEmail} ${program}:`, e.message);
+  }
+}
+
+// Loyalty sync cron — runs every 6 hours
+setInterval(async () => {
+  try {
+    const accounts = await sql`
+      SELECT DISTINCT user_email, program FROM loyalty_accounts
+      WHERE last_synced < NOW() - INTERVAL '6 hours' OR last_synced IS NULL
+    `;
+    console.log(`[loyalty-cron] syncing ${accounts.length} accounts`);
+    for (const acct of accounts) {
+      await syncLoyaltyAccount(acct.user_email, acct.program).catch(e =>
+        console.error("[loyalty-cron]", e.message));
+    }
+  } catch (e) {
+    console.error("[loyalty-cron] error:", e.message);
+  }
+}, 6 * 60 * 60 * 1000); // every 6 hours
 
 // ---------------------------------------------------------------------------
 // GET /me — current user info
@@ -820,8 +1071,8 @@ app.post("/concierge", async (req, res) => {
   const { message, history } = req.body || {};
   if (!message) return res.status(400).json({ error: "message required" });
   try {
-    // Fetch user preferences (taste graph) and trips in parallel
-    const [userRows, trips] = await Promise.all([
+    // Fetch user preferences (taste graph), trips, and loyalty accounts in parallel
+    const [userRows, trips, loyaltyAccounts] = await Promise.all([
       sql`SELECT preferences FROM users WHERE email = ${email}`,
       sql`
       SELECT t.id, t.title, t.status, t.mode, t.created_at,
@@ -832,7 +1083,8 @@ app.post("/concierge", async (req, res) => {
       GROUP BY t.id
       ORDER BY t.created_at DESC
             LIMIT 10
-    `
+    `,
+      sql`SELECT program, points_balance, elite_status, elite_level_next, points_to_next_level, nights_ytd, segments_ytd FROM loyalty_accounts WHERE user_email = ${email} ORDER BY program ASC`
     ]);
     const prefs = userRows[0]?.preferences || {};
     const today = new Date().toISOString();
@@ -934,10 +1186,28 @@ app.post("/concierge", async (req, res) => {
         ? `Dietary preferences (apply to restaurant and airline meal recommendations):\n  ${foodPrefs.join(", ")}`
         : null,
     ].filter(Boolean).join("\n\n");
+    // Build loyalty summary for system prompt
+    const PROG_NAMES = {
+      marriott: "Marriott Bonvoy", hilton: "Hilton Honors", united: "United MileagePlus",
+      delta: "Delta SkyMiles", american: "American AAdvantage", hyatt: "World of Hyatt",
+      ihg: "IHG One Rewards", british: "British Airways Avios", emirates: "Emirates Skywards", amex_mr: "Amex MR",
+    };
+    const loyaltySummary = loyaltyAccounts.length > 0
+      ? loyaltyAccounts.map(a => {
+          const name = PROG_NAMES[a.program] || a.program;
+          const pts = a.points_balance ? Number(a.points_balance).toLocaleString() : "unknown";
+          const status = a.elite_status ? ` · ${a.elite_status}` : "";
+          const toNext = a.points_to_next_level && a.elite_level_next
+            ? ` · ${Number(a.points_to_next_level).toLocaleString()} to ${a.elite_level_next}` : "";
+          return `  - ${name}: ${pts} pts${status}${toNext}`;
+        }).join("\n")
+      : null;
+
     const systemPrompt = `You are Wingman, a world-class AI travel concierge. You have real-time access to the user's trips, live flight statuses, and weather disruption risk scores. You also know this user's personal taste profile and editorial preferences — use them to give recommendations that feel like they came from a trusted friend with impeccable taste, not a generic algorithm.
 Today's date/time: ${today}
 User: ${email}
 ${tasteSection ? `=== USER'S TASTE PROFILE ===\n${tasteSection}\n` : ""}
+${loyaltySummary ? `=== USER'S LOYALTY ACCOUNTS ===\n${loyaltySummary}\n\nWhen recommending hotels, always factor in which programs the user has status with and suggest properties where their status will be recognized. When advising on flights, factor in their airline status and miles balance — suggest using miles for upgrades when the balance is high.\n` : ""}
 === USER'S TRIPS (with live data) ===
 ${tripsSummary}
 You help with:
