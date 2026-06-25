@@ -43,8 +43,6 @@ app.post("/auth/request", async (req, res) => {
     console.error("[auth] email error:", e.message);
     res.status(500).json({ error: "Failed to send email" });
   }
-  // REMOVED DEV devCode return
-  res.json({ ok: true, devCode: PROD ? undefined : code });
 });
 
 app.post("/auth/verify", (req, res) => {
