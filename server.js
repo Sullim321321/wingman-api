@@ -1,7 +1,10 @@
 // Wingman backend — production-ready
-// Persistent OTP via Upstash Redis, user/session storage via Neon PostgreSQL,
-// JWT auth, push notifications via Expo Push API, email via Resend.
-// Node 18+ required (uses global fetch).
+// Auth: email OTP (Upstash Redis) + JWT
+// Storage: Neon PostgreSQL (users, trips, gmail_tokens)
+// Gmail: OAuth2 flow + booking email parser
+// Concierge: GPT-4o with trip context
+// Push: Expo Push API
+// Email: Resend
 
 const express = require("express");
 const cors = require("cors");
@@ -9,6 +12,9 @@ const jwt = require("jsonwebtoken");
 const { Redis } = require("@upstash/redis");
 const { neon } = require("@neondatabase/serverless");
 const { Resend } = require("resend");
+const { google } = require("googleapis");
+const OpenAI = require("openai");
+const path = require("path");
 
 const app = express();
 app.use(cors());
@@ -25,12 +31,21 @@ const redis = new Redis({
   url: process.env.UPSTASH_REDIS_REST_URL,
   token: process.env.UPSTASH_REDIS_REST_TOKEN,
 });
-
 const sql = neon(process.env.DATABASE_URL);
 const resend = new Resend(process.env.RESEND_API_KEY);
+const openai = new OpenAI({ apiKey: process.env.OPENAI_API_KEY });
+
+// Google OAuth2 client
+function makeOAuth2Client() {
+  return new google.auth.OAuth2(
+    process.env.GOOGLE_CLIENT_ID,
+    process.env.GOOGLE_CLIENT_SECRET,
+    process.env.GOOGLE_REDIRECT_URI || "https://wingman-api-y39a.onrender.com/auth/gmail/callback"
+  );
+}
 
 // ---------------------------------------------------------------------------
-// Database bootstrap — create tables if they don't exist
+// Database bootstrap
 // ---------------------------------------------------------------------------
 async function bootstrapDB() {
   try {
@@ -51,12 +66,50 @@ async function bootstrapDB() {
         expires_at TIMESTAMPTZ NOT NULL
       )
     `;
+    await sql`
+      CREATE TABLE IF NOT EXISTS gmail_tokens (
+        id SERIAL PRIMARY KEY,
+        user_email TEXT UNIQUE NOT NULL,
+        access_token TEXT NOT NULL,
+        refresh_token TEXT,
+        expiry_date BIGINT,
+        updated_at TIMESTAMPTZ DEFAULT NOW()
+      )
+    `;
+    await sql`
+      CREATE TABLE IF NOT EXISTS trips (
+        id SERIAL PRIMARY KEY,
+        user_email TEXT NOT NULL,
+        title TEXT NOT NULL,
+        status TEXT DEFAULT 'upcoming',
+        source TEXT DEFAULT 'manual',
+        raw_email_id TEXT,
+        created_at TIMESTAMPTZ DEFAULT NOW(),
+        updated_at TIMESTAMPTZ DEFAULT NOW()
+      )
+    `;
+    await sql`
+      CREATE TABLE IF NOT EXISTS trip_legs (
+        id SERIAL PRIMARY KEY,
+        trip_id INTEGER REFERENCES trips(id) ON DELETE CASCADE,
+        type TEXT NOT NULL,
+        carrier TEXT,
+        flight_number TEXT,
+        origin TEXT,
+        destination TEXT,
+        departs_at TIMESTAMPTZ,
+        arrives_at TIMESTAMPTZ,
+        confirmation TEXT,
+        status TEXT DEFAULT 'upcoming',
+        raw_data JSONB,
+        created_at TIMESTAMPTZ DEFAULT NOW()
+      )
+    `;
     console.log("[db] tables ready");
   } catch (e) {
     console.error("[db] bootstrap error:", e.message);
   }
 }
-
 bootstrapDB();
 
 // ---------------------------------------------------------------------------
@@ -65,7 +118,6 @@ bootstrapDB();
 function signAccessToken(email) {
   return jwt.sign({ email, type: "access" }, JWT_SECRET, { expiresIn: JWT_EXPIRES_IN });
 }
-
 async function verifyAccessToken(req) {
   const h = req.headers.authorization || "";
   const t = h.startsWith("Bearer ") ? h.slice(7) : null;
@@ -80,145 +132,488 @@ async function verifyAccessToken(req) {
 }
 
 // ---------------------------------------------------------------------------
-// POST /auth/request — send OTP via Resend, store in Redis with 10-min TTL
+// POST /auth/request — send OTP
 // ---------------------------------------------------------------------------
 app.post("/auth/request", async (req, res) => {
   const email = ((req.body && req.body.email) || "").trim().toLowerCase();
   if (!email || !email.includes("@")) {
     return res.status(400).json({ error: "valid email required" });
   }
-
   const code = String(Math.floor(100000 + Math.random() * 900000));
-  const key = "otp:" + email;
-
   try {
-    await redis.set(key, code, { ex: 600 });
-  } catch (e) {
-    console.error("[redis] set error:", e.message);
-    return res.status(500).json({ error: "failed to store code" });
-  }
-
-  try {
+    await redis.set("otp:" + email, code, { ex: 600 });
     await resend.emails.send({
-      from: "Wingman Travel <noreply@welcometothefight.club>",
+      from: "Wingman <noreply@wingmantravel.app>",
       to: email,
-      subject: "Your Wingman login code",
-      html: `<div style="font-family:sans-serif;max-width:400px;margin:0 auto;padding:24px"><h2 style="color:#1a1a2e">Wingman Travel</h2><p style="color:#555">Your one-time login code:</p><div style="background:#f4f4f8;border-radius:12px;padding:24px;text-align:center"><span style="font-size:36px;font-weight:700;letter-spacing:8px;color:#1a1a2e">${code}</span></div><p style="color:#888;font-size:13px;margin-top:16px">Expires in 10 minutes.</p></div>`,
+      subject: "Your Wingman sign-in code: " + code,
+      html: `<div style="font-family:sans-serif;max-width:400px;margin:0 auto;padding:32px">
+        <h2 style="color:#5B8CFF;margin-bottom:8px">✈ Wingman</h2>
+        <p style="font-size:16px;color:#222">Your sign-in code is:</p>
+        <div style="font-size:48px;font-weight:700;letter-spacing:8px;color:#111;margin:16px 0">${code}</div>
+        <p style="color:#666;font-size:13px">Expires in 10 minutes. If you didn't request this, ignore this email.</p>
+      </div>`,
     });
-    console.log("[auth] OTP sent to " + email);
+    res.json({ ok: true });
   } catch (e) {
-    console.error("[resend] error:", e.message);
+    console.error("[auth/request]", e.message);
+    res.status(500).json({ error: "failed to send OTP" });
   }
-
-  res.json({ ok: true });
 });
 
 // ---------------------------------------------------------------------------
-// POST /auth/verify — validate OTP, upsert user in DB, return JWT
+// POST /auth/verify — verify OTP, return JWT
 // ---------------------------------------------------------------------------
 app.post("/auth/verify", async (req, res) => {
   const email = ((req.body && req.body.email) || "").trim().toLowerCase();
-  const code = ((req.body && req.body.code) || "").trim();
-
-  if (!email || !code) {
-    return res.status(400).json({ error: "email and code required" });
-  }
-
-  const key = "otp:" + email;
-  let stored;
+  const code = String((req.body && req.body.code) || "").trim();
+  if (!email || !code) return res.status(400).json({ error: "email and code required" });
   try {
-    stored = await redis.get(key);
+    const stored = await redis.get("otp:" + email);
+    if (!stored || String(stored) !== code) {
+      return res.status(401).json({ error: "invalid or expired code" });
+    }
+    await redis.del("otp:" + email);
+    await sql`
+      INSERT INTO users (email) VALUES (${email})
+      ON CONFLICT (email) DO NOTHING
+    `;
+    const token = signAccessToken(email);
+    res.json({ ok: true, token, email });
   } catch (e) {
-    console.error("[redis] get error:", e.message);
-    return res.status(500).json({ error: "verification failed" });
+    console.error("[auth/verify]", e.message);
+    res.status(500).json({ error: "verification failed" });
   }
-
-  if (!stored || String(stored) !== String(code)) {
-    return res.status(401).json({ error: "invalid or expired code" });
-  }
-
-  await redis.del(key).catch(() => {});
-
-  try {
-    await sql`INSERT INTO users (email) VALUES (${email}) ON CONFLICT (email) DO NOTHING`;
-  } catch (e) {
-    console.error("[db] upsert user error:", e.message);
-  }
-
-  const token = signAccessToken(email);
-  console.log("[auth] verified " + email);
-  res.json({ token, email });
 });
 
 // ---------------------------------------------------------------------------
-// POST /push-token — store Expo push token for authenticated user
+// POST /push-token — store Expo push token
 // ---------------------------------------------------------------------------
 app.post("/push-token", async (req, res) => {
   const email = await verifyAccessToken(req);
   if (!email) return res.status(401).json({ error: "unauthorized" });
-
-  const { pushToken } = req.body;
-  if (!pushToken || !pushToken.startsWith("ExponentPushToken[")) {
-    return res.status(400).json({ error: "invalid push token" });
-  }
-
+  const { token } = req.body || {};
+  if (!token) return res.status(400).json({ error: "token required" });
   try {
-    await sql`UPDATE users SET push_token = ${pushToken} WHERE email = ${email}`;
-    console.log("[push] stored token for " + email);
+    await sql`UPDATE users SET push_token = ${token} WHERE email = ${email}`;
     res.json({ ok: true });
-  } catch (e) {
-    console.error("[db] push token error:", e.message);
-    res.status(500).json({ error: "failed to store push token" });
-  }
-});
-
-// ---------------------------------------------------------------------------
-// POST /notify — send push notification to authenticated user
-// ---------------------------------------------------------------------------
-app.post("/notify", async (req, res) => {
-  const email = await verifyAccessToken(req);
-  if (!email) return res.status(401).json({ error: "unauthorized" });
-
-  const { title, body } = req.body;
-  if (!title || !body) return res.status(400).json({ error: "title and body required" });
-
-  try {
-    const rows = await sql`SELECT push_token FROM users WHERE email = ${email}`;
-    const pushToken = rows[0] && rows[0].push_token;
-    if (!pushToken) return res.status(404).json({ error: "no push token registered" });
-
-    const response = await fetch("https://exp.host/--/api/v2/push/send", {
-      method: "POST",
-      headers: { "Content-Type": "application/json", "Accept": "application/json" },
-      body: JSON.stringify({ to: pushToken, title, body, sound: "default" }),
-    });
-    const result = await response.json();
-    console.log("[push] sent to " + email + ":", result);
-    res.json({ ok: true, result });
-  } catch (e) {
-    console.error("[push] error:", e.message);
-    res.status(500).json({ error: "push failed" });
-  }
-});
-
-// ---------------------------------------------------------------------------
-// GET /me — return current user info
-// ---------------------------------------------------------------------------
-app.get("/me", async (req, res) => {
-  const email = await verifyAccessToken(req);
-  if (!email) return res.status(401).json({ error: "unauthorized" });
-
-  try {
-    const rows = await sql`SELECT email, push_token, created_at FROM users WHERE email = ${email}`;
-    if (!rows[0]) return res.status(404).json({ error: "user not found" });
-    res.json(rows[0]);
   } catch (e) {
     res.status(500).json({ error: "db error" });
   }
 });
 
 // ---------------------------------------------------------------------------
-// Prediction — live weather (aviationweather.gov METAR, free, no key) -> risk
+// POST /notify — send push notification
+// ---------------------------------------------------------------------------
+app.post("/notify", async (req, res) => {
+  const email = await verifyAccessToken(req);
+  if (!email) return res.status(401).json({ error: "unauthorized" });
+  const { title, body } = req.body || {};
+  try {
+    const rows = await sql`SELECT push_token FROM users WHERE email = ${email}`;
+    const token = rows[0]?.push_token;
+    if (!token) return res.status(404).json({ error: "no push token" });
+    const r = await fetch("https://exp.host/--/api/v2/push/send", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ to: token, title: title || "Wingman", body: body || "Update" }),
+    });
+    const data = await r.json();
+    res.json({ ok: true, data });
+  } catch (e) {
+    res.status(500).json({ error: "push failed" });
+  }
+});
+
+// ---------------------------------------------------------------------------
+// GET /me — current user info
+// ---------------------------------------------------------------------------
+app.get("/me", async (req, res) => {
+  const email = await verifyAccessToken(req);
+  if (!email) return res.status(401).json({ error: "unauthorized" });
+  try {
+    const rows = await sql`SELECT email, push_token, created_at FROM users WHERE email = ${email}`;
+    if (!rows[0]) return res.status(404).json({ error: "user not found" });
+    // Check if Gmail is connected
+    const gmailRows = await sql`SELECT id FROM gmail_tokens WHERE user_email = ${email}`;
+    res.json({ ...rows[0], gmail_connected: gmailRows.length > 0 });
+  } catch (e) {
+    res.status(500).json({ error: "db error" });
+  }
+});
+
+// ---------------------------------------------------------------------------
+// Gmail OAuth — GET /auth/gmail/connect — returns URL to open in browser
+// ---------------------------------------------------------------------------
+app.get("/auth/gmail/connect", async (req, res) => {
+  const email = await verifyAccessToken(req);
+  if (!email) return res.status(401).json({ error: "unauthorized" });
+  const oauth2 = makeOAuth2Client();
+  const url = oauth2.generateAuthUrl({
+    access_type: "offline",
+    prompt: "consent",
+    scope: ["https://www.googleapis.com/auth/gmail.readonly"],
+    state: Buffer.from(email).toString("base64"),
+  });
+  res.json({ url });
+});
+
+// ---------------------------------------------------------------------------
+// Gmail OAuth — GET /auth/gmail/callback — handles redirect from Google
+// ---------------------------------------------------------------------------
+app.get("/auth/gmail/callback", async (req, res) => {
+  const { code, state } = req.query;
+  if (!code || !state) return res.status(400).send("Missing code or state");
+  let userEmail;
+  try {
+    userEmail = Buffer.from(state, "base64").toString("utf8");
+  } catch {
+    return res.status(400).send("Invalid state");
+  }
+  try {
+    const oauth2 = makeOAuth2Client();
+    const { tokens } = await oauth2.getToken(code);
+    await sql`
+      INSERT INTO gmail_tokens (user_email, access_token, refresh_token, expiry_date)
+      VALUES (${userEmail}, ${tokens.access_token}, ${tokens.refresh_token || null}, ${tokens.expiry_date || null})
+      ON CONFLICT (user_email) DO UPDATE SET
+        access_token = EXCLUDED.access_token,
+        refresh_token = COALESCE(EXCLUDED.refresh_token, gmail_tokens.refresh_token),
+        expiry_date = EXCLUDED.expiry_date,
+        updated_at = NOW()
+    `;
+    // Trigger initial email scan in background
+    scanGmailForTrips(userEmail, tokens).catch(e => console.error("[gmail scan]", e.message));
+    res.send(`<html><body style="font-family:sans-serif;text-align:center;padding:60px">
+      <h2 style="color:#5B8CFF">✈ Gmail connected!</h2>
+      <p>Wingman is scanning your inbox for travel bookings.</p>
+      <p style="color:#666;font-size:13px">You can close this tab and return to the app.</p>
+    </body></html>`);
+  } catch (e) {
+    console.error("[gmail/callback]", e.message);
+    res.status(500).send("OAuth error: " + e.message);
+  }
+});
+
+// ---------------------------------------------------------------------------
+// Gmail scanner — parse booking confirmation emails into trips
+// ---------------------------------------------------------------------------
+async function getGmailClient(userEmail) {
+  const rows = await sql`SELECT * FROM gmail_tokens WHERE user_email = ${userEmail}`;
+  if (!rows[0]) return null;
+  const oauth2 = makeOAuth2Client();
+  oauth2.setCredentials({
+    access_token: rows[0].access_token,
+    refresh_token: rows[0].refresh_token,
+    expiry_date: rows[0].expiry_date,
+  });
+  // Auto-refresh if needed
+  oauth2.on("tokens", async (tokens) => {
+    if (tokens.access_token) {
+      await sql`UPDATE gmail_tokens SET access_token = ${tokens.access_token}, expiry_date = ${tokens.expiry_date || null}, updated_at = NOW() WHERE user_email = ${userEmail}`;
+    }
+  });
+  return google.gmail({ version: "v1", auth: oauth2 });
+}
+
+async function scanGmailForTrips(userEmail, tokens) {
+  const gmail = await getGmailClient(userEmail);
+  if (!gmail) return;
+  // Search for booking confirmation emails
+  const queries = [
+    "from:united.com subject:confirmation",
+    "from:delta.com subject:confirmation",
+    "from:aa.com subject:confirmation",
+    "from:southwest.com subject:confirmation",
+    "from:alaskaair.com subject:confirmation",
+    "from:jetblue.com subject:confirmation",
+    "from:marriott.com subject:confirmation",
+    "from:hilton.com subject:confirmation",
+    "from:airbnb.com subject:confirmation",
+    "from:hotels.com subject:confirmation",
+    "from:expedia.com subject:confirmation",
+    "from:booking.com subject:confirmation",
+    "subject:(flight confirmation OR itinerary OR booking confirmation) newer_than:6m",
+  ];
+  const seen = new Set();
+  for (const q of queries) {
+    try {
+      const listRes = await gmail.users.messages.list({ userId: "me", q, maxResults: 20 });
+      const messages = listRes.data.messages || [];
+      for (const msg of messages) {
+        if (seen.has(msg.id)) continue;
+        seen.add(msg.id);
+        try {
+          const full = await gmail.users.messages.get({ userId: "me", id: msg.id, format: "full" });
+          await parseAndStoreEmail(userEmail, full.data);
+        } catch (e) {
+          console.error("[gmail parse]", e.message);
+        }
+      }
+    } catch (e) {
+      console.error("[gmail list]", q, e.message);
+    }
+  }
+}
+
+function extractEmailBody(payload) {
+  if (!payload) return "";
+  if (payload.body && payload.body.data) {
+    return Buffer.from(payload.body.data, "base64").toString("utf8");
+  }
+  if (payload.parts) {
+    for (const part of payload.parts) {
+      const text = extractEmailBody(part);
+      if (text) return text;
+    }
+  }
+  return "";
+}
+
+async function parseAndStoreEmail(userEmail, message) {
+  // Check if already processed
+  const existing = await sql`SELECT id FROM trips WHERE user_email = ${userEmail} AND raw_email_id = ${message.id}`;
+  if (existing.length > 0) return;
+
+  const headers = message.payload?.headers || [];
+  const subject = headers.find(h => h.name === "Subject")?.value || "";
+  const from = headers.find(h => h.name === "From")?.value || "";
+  const body = extractEmailBody(message.payload);
+  const snippet = message.snippet || "";
+
+  // Use GPT to extract structured trip data
+  try {
+    const prompt = `Extract travel booking information from this email. Return JSON only, no markdown.
+Subject: ${subject}
+From: ${from}
+Body (first 3000 chars): ${(body || snippet).slice(0, 3000)}
+
+Return this exact JSON structure (null for unknown fields):
+{
+  "type": "flight|hotel|car|other",
+  "title": "short trip title e.g. New York Trip",
+  "carrier": "airline or hotel name",
+  "confirmation": "confirmation/booking number",
+  "origin": "departure city or airport code (flights only)",
+  "destination": "arrival city or airport code",
+  "departs_at": "ISO 8601 datetime or null",
+  "arrives_at": "ISO 8601 datetime or null",
+  "is_travel_booking": true or false
+}`;
+
+    const completion = await openai.chat.completions.create({
+      model: "gpt-4o-mini",
+      messages: [{ role: "user", content: prompt }],
+      max_tokens: 400,
+      temperature: 0,
+    });
+
+    let parsed;
+    try {
+      const raw = completion.choices[0].message.content.trim();
+      const jsonStr = raw.replace(/^```json\n?/, "").replace(/\n?```$/, "").trim();
+      parsed = JSON.parse(jsonStr);
+    } catch {
+      return;
+    }
+
+    if (!parsed.is_travel_booking) return;
+
+    // Create or find trip
+    const dest = parsed.destination || "Unknown";
+    const tripTitle = parsed.title || (dest + " Trip");
+    const tripRows = await sql`
+      INSERT INTO trips (user_email, title, source, raw_email_id)
+      VALUES (${userEmail}, ${tripTitle}, 'gmail', ${message.id})
+      ON CONFLICT DO NOTHING
+      RETURNING id
+    `;
+    if (tripRows.length === 0) return;
+    const tripId = tripRows[0].id;
+
+    // Add leg
+    await sql`
+      INSERT INTO trip_legs (trip_id, type, carrier, flight_number, origin, destination, departs_at, arrives_at, confirmation, raw_data)
+      VALUES (
+        ${tripId},
+        ${parsed.type || "flight"},
+        ${parsed.carrier || null},
+        ${null},
+        ${parsed.origin || null},
+        ${parsed.destination || null},
+        ${parsed.departs_at || null},
+        ${parsed.arrives_at || null},
+        ${parsed.confirmation || null},
+        ${JSON.stringify(parsed)}
+      )
+    `;
+    console.log("[gmail] stored trip:", tripTitle, "for", userEmail);
+  } catch (e) {
+    console.error("[gmail/parse]", e.message);
+  }
+}
+
+// ---------------------------------------------------------------------------
+// POST /auth/gmail/scan — manually trigger a re-scan
+// ---------------------------------------------------------------------------
+app.post("/auth/gmail/scan", async (req, res) => {
+  const email = await verifyAccessToken(req);
+  if (!email) return res.status(401).json({ error: "unauthorized" });
+  try {
+    scanGmailForTrips(email).catch(e => console.error("[scan]", e.message));
+    res.json({ ok: true, message: "Scan started" });
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
+// ---------------------------------------------------------------------------
+// GET /trips — get all trips for current user
+// ---------------------------------------------------------------------------
+app.get("/trips", async (req, res) => {
+  const email = await verifyAccessToken(req);
+  if (!email) return res.status(401).json({ error: "unauthorized" });
+  try {
+    const trips = await sql`
+      SELECT t.*, 
+        json_agg(tl.* ORDER BY tl.departs_at ASC NULLS LAST) FILTER (WHERE tl.id IS NOT NULL) as legs
+      FROM trips t
+      LEFT JOIN trip_legs tl ON tl.trip_id = t.id
+      WHERE t.user_email = ${email}
+      GROUP BY t.id
+      ORDER BY t.created_at DESC
+    `;
+    res.json({ trips });
+  } catch (e) {
+    console.error("[trips]", e.message);
+    res.status(500).json({ error: "db error" });
+  }
+});
+
+// ---------------------------------------------------------------------------
+// POST /trips — manually create a trip
+// ---------------------------------------------------------------------------
+app.post("/trips", async (req, res) => {
+  const email = await verifyAccessToken(req);
+  if (!email) return res.status(401).json({ error: "unauthorized" });
+  const { title, legs } = req.body || {};
+  if (!title) return res.status(400).json({ error: "title required" });
+  try {
+    const tripRows = await sql`
+      INSERT INTO trips (user_email, title, source)
+      VALUES (${email}, ${title}, 'manual')
+      RETURNING id
+    `;
+    const tripId = tripRows[0].id;
+    if (legs && Array.isArray(legs)) {
+      for (const leg of legs) {
+        await sql`
+          INSERT INTO trip_legs (trip_id, type, carrier, flight_number, origin, destination, departs_at, arrives_at, confirmation)
+          VALUES (
+            ${tripId},
+            ${leg.type || "flight"},
+            ${leg.carrier || null},
+            ${leg.flight_number || null},
+            ${leg.origin || null},
+            ${leg.destination || null},
+            ${leg.departs_at || null},
+            ${leg.arrives_at || null},
+            ${leg.confirmation || null}
+          )
+        `;
+      }
+    }
+    const result = await sql`
+      SELECT t.*, json_agg(tl.* ORDER BY tl.departs_at ASC NULLS LAST) FILTER (WHERE tl.id IS NOT NULL) as legs
+      FROM trips t LEFT JOIN trip_legs tl ON tl.trip_id = t.id
+      WHERE t.id = ${tripId} GROUP BY t.id
+    `;
+    res.json({ ok: true, trip: result[0] });
+  } catch (e) {
+    console.error("[trips/create]", e.message);
+    res.status(500).json({ error: "db error" });
+  }
+});
+
+// ---------------------------------------------------------------------------
+// DELETE /trips/:id — delete a trip
+// ---------------------------------------------------------------------------
+app.delete("/trips/:id", async (req, res) => {
+  const email = await verifyAccessToken(req);
+  if (!email) return res.status(401).json({ error: "unauthorized" });
+  try {
+    await sql`DELETE FROM trips WHERE id = ${req.params.id} AND user_email = ${email}`;
+    res.json({ ok: true });
+  } catch (e) {
+    res.status(500).json({ error: "db error" });
+  }
+});
+
+// ---------------------------------------------------------------------------
+// POST /concierge — LLM chat with trip context
+// ---------------------------------------------------------------------------
+app.post("/concierge", async (req, res) => {
+  const email = await verifyAccessToken(req);
+  if (!email) return res.status(401).json({ error: "unauthorized" });
+  const { message, history } = req.body || {};
+  if (!message) return res.status(400).json({ error: "message required" });
+  try {
+    // Fetch user's trips for context
+    const trips = await sql`
+      SELECT t.title, t.status, t.created_at,
+        json_agg(tl.* ORDER BY tl.departs_at ASC NULLS LAST) FILTER (WHERE tl.id IS NOT NULL) as legs
+      FROM trips t
+      LEFT JOIN trip_legs tl ON tl.trip_id = t.id
+      WHERE t.user_email = ${email}
+      GROUP BY t.id
+      ORDER BY t.created_at DESC
+      LIMIT 10
+    `;
+
+    const today = new Date().toISOString();
+    const tripsContext = trips.length > 0
+      ? JSON.stringify(trips, null, 2)
+      : "No trips found yet.";
+
+    const systemPrompt = `You are Wingman, a smart travel concierge AI. You have access to the user's upcoming trips and bookings.
+
+Today's date: ${today}
+User email: ${email}
+
+User's trips:
+${tripsContext}
+
+You help with:
+- Flight status and disruption risk (use the /predict endpoint data if asked)
+- Trip planning and recommendations
+- Rebooking suggestions when flights are disrupted
+- Hotel and restaurant recommendations
+- General travel advice
+
+Be concise, friendly, and proactive. If you don't have real-time flight status, say so clearly and suggest checking the airline app. Always refer to the user's actual trip data when relevant.`;
+
+    const messages = [
+      { role: "system", content: systemPrompt },
+      ...(Array.isArray(history) ? history.slice(-10) : []),
+      { role: "user", content: message },
+    ];
+
+    const completion = await openai.chat.completions.create({
+      model: "gpt-4o-mini",
+      messages,
+      max_tokens: 600,
+      temperature: 0.7,
+    });
+
+    const reply = completion.choices[0].message.content;
+    res.json({ ok: true, reply });
+  } catch (e) {
+    console.error("[concierge]", e.message);
+    res.status(500).json({ error: "concierge error: " + e.message });
+  }
+});
+
+// ---------------------------------------------------------------------------
+// Prediction — live weather risk
 // ---------------------------------------------------------------------------
 const ICAO = {
   DEN: "KDEN", ASE: "KASE", JFK: "KJFK", ORD: "KORD", SFO: "KSFO",
@@ -227,7 +622,6 @@ const ICAO = {
   CDG: "LFPG", AMS: "EHAM", FRA: "EDDF", ARN: "ESSA",
 };
 const MOUNTAIN = new Set(["ASE", "EGE", "JAC", "SUN", "TEX", "MTJ", "HDN", "GUC"]);
-
 async function metar(icao) {
   try {
     const r = await fetch(
@@ -237,26 +631,18 @@ async function metar(icao) {
     if (!r.ok) return null;
     const j = await r.json();
     return Array.isArray(j) && j[0] ? j[0] : null;
-  } catch {
-    return null;
-  }
+  } catch { return null; }
 }
-
 function weatherScore(m) {
   if (!m) return { score: 0.12, notes: ["no live report — baseline only"], raw: null };
-  let score = 0;
-  const notes = [];
+  let score = 0; const notes = [];
   let vis = m.visib;
   if (typeof vis === "string") vis = parseFloat(vis);
   if (!isNaN(vis)) {
     if (vis < 1) { score += 0.4; notes.push("visibility under 1 mi"); }
     else if (vis < 3) { score += 0.25; notes.push("low visibility " + vis + " mi"); }
   }
-  const ceil = (m.clouds || [])
-    .filter((c) => ["BKN", "OVC"].includes(c.cover))
-    .map((c) => c.base)
-    .filter((x) => x != null)
-    .sort((a, b) => a - b)[0];
+  const ceil = (m.clouds || []).filter(c => ["BKN","OVC"].includes(c.cover)).map(c => c.base).filter(x => x != null).sort((a,b) => a-b)[0];
   if (ceil != null) {
     if (ceil < 500) { score += 0.3; notes.push("ceiling under 500 ft"); }
     else if (ceil < 1000) { score += 0.18; notes.push("low ceiling " + ceil + " ft"); }
@@ -273,58 +659,35 @@ function weatherScore(m) {
   if (/\bFG\b|\bBR\b/.test(wx)) { score += 0.12; notes.push("fog / mist"); }
   return { score: Math.min(score, 1), notes, raw: m.rawOb || m.rawText || null };
 }
-
 function impactOf(points) {
   return points >= 22 ? "High impact" : points >= 10 ? "Medium" : "Low";
 }
-
 app.get("/predict", async (req, res) => {
   const dep = String(req.query.dep || "DEN").toUpperCase();
   const arr = String(req.query.arr || "ASE").toUpperCase();
   const depI = ICAO[dep] || "K" + dep;
   const arrI = ICAO[arr] || "K" + arr;
-
   const [dm, am] = await Promise.all([metar(depI), metar(arrI)]);
-  const dw = weatherScore(dm);
-  const aw = weatherScore(am);
+  const dw = weatherScore(dm); const aw = weatherScore(am);
   const mtn = (MOUNTAIN.has(arr) ? 1 : 0) * 0.85 + (MOUNTAIN.has(dep) ? 1 : 0) * 0.2;
-
   const fDep = Math.round(dw.score * 34);
   const fArr = Math.round(aw.score * 32);
   const fMtn = Math.round(Math.min(mtn, 1) * 20);
   const fBase = 6;
   const risk = Math.min(fDep + fArr + fMtn + fBase, 95);
-
   const factors = [
     { label: "Weather at " + dep, points: fDep, impact: impactOf(fDep), detail: dw.notes.join(", ") },
     { label: "Weather at " + arr, points: fArr, impact: impactOf(fArr), detail: aw.notes.join(", ") },
     { label: "Airport sensitivity", points: fMtn, impact: impactOf(fMtn), detail: MOUNTAIN.has(arr) ? arr + " has strict weather minimums" : "standard airport tolerances" },
     { label: "Connection & baseline", points: fBase, impact: "Low", detail: "layover slack and seasonal cancellation base rate" },
-  ].filter((f) => f.points > 0);
-
+  ].filter(f => f.points > 0);
   const email = await verifyAccessToken(req);
-
-  res.json({
-    dep, arr, risk,
-    live: !!(dm || am),
-    summary: risk >= 60
-      ? "High disruption risk on " + dep + " -> " + arr + "."
-      : risk >= 35
-        ? "Moderate disruption risk on " + dep + " -> " + arr + "."
-        : "Conditions look manageable on " + dep + " -> " + arr + ".",
-    factors,
-    sources: ["aviationweather.gov METAR", "airport ops profile"],
-    metar: { dep: dw.raw, arr: aw.raw },
-    user: email,
-    ts: Date.now(),
-  });
+  res.json({ dep, arr, risk, live: !!(dm || am), summary: risk >= 60 ? "High disruption risk on " + dep + " -> " + arr + "." : risk >= 35 ? "Moderate disruption risk on " + dep + " -> " + arr + "." : "Conditions look manageable on " + dep + " -> " + arr + ".", factors, sources: ["aviationweather.gov METAR", "airport ops profile"], metar: { dep: dw.raw, arr: aw.raw }, user: email, ts: Date.now() });
 });
 
-
 // ---------------------------------------------------------------------------
-// Privacy Policy page
+// Privacy Policy
 // ---------------------------------------------------------------------------
-const path = require("path");
 app.get("/privacy", (_req, res) => {
   res.sendFile(path.join(__dirname, "privacy.html"));
 });
