@@ -15,6 +15,7 @@ const { Resend } = require("resend");
 const { google } = require("googleapis");
 const Anthropic = require("@anthropic-ai/sdk");
 const path = require("path");
+const { Duffel } = require("@duffel/api");
 
 const app = express();
 app.use(cors());
@@ -2223,6 +2224,205 @@ app.post("/subscription/webhook", express.raw({ type: "*/*" }), async (req, res)
     res.json({ received: true });
   } catch (e) {
     console.error("[stripe-webhook]", e.message);
+    res.status(500).json({ error: e.message });
+  }
+});
+
+// ---------------------------------------------------------------------------
+// Duffel — flight search + booking
+// ---------------------------------------------------------------------------
+function getDuffel() {
+  if (!process.env.DUFFEL_API_KEY) throw new Error("DUFFEL_API_KEY not set");
+  return new Duffel({ token: process.env.DUFFEL_API_KEY });
+}
+
+// POST /flights/search
+// Body: { origin, destination, departure_date, return_date?, cabin_class?, passengers? }
+app.post("/flights/search", async (req, res) => {
+  try {
+    const user = await verifyAccessToken(req);
+    if (!user) return res.status(401).json({ error: "Unauthorized" });
+    const { origin, destination, departure_date, return_date, cabin_class = "economy", passengers = 1 } = req.body;
+    if (!origin || !destination || !departure_date) {
+      return res.status(400).json({ error: "origin, destination, and departure_date are required" });
+    }
+    const duffel = getDuffel();
+    const paxArray = Array.from({ length: passengers }, () => ({ type: "adult" }));
+    const slices = [{ origin, destination, departure_date }];
+    if (return_date) slices.push({ origin: destination, destination: origin, departure_date: return_date });
+    const offerRequest = await duffel.offerRequests.create({
+      slices,
+      passengers: paxArray,
+      cabin_class,
+      return_offers: true,
+      supplier_timeout: 15000,
+    });
+    // Return top 20 offers sorted by price
+    const offers = (offerRequest.data.offers || [])
+      .sort((a, b) => parseFloat(a.total_amount) - parseFloat(b.total_amount))
+      .slice(0, 20)
+      .map(o => ({
+        id: o.id,
+        total_amount: o.total_amount,
+        total_currency: o.total_currency,
+        expires_at: o.expires_at,
+        slices: o.slices.map(s => ({
+          origin: s.origin?.iata_code,
+          origin_name: s.origin?.name,
+          destination: s.destination?.iata_code,
+          destination_name: s.destination?.name,
+          duration: s.duration,
+          segments: s.segments.map(seg => ({
+            id: seg.id,
+            carrier: seg.marketing_carrier?.name,
+            carrier_iata: seg.marketing_carrier?.iata_code,
+            carrier_logo: seg.marketing_carrier?.logo_symbol_url,
+            flight_number: seg.marketing_carrier_flight_number,
+            origin: seg.origin?.iata_code,
+            destination: seg.destination?.iata_code,
+            departing_at: seg.departing_at,
+            arriving_at: seg.arriving_at,
+            duration: seg.duration,
+            aircraft: seg.aircraft?.name,
+            stops: seg.stops?.length || 0,
+          })),
+        })),
+        passengers: o.passengers,
+        conditions: {
+          refundable: o.conditions?.refund_before_departure?.allowed || false,
+          changeable: o.conditions?.change_before_departure?.allowed || false,
+        },
+        baggages: o.slices?.[0]?.segments?.[0]?.passengers?.[0]?.baggages || [],
+      }));
+    res.json({ offers, offer_request_id: offerRequest.data.id });
+  } catch (e) {
+    console.error("[duffel-search]", e.message);
+    res.status(500).json({ error: e.message });
+  }
+});
+
+// GET /flights/offer/:offerId — get full offer details before booking
+app.get("/flights/offer/:offerId", async (req, res) => {
+  try {
+    const user = await verifyAccessToken(req);
+    if (!user) return res.status(401).json({ error: "Unauthorized" });
+    const duffel = getDuffel();
+    const offer = await duffel.offers.get(req.params.offerId);
+    res.json({ offer: offer.data });
+  } catch (e) {
+    console.error("[duffel-offer]", e.message);
+    res.status(500).json({ error: e.message });
+  }
+});
+
+// POST /flights/book
+// Body: { offer_id, passengers: [{ given_name, family_name, born_on, gender, email, phone, passport_number?, passport_expiry?, passport_country? }] }
+app.post("/flights/book", async (req, res) => {
+  try {
+    const user = await verifyAccessToken(req);
+    if (!user) return res.status(401).json({ error: "Unauthorized" });
+    const { offer_id, passengers } = req.body;
+    if (!offer_id || !passengers?.length) {
+      return res.status(400).json({ error: "offer_id and passengers are required" });
+    }
+    const duffel = getDuffel();
+    // Get the offer to check expiry and passenger requirements
+    const offerData = await duffel.offers.get(offer_id);
+    const offer = offerData.data;
+    // Map passengers with IDs from the offer
+    const offerPassengerIds = offer.passengers.map(p => p.id);
+    const mappedPassengers = passengers.map((p, i) => ({
+      id: offerPassengerIds[i],
+      given_name: p.given_name,
+      family_name: p.family_name,
+      born_on: p.born_on,
+      gender: p.gender,
+      email: p.email || user.email,
+      phone_number: p.phone || "+10000000000",
+      ...(p.passport_number ? {
+        identity_documents: [{
+          type: "passport",
+          unique_identifier: p.passport_number,
+          expires_on: p.passport_expiry,
+          issuing_country_code: p.passport_country || "US",
+        }]
+      } : {}),
+    }));
+    const order = await duffel.orders.create({
+      selected_offers: [offer_id],
+      passengers: mappedPassengers,
+      payments: [{
+        type: "balance",
+        currency: offer.total_currency,
+        amount: offer.total_amount,
+      }],
+      metadata: { wingman_user: user.email },
+    });
+    const orderData = order.data;
+    // Save as a trip in the DB
+    const firstSlice = offer.slices?.[0];
+    const lastSlice = offer.slices?.[offer.slices.length - 1];
+    const tripTitle = `${firstSlice?.origin?.iata_code || ""} → ${lastSlice?.destination?.iata_code || ""}`;
+    const [trip] = await sql`
+      INSERT INTO trips (user_email, title, status, source)
+      VALUES (${user.email}, ${tripTitle}, 'upcoming', 'duffel')
+      RETURNING id
+    `;
+    // Insert each slice as a trip leg
+    for (const slice of offer.slices) {
+      for (const seg of slice.segments) {
+        await sql`
+          INSERT INTO trip_legs (trip_id, type, carrier, flight_number, origin, destination, departs_at, arrives_at, confirmation, raw_data)
+          VALUES (
+            ${trip.id}, 'flight',
+            ${seg.marketing_carrier?.name || null},
+            ${(seg.marketing_carrier?.iata_code || "") + (seg.marketing_carrier_flight_number || "")},
+            ${seg.origin?.iata_code || null},
+            ${seg.destination?.iata_code || null},
+            ${seg.departing_at || null},
+            ${seg.arriving_at || null},
+            ${orderData.booking_reference || null},
+            ${JSON.stringify({ duffel_order_id: orderData.id, segment_id: seg.id })}
+          )
+        `;
+      }
+    }
+    await logActivity(
+      user.email, "booking",
+      `Flight booked: ${tripTitle}`,
+      `Booking confirmed. Reference: ${orderData.booking_reference}. Total: ${offer.total_currency} ${offer.total_amount}.`,
+      trip.id, null,
+      { duffel_order_id: orderData.id, booking_reference: orderData.booking_reference }
+    );
+    res.json({
+      order_id: orderData.id,
+      booking_reference: orderData.booking_reference,
+      trip_id: trip.id,
+      total_amount: offer.total_amount,
+      total_currency: offer.total_currency,
+      slices: orderData.slices,
+    });
+  } catch (e) {
+    console.error("[duffel-book]", e.message);
+    res.status(500).json({ error: e.message });
+  }
+});
+
+// GET /flights/orders — list user's Duffel bookings
+app.get("/flights/orders", async (req, res) => {
+  try {
+    const user = await verifyAccessToken(req);
+    if (!user) return res.status(401).json({ error: "Unauthorized" });
+    const rows = await sql`
+      SELECT t.id, t.title, t.created_at, tl.carrier, tl.flight_number, tl.origin, tl.destination, tl.departs_at, tl.confirmation, tl.raw_data
+      FROM trips t
+      JOIN trip_legs tl ON tl.trip_id = t.id
+      WHERE t.user_email = ${user.email} AND t.source = 'duffel'
+      ORDER BY tl.departs_at ASC
+    `;
+    res.json({ bookings: rows });
+  } catch (e) {
+    console.error("[duffel-orders]", e.message);
     res.status(500).json({ error: e.message });
   }
 });

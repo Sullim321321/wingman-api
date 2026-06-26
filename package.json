@@ -13,6 +13,7 @@
   },
   "dependencies": {
     "@anthropic-ai/sdk": "^0.39.0",
+    "@duffel/api": "^4.27.1",
     "@neondatabase/serverless": "^1.1.0",
     "@upstash/redis": "^1.38.0",
     "cors": "^2.8.5",
