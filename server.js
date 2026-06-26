@@ -2036,8 +2036,9 @@ function buildPassData(leg, email, passTypeId, teamId) {
 }
 
 // ---------------------------------------------------------------------------
-// AirLabs — aircraft type lookup + seat configuration inference
+// FlightAware AeroAPI — aircraft type lookup + seat configuration inference
 // Replaces Amadeus SeatMap (shut down July 17, 2026)
+// Reuses the existing FLIGHTAWARE_API_KEY — no new key needed
 // ---------------------------------------------------------------------------
 
 // Known aircraft seat configurations: { cols, aisle_positions, has_window_suite }
@@ -2063,28 +2064,43 @@ const AIRCRAFT_CONFIGS = {
   "B747": { layout: "3-4-3", cols: ["A","B","C","D","E","F","G","H","J","K"], aisles: ["C","D","G","H"], windows: ["A","K"] },
 };
 
-// Get aircraft config from AirLabs for a flight, then infer seat layout
-async function getAirLabsSeatConfig(leg) {
+// Get aircraft config from FlightAware AeroAPI for a flight, then infer seat layout
+// Uses the same FLIGHTAWARE_API_KEY already in use for disruption polling
+async function getFlightAwareSeatConfig(leg) {
   try {
-    const apiKey = process.env.AIRLABS_API_KEY;
+    const apiKey = process.env.FLIGHTAWARE_API_KEY;
     if (!apiKey) return null;
     const ident = (leg.carrier || "") + (leg.flight_number || "");
     if (!ident) return null;
-    // Look up the flight to get aircraft type
-    const url = `https://airlabs.co/api/v9/flight?flight_iata=${encodeURIComponent(ident)}&api_key=${apiKey}`;
-    const resp = await fetch(url, { signal: AbortSignal.timeout(8000) });
+    // Fetch recent flights for this ident to get aircraft_type
+    const url = `https://aeroapi.flightaware.com/aeroapi/flights/${encodeURIComponent(ident)}?max_pages=1`;
+    const resp = await fetch(url, {
+      headers: { "x-apikey": apiKey },
+      signal: AbortSignal.timeout(8000),
+    });
+    if (!resp.ok) return null;
     const data = await resp.json();
-    if (!data.response) return null;
-    const flight = data.response;
-    const aircraftIcao = flight.aircraft_icao || flight.aircraft_code || null;
-    if (!aircraftIcao) return null;
+    const flights = data.flights || [];
+    if (flights.length === 0) return null;
+    // Find the most relevant flight (closest departure date to leg)
+    const legDep = leg.departs_at ? new Date(leg.departs_at).getTime() : null;
+    let bestFlight = flights[0];
+    if (legDep) {
+      bestFlight = flights.reduce((best, f) => {
+        const fDep = f.scheduled_out ? new Date(f.scheduled_out).getTime() : 0;
+        const bestDep = best.scheduled_out ? new Date(best.scheduled_out).getTime() : 0;
+        return Math.abs(fDep - legDep) < Math.abs(bestDep - legDep) ? f : best;
+      }, flights[0]);
+    }
+    const aircraftType = bestFlight.aircraft_type || null;
+    if (!aircraftType) return null;
     // Match to known config (try exact, then prefix)
-    const config = AIRCRAFT_CONFIGS[aircraftIcao.toUpperCase()] ||
-      Object.entries(AIRCRAFT_CONFIGS).find(([k]) => aircraftIcao.toUpperCase().startsWith(k))?.[1] ||
+    const config = AIRCRAFT_CONFIGS[aircraftType.toUpperCase()] ||
+      Object.entries(AIRCRAFT_CONFIGS).find(([k]) => aircraftType.toUpperCase().startsWith(k))?.[1] ||
       null;
-    return config ? { ...config, aircraft: aircraftIcao, ident } : null;
+    return config ? { ...config, aircraft: aircraftType, ident } : null;
   } catch (e) {
-    console.error("[airlabs-seat]", e.message);
+    console.error("[flightaware-seat]", e.message);
     return null;
   }
 }
@@ -2169,14 +2185,14 @@ async function checkSeatPreferenceAlerts(legs) {
         `;
         if (recentAlerts.length > 0) continue;
         const ident = (leg.carrier || "") + leg.flight_number;
-        // Try to get aircraft config from AirLabs, then infer seat layout
+        // Try to get aircraft config from FlightAware, then infer seat layout
         let matchingSeats = [];
         let usedLiveData = false;
         let aircraftInfo = null;
-        const airLabsConfig = await getAirLabsSeatConfig(leg);
-        if (airLabsConfig) {
-          aircraftInfo = airLabsConfig.aircraft;
-          const seatMap = inferSeatsFromConfig(airLabsConfig);
+        const flightAwareConfig = await getFlightAwareSeatConfig(leg);
+        if (flightAwareConfig) {
+          aircraftInfo = flightAwareConfig.aircraft;
+          const seatMap = inferSeatsFromConfig(flightAwareConfig);
           if (seatMap.length > 0) {
             usedLiveData = true; // We have aircraft-specific layout data
             // Check each user pref against the inferred seat map
@@ -2194,7 +2210,7 @@ async function checkSeatPreferenceAlerts(legs) {
                   seats: matches.slice(0, 3).map(s => s.designator || (s.number + s.column)),
                   count: matches.length,
                   aircraft: aircraftInfo,
-                  layout: airLabsConfig.layout,
+                  layout: flightAwareConfig.layout,
                 });
               }
             }
