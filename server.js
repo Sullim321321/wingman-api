@@ -160,6 +160,18 @@ async function bootstrapDB() {
         UNIQUE(user_email, provider_code)
       )
     `;
+    await sql`
+      CREATE TABLE IF NOT EXISTS uber_tokens (
+        id SERIAL PRIMARY KEY,
+        user_email TEXT UNIQUE NOT NULL,
+        access_token TEXT NOT NULL,
+        refresh_token TEXT,
+        token_type TEXT DEFAULT 'Bearer',
+        scope TEXT,
+        expires_at TIMESTAMPTZ,
+        updated_at TIMESTAMPTZ DEFAULT NOW()
+      )
+    `;
     console.log("[db] tables ready");
   } catch (e) {
     console.error("[db] bootstrap error:", e.message);
@@ -972,6 +984,96 @@ app.post("/auth/gmail/scan", async (req, res) => {
 });
 
 // ---------------------------------------------------------------------------
+// Uber OAuth — GET /auth/uber/connect — returns Uber OAuth URL for user to authorize
+// ---------------------------------------------------------------------------
+app.get("/auth/uber/connect", async (req, res) => {
+  const email = await verifyAccessToken(req);
+  if (!email) return res.status(401).json({ error: "unauthorized" });
+  const clientId = process.env.UBER_CLIENT_ID;
+  if (!clientId) return res.status(503).json({ error: "Uber not configured" });
+  const redirectUri = encodeURIComponent(process.env.UBER_REDIRECT_URI || "https://wingman-api-y39a.onrender.com/auth/uber/callback");
+  const state = Buffer.from(email).toString("base64");
+  const scope = encodeURIComponent("profile ride_widgets request");
+  const url = `https://login.uber.com/oauth/v2/authorize?client_id=${clientId}&response_type=code&redirect_uri=${redirectUri}&scope=${scope}&state=${state}`;
+  res.json({ url });
+});
+
+// ---------------------------------------------------------------------------
+// Uber OAuth — GET /auth/uber/callback — handles redirect from Uber
+// ---------------------------------------------------------------------------
+app.get("/auth/uber/callback", async (req, res) => {
+  const { code, state } = req.query;
+  if (!code || !state) return res.status(400).send("Missing code or state");
+  let userEmail;
+  try {
+    userEmail = Buffer.from(state, "base64").toString("utf8");
+  } catch {
+    return res.status(400).send("Invalid state");
+  }
+  try {
+    const clientId = process.env.UBER_CLIENT_ID;
+    const clientSecret = process.env.UBER_CLIENT_SECRET;
+    const redirectUri = process.env.UBER_REDIRECT_URI || "https://wingman-api-y39a.onrender.com/auth/uber/callback";
+    if (!clientId || !clientSecret) return res.status(503).send("Uber not configured");
+    // Exchange code for tokens
+    const tokenResp = await fetch("https://login.uber.com/oauth/v2/token", {
+      method: "POST",
+      headers: { "Content-Type": "application/x-www-form-urlencoded" },
+      body: new URLSearchParams({
+        client_id: clientId,
+        client_secret: clientSecret,
+        grant_type: "authorization_code",
+        redirect_uri: redirectUri,
+        code,
+      }).toString(),
+    });
+    const tokens = await tokenResp.json();
+    if (!tokens.access_token) throw new Error("Uber token exchange failed: " + JSON.stringify(tokens));
+    const expiresAt = tokens.expires_in ? new Date(Date.now() + tokens.expires_in * 1000).toISOString() : null;
+    await sql`
+      INSERT INTO uber_tokens (user_email, access_token, refresh_token, token_type, scope, expires_at)
+      VALUES (${userEmail}, ${tokens.access_token}, ${tokens.refresh_token || null}, ${tokens.token_type || 'Bearer'}, ${tokens.scope || null}, ${expiresAt})
+      ON CONFLICT (user_email) DO UPDATE SET
+        access_token = EXCLUDED.access_token,
+        refresh_token = COALESCE(EXCLUDED.refresh_token, uber_tokens.refresh_token),
+        token_type = EXCLUDED.token_type,
+        scope = EXCLUDED.scope,
+        expires_at = EXCLUDED.expires_at,
+        updated_at = NOW()
+    `;
+    await logActivity(userEmail, "uber", "Uber account connected", "Your Uber account is now linked to Wingman. Rides will be auto-dispatched when you land.", null, null, { connected: true });
+    res.send(`<html><body style="font-family:sans-serif;text-align:center;padding:60px;background:#0A0E1C;color:#fff">
+      <h2 style="color:#22D3A6">🚗 Uber connected!</h2>
+      <p>Wingman will auto-dispatch a ride when you land.</p>
+      <p style="color:#888;font-size:13px">You can close this tab and return to the app.</p>
+    </body></html>`);
+  } catch (e) {
+    console.error("[uber/callback]", e.message);
+    res.status(500).send("OAuth error: " + e.message);
+  }
+});
+
+// ---------------------------------------------------------------------------
+// GET /auth/uber/status — check if user has Uber connected
+// ---------------------------------------------------------------------------
+app.get("/auth/uber/status", async (req, res) => {
+  const email = await verifyAccessToken(req);
+  if (!email) return res.status(401).json({ error: "unauthorized" });
+  const rows = await sql`SELECT id, scope, expires_at, updated_at FROM uber_tokens WHERE user_email = ${email}`;
+  res.json({ connected: rows.length > 0, details: rows[0] || null });
+});
+
+// ---------------------------------------------------------------------------
+// DELETE /auth/uber/disconnect — remove user's Uber connection
+// ---------------------------------------------------------------------------
+app.delete("/auth/uber/disconnect", async (req, res) => {
+  const email = await verifyAccessToken(req);
+  if (!email) return res.status(401).json({ error: "unauthorized" });
+  await sql`DELETE FROM uber_tokens WHERE user_email = ${email}`;
+  res.json({ ok: true });
+});
+
+// ---------------------------------------------------------------------------
 // GET /trips — get all trips for current user
 // ---------------------------------------------------------------------------
 app.get("/trips", async (req, res) => {
@@ -1567,12 +1669,42 @@ const AIRPORT_COORDS = {
   SYD: { lat: -33.9399, lng: 151.1753 }, GRU: { lat: -23.4356, lng: -46.4731 },
 };
 
-async function dispatchUberOnLanding(leg) {
-  const apiKey = process.env.UBER_SERVER_TOKEN;
-  if (!apiKey) {
-    console.log("[uber] UBER_SERVER_TOKEN not set — skipping dispatch");
-    return;
+// Get a valid Uber access token for a user (refreshes if expired)
+async function getUberAccessToken(userEmail) {
+  const rows = await sql`SELECT * FROM uber_tokens WHERE user_email = ${userEmail}`;
+  if (!rows[0]) return null;
+  const tokenRow = rows[0];
+  // Check if token is expired (with 5 min buffer)
+  if (tokenRow.expires_at && new Date(tokenRow.expires_at) < new Date(Date.now() + 5 * 60 * 1000)) {
+    // Try to refresh
+    if (tokenRow.refresh_token && process.env.UBER_CLIENT_ID && process.env.UBER_CLIENT_SECRET) {
+      try {
+        const refreshResp = await fetch("https://login.uber.com/oauth/v2/token", {
+          method: "POST",
+          headers: { "Content-Type": "application/x-www-form-urlencoded" },
+          body: new URLSearchParams({
+            client_id: process.env.UBER_CLIENT_ID,
+            client_secret: process.env.UBER_CLIENT_SECRET,
+            grant_type: "refresh_token",
+            refresh_token: tokenRow.refresh_token,
+          }).toString(),
+        });
+        const newTokens = await refreshResp.json();
+        if (newTokens.access_token) {
+          const expiresAt = newTokens.expires_in ? new Date(Date.now() + newTokens.expires_in * 1000).toISOString() : null;
+          await sql`UPDATE uber_tokens SET access_token = ${newTokens.access_token}, expires_at = ${expiresAt}, updated_at = NOW() WHERE user_email = ${userEmail}`;
+          return newTokens.access_token;
+        }
+      } catch (e) {
+        console.error("[uber] token refresh failed:", e.message);
+      }
+    }
+    return null; // expired and couldn't refresh
   }
+  return tokenRow.access_token;
+}
+
+async function dispatchUberOnLanding(leg) {
   const mode = (leg.trip_mode || "solo").toLowerCase();
   const airport = leg.destination; // IATA code
   const coords = AIRPORT_COORDS[airport];
@@ -1580,7 +1712,25 @@ async function dispatchUberOnLanding(leg) {
     console.log(`[uber] no coords for airport ${airport} — skipping dispatch`);
     return;
   }
-  // Fetch user's home/destination address from preferences
+  // Fetch user's Uber token and preferences
+  const userToken = await getUberAccessToken(leg.user_email);
+  if (!userToken) {
+    // User hasn't connected Uber — send a nudge notification
+    await logActivity(
+      leg.user_email, "uber",
+      `Connect Uber for auto-dispatch`,
+      `You've landed at ${airport}. Connect your Uber account in Wingman to auto-dispatch rides on landing.`,
+      leg.trip_id, leg.id,
+      { airport, mode, status: "not_connected" }
+    );
+    await sendPushToUser(
+      leg.user_email,
+      `🚗 Connect Uber for auto-dispatch`,
+      `Landed at ${airport}? Connect your Uber account in Wingman Settings to get automatic rides.`,
+      { route: "Connections" }
+    );
+    return;
+  }
   const userRows = await sql`SELECT preferences, push_token FROM users WHERE email = ${leg.user_email}`;
   const prefs = userRows[0]?.preferences || {};
   const dropoffAddr = prefs.home_address || null;
@@ -1588,21 +1738,7 @@ async function dispatchUberOnLanding(leg) {
   // Determine product
   const productMap = UBER_PRODUCTS[mode] || UBER_PRODUCTS.solo;
   const productId = productMap[airport] || productMap.default;
-  // Build ride request
-  const ridePayload = {
-    fare_id: null, // will be set after price estimate
-    product_id: productId,
-    start_latitude: coords.lat,
-    start_longitude: coords.lng,
-    start_address: `${airport} Airport`,
-    end_address: dropoffAddr || "Home",
-    rider_email: leg.user_email,
-    rider_name: leg.user_email.split("@")[0],
-    rider_phone: prefs.phone || null,
-    payment_method_id: process.env.UBER_PAYMENT_METHOD_ID || null,
-    note_for_driver: mode === "client" ? "Business trip — please have water available" : "",
-  };
-  // Step 1: Get price estimate
+  // Step 1: Get price estimate using user's own token
   let fareId = null;
   try {
     const estimateResp = await fetch(
@@ -1610,7 +1746,7 @@ async function dispatchUberOnLanding(leg) {
       {
         method: "POST",
         headers: {
-          "Authorization": `Token ${apiKey}`,
+          "Authorization": `Bearer ${userToken}`,
           "Content-Type": "application/json",
           "Accept-Language": "en_US",
         },
@@ -1664,8 +1800,9 @@ app.post("/uber/confirm", async (req, res) => {
     const token = authHeader.replace("Bearer ", "");
     const { email } = jwt.verify(token, JWT_SECRET);
     const { fare_id, product_id, airport } = req.body;
-    const apiKey = process.env.UBER_SERVER_TOKEN;
-    if (!apiKey) return res.status(503).json({ error: "Uber not configured" });
+    // Use user's own Uber token
+    const userToken = await getUberAccessToken(email);
+    if (!userToken) return res.status(403).json({ error: "Uber not connected. Please connect your Uber account in Settings > Connections." });
     const coords = AIRPORT_COORDS[airport];
     if (!coords) return res.status(400).json({ error: "Unknown airport" });
     const userRows = await sql`SELECT preferences FROM users WHERE email = ${email}`;
@@ -1674,7 +1811,7 @@ app.post("/uber/confirm", async (req, res) => {
     const resp = await fetch("https://api.uber.com/v1.2/requests", {
       method: "POST",
       headers: {
-        "Authorization": `Token ${apiKey}`,
+        "Authorization": `Bearer ${userToken}`,
         "Content-Type": "application/json",
       },
       body: JSON.stringify({
@@ -1684,8 +1821,6 @@ app.post("/uber/confirm", async (req, res) => {
         start_longitude: coords.lng,
         start_address: `${airport} Airport`,
         end_address: prefs.home_address || "Home",
-        rider_email: email,
-        payment_method_id: process.env.UBER_PAYMENT_METHOD_ID || undefined,
         note_for_driver: mode === "client" ? "Business trip — please have water available" : "",
       }),
     });
@@ -1713,8 +1848,9 @@ app.get("/uber/estimate", async (req, res) => {
     const token = authHeader.replace("Bearer ", "");
     const { email } = jwt.verify(token, JWT_SECRET);
     const { airport, mode } = req.query;
-    const apiKey = process.env.UBER_SERVER_TOKEN;
-    if (!apiKey) return res.status(503).json({ error: "Uber not configured" });
+    // Use user's own Uber token
+    const userToken = await getUberAccessToken(email);
+    if (!userToken) return res.status(403).json({ error: "Uber not connected", connect_url: "/auth/uber/connect" });
     const coords = AIRPORT_COORDS[airport];
     if (!coords) return res.status(400).json({ error: "Unknown airport" });
     const productMap = UBER_PRODUCTS[mode?.toLowerCase() || "solo"] || UBER_PRODUCTS.solo;
@@ -1724,7 +1860,7 @@ app.get("/uber/estimate", async (req, res) => {
     const resp = await fetch("https://api.uber.com/v1.2/requests/estimate", {
       method: "POST",
       headers: {
-        "Authorization": `Token ${apiKey}`,
+        "Authorization": `Bearer ${userToken}`,
         "Content-Type": "application/json",
       },
       body: JSON.stringify({
@@ -1900,79 +2036,82 @@ function buildPassData(leg, email, passTypeId, teamId) {
 }
 
 // ---------------------------------------------------------------------------
-// Amadeus OAuth2 token cache
+// AirLabs — aircraft type lookup + seat configuration inference
+// Replaces Amadeus SeatMap (shut down July 17, 2026)
 // ---------------------------------------------------------------------------
-let _amadeusToken = null;
-let _amadeusTokenExpiry = 0;
-async function getAmadeusToken() {
-  if (_amadeusToken && Date.now() < _amadeusTokenExpiry - 60000) return _amadeusToken;
-  const key = process.env.AMADEUS_API_KEY;
-  const secret = process.env.AMADEUS_API_SECRET;
-  if (!key || !secret) throw new Error("AMADEUS_API_KEY / AMADEUS_API_SECRET not set");
-  const resp = await fetch("https://test.api.amadeus.com/v1/security/oauth2/token", {
-    method: "POST",
-    headers: { "Content-Type": "application/x-www-form-urlencoded" },
-    body: `grant_type=client_credentials&client_id=${encodeURIComponent(key)}&client_secret=${encodeURIComponent(secret)}`,
-  });
-  const data = await resp.json();
-  if (!data.access_token) throw new Error("Amadeus auth failed: " + JSON.stringify(data));
-  _amadeusToken = data.access_token;
-  _amadeusTokenExpiry = Date.now() + (data.expires_in || 1799) * 1000;
-  return _amadeusToken;
-}
 
-// ---------------------------------------------------------------------------
-// Fetch seat map from Amadeus for a given flight leg
-// Returns array of { designator, cabin, available, characteristics }
-// ---------------------------------------------------------------------------
-async function getAmadeusSeatMap(leg) {
+// Known aircraft seat configurations: { cols, aisle_positions, has_window_suite }
+const AIRCRAFT_CONFIGS = {
+  // Narrowbody (3-3)
+  "B737": { layout: "3-3", cols: ["A","B","C","D","E","F"], aisles: ["C","D"], windows: ["A","F"] },
+  "B738": { layout: "3-3", cols: ["A","B","C","D","E","F"], aisles: ["C","D"], windows: ["A","F"] },
+  "B739": { layout: "3-3", cols: ["A","B","C","D","E","F"], aisles: ["C","D"], windows: ["A","F"] },
+  "B737MAX": { layout: "3-3", cols: ["A","B","C","D","E","F"], aisles: ["C","D"], windows: ["A","F"] },
+  "A319": { layout: "3-3", cols: ["A","B","C","D","E","F"], aisles: ["C","D"], windows: ["A","F"] },
+  "A320": { layout: "3-3", cols: ["A","B","C","D","E","F"], aisles: ["C","D"], windows: ["A","F"] },
+  "A321": { layout: "3-3", cols: ["A","B","C","D","E","F"], aisles: ["C","D"], windows: ["A","F"] },
+  "E175": { layout: "2-2", cols: ["A","B","C","D"], aisles: ["B","C"], windows: ["A","D"] },
+  "E190": { layout: "2-2", cols: ["A","B","C","D"], aisles: ["B","C"], windows: ["A","D"] },
+  "CRJ9": { layout: "2-2", cols: ["A","B","C","D"], aisles: ["B","C"], windows: ["A","D"] },
+  // Widebody (2-4-2 or 3-3-3)
+  "B767": { layout: "2-3-2", cols: ["A","B","C","D","E","F","G"], aisles: ["B","C","E","F"], windows: ["A","G"] },
+  "B777": { layout: "3-3-3", cols: ["A","B","C","D","E","F","G","H","J"], aisles: ["C","D","G","H"], windows: ["A","J"] },
+  "B787": { layout: "3-3-3", cols: ["A","B","C","D","E","F","G","H","J"], aisles: ["C","D","G","H"], windows: ["A","J"] },
+  "A330": { layout: "2-4-2", cols: ["A","B","C","D","E","F","G","H"], aisles: ["B","C","F","G"], windows: ["A","H"] },
+  "A350": { layout: "3-3-3", cols: ["A","B","C","D","E","F","G","H","J"], aisles: ["C","D","G","H"], windows: ["A","J"] },
+  "A380": { layout: "3-4-3", cols: ["A","B","C","D","E","F","G","H","J","K"], aisles: ["C","D","G","H"], windows: ["A","K"] },
+  "B747": { layout: "3-4-3", cols: ["A","B","C","D","E","F","G","H","J","K"], aisles: ["C","D","G","H"], windows: ["A","K"] },
+};
+
+// Get aircraft config from AirLabs for a flight, then infer seat layout
+async function getAirLabsSeatConfig(leg) {
   try {
-    const token = await getAmadeusToken();
-    // Amadeus SeatMap Display requires a flight offer — we use the by-flight endpoint
-    const depDate = leg.departs_at ? leg.departs_at.split("T")[0] : null;
-    if (!depDate || !leg.carrier || !leg.flight_number || !leg.origin || !leg.destination) return null;
-    // Strip carrier prefix from flight number if present (e.g. "UA412" -> "412")
-    const flightNum = leg.flight_number.replace(/^[A-Z]{2}/i, "").trim();
-    const url = `https://test.api.amadeus.com/v1/shopping/seatmaps?flightOrderId=&originDestinationId=1&segmentId=1`;
-    // Use the flight-offers/seatmaps endpoint with a search
-    const searchUrl = `https://test.api.amadeus.com/v1/shopping/seatmaps`;
-    // Build a minimal flight offer search to get an offer ID for the seat map
-    const offersUrl = `https://test.api.amadeus.com/v2/shopping/flight-offers?originLocationCode=${leg.origin}&destinationLocationCode=${leg.destination}&departureDate=${depDate}&adults=1&travelClass=ECONOMY&includedAirlineCodes=${leg.carrier}&max=1`;
-    const offersResp = await fetch(offersUrl, {
-      headers: { Authorization: `Bearer ${token}` },
-    });
-    const offersData = await offersResp.json();
-    if (!offersData.data || offersData.data.length === 0) return null;
-    // Get seat map for the first matching offer
-    const seatResp = await fetch(searchUrl, {
-      method: "POST",
-      headers: { Authorization: `Bearer ${token}`, "Content-Type": "application/json" },
-      body: JSON.stringify({ data: [offersData.data[0]] }),
-    });
-    const seatData = await seatResp.json();
-    if (!seatData.data || seatData.data.length === 0) return null;
-    // Flatten all seats from all decks and cabins
-    const seats = [];
-    for (const seatMap of seatData.data) {
-      for (const deck of seatMap.decks || []) {
-        const cabin = deck.deckConfiguration?.startSeatRow ? "economy" : "unknown";
-        for (const row of deck.seats || []) {
-          seats.push({
-            designator: row.number + row.characteristicsCodes?.join(""),
-            cabin: deck.deckType || cabin,
-            available: row.travelerPricing?.[0]?.seatAvailabilityStatus === "AVAILABLE",
-            characteristics: row.characteristicsCodes || [],
-            number: row.number,
-            column: row.characteristicsCodes?.find(c => /^[A-K]$/.test(c)) || "",
-          });
-        }
-      }
-    }
-    return seats;
+    const apiKey = process.env.AIRLABS_API_KEY;
+    if (!apiKey) return null;
+    const ident = (leg.carrier || "") + (leg.flight_number || "");
+    if (!ident) return null;
+    // Look up the flight to get aircraft type
+    const url = `https://airlabs.co/api/v9/flight?flight_iata=${encodeURIComponent(ident)}&api_key=${apiKey}`;
+    const resp = await fetch(url, { signal: AbortSignal.timeout(8000) });
+    const data = await resp.json();
+    if (!data.response) return null;
+    const flight = data.response;
+    const aircraftIcao = flight.aircraft_icao || flight.aircraft_code || null;
+    if (!aircraftIcao) return null;
+    // Match to known config (try exact, then prefix)
+    const config = AIRCRAFT_CONFIGS[aircraftIcao.toUpperCase()] ||
+      Object.entries(AIRCRAFT_CONFIGS).find(([k]) => aircraftIcao.toUpperCase().startsWith(k))?.[1] ||
+      null;
+    return config ? { ...config, aircraft: aircraftIcao, ident } : null;
   } catch (e) {
-    console.error("[amadeus-seatmap]", e.message);
+    console.error("[airlabs-seat]", e.message);
     return null;
   }
+}
+
+// Infer seat availability hints from aircraft config + user preferences
+// Returns array matching the old Amadeus format: { designator, cabin, available, characteristics }
+function inferSeatsFromConfig(config, totalRows = 30) {
+  if (!config) return [];
+  const seats = [];
+  for (let row = 1; row <= totalRows; row++) {
+    for (const col of config.cols) {
+      const chars = [];
+      if (config.windows.includes(col)) chars.push("W");
+      if (config.aisles.includes(col)) chars.push("A");
+      if (row <= 2) chars.push("B"); // bulkhead approximation
+      if (row >= Math.floor(totalRows * 0.4) && row <= Math.floor(totalRows * 0.5)) chars.push("E"); // exit row approx
+      seats.push({
+        designator: `${row}${col}`,
+        cabin: "ECONOMY",
+        available: true, // we can't know real availability without booking data
+        characteristics: chars,
+        number: String(row),
+        column: col,
+      });
+    }
+  }
+  return seats;
 }
 
 // ---------------------------------------------------------------------------
@@ -2030,27 +2169,34 @@ async function checkSeatPreferenceAlerts(legs) {
         `;
         if (recentAlerts.length > 0) continue;
         const ident = (leg.carrier || "") + leg.flight_number;
-        // Try to get real seat map from Amadeus
+        // Try to get aircraft config from AirLabs, then infer seat layout
         let matchingSeats = [];
         let usedLiveData = false;
-        const seatMap = await getAmadeusSeatMap(leg);
-        if (seatMap && seatMap.length > 0) {
-          usedLiveData = true;
-          // Check each user pref against the live seat map
-          for (const pref of seatPrefs) {
-            const criteria = SEAT_PREF_TO_CHARACTERISTICS[pref];
-            if (!criteria) continue;
-            const matches = seatMap.filter(s =>
-              s.available &&
-              s.characteristics.some(c => criteria.chars.includes(c))
-            );
-            if (matches.length > 0) {
-              matchingSeats.push({
-                pref,
-                label: SEAT_LABELS[pref] || pref,
-                seats: matches.slice(0, 3).map(s => s.designator || (s.number + s.column)),
-                count: matches.length,
-              });
+        let aircraftInfo = null;
+        const airLabsConfig = await getAirLabsSeatConfig(leg);
+        if (airLabsConfig) {
+          aircraftInfo = airLabsConfig.aircraft;
+          const seatMap = inferSeatsFromConfig(airLabsConfig);
+          if (seatMap.length > 0) {
+            usedLiveData = true; // We have aircraft-specific layout data
+            // Check each user pref against the inferred seat map
+            for (const pref of seatPrefs) {
+              const criteria = SEAT_PREF_TO_CHARACTERISTICS[pref];
+              if (!criteria) continue;
+              const matches = seatMap.filter(s =>
+                s.available &&
+                s.characteristics.some(c => criteria.chars.includes(c))
+              );
+              if (matches.length > 0) {
+                matchingSeats.push({
+                  pref,
+                  label: SEAT_LABELS[pref] || pref,
+                  seats: matches.slice(0, 3).map(s => s.designator || (s.number + s.column)),
+                  count: matches.length,
+                  aircraft: aircraftInfo,
+                  layout: airLabsConfig.layout,
+                });
+              }
             }
           }
         }
@@ -2067,8 +2213,9 @@ async function checkSeatPreferenceAlerts(legs) {
         if (matchingSeats.length > 0) {
           const best = matchingSeats[0];
           const seatList = best.seats.join(", ");
+          const aircraftNote = best.aircraft ? ` (${best.aircraft}, ${best.layout} layout)` : "";
           const activityBody = usedLiveData
-            ? `Live seat map check: ${best.count} ${best.label} seat${best.count !== 1 ? "s" : ""} available on ${leg.origin} → ${leg.destination}. Best options: ${seatList}.`
+            ? `Aircraft${aircraftNote}: ${best.count} ${best.label} seat${best.count !== 1 ? "s" : ""} on ${leg.origin} → ${leg.destination}. Typical positions: ${seatList}. Check the airline app to select.`
             : `Your preferred seat (${best.label}) may be available on ${leg.origin} → ${leg.destination}. Check the airline app to confirm.`;
           await logActivity(
             userEmail, "seat_alert",
