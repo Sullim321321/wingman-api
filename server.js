@@ -160,18 +160,6 @@ async function bootstrapDB() {
         UNIQUE(user_email, provider_code)
       )
     `;
-    await sql`
-      CREATE TABLE IF NOT EXISTS uber_tokens (
-        id SERIAL PRIMARY KEY,
-        user_email TEXT UNIQUE NOT NULL,
-        access_token TEXT NOT NULL,
-        refresh_token TEXT,
-        token_type TEXT DEFAULT 'Bearer',
-        scope TEXT,
-        expires_at TIMESTAMPTZ,
-        updated_at TIMESTAMPTZ DEFAULT NOW()
-      )
-    `;
     console.log("[db] tables ready");
   } catch (e) {
     console.error("[db] bootstrap error:", e.message);
@@ -984,93 +972,40 @@ app.post("/auth/gmail/scan", async (req, res) => {
 });
 
 // ---------------------------------------------------------------------------
-// Uber OAuth — GET /auth/uber/connect — returns Uber OAuth URL for user to authorize
+// GET /uber/deeplink — returns a pre-filled Uber deep link for a given airport
+// No OAuth required — opens the Uber app directly on the user's phone
 // ---------------------------------------------------------------------------
-app.get("/auth/uber/connect", async (req, res) => {
-  const email = await verifyAccessToken(req);
-  if (!email) return res.status(401).json({ error: "unauthorized" });
-  const clientId = process.env.UBER_CLIENT_ID;
-  if (!clientId) return res.status(503).json({ error: "Uber not configured" });
-  const redirectUri = encodeURIComponent(process.env.UBER_REDIRECT_URI || "https://wingman-api-y39a.onrender.com/auth/uber/callback");
-  const state = Buffer.from(email).toString("base64");
-  const scope = encodeURIComponent("profile ride_widgets request");
-  const url = `https://login.uber.com/oauth/v2/authorize?client_id=${clientId}&response_type=code&redirect_uri=${redirectUri}&scope=${scope}&state=${state}`;
-  res.json({ url });
-});
-
-// ---------------------------------------------------------------------------
-// Uber OAuth — GET /auth/uber/callback — handles redirect from Uber
-// ---------------------------------------------------------------------------
-app.get("/auth/uber/callback", async (req, res) => {
-  const { code, state } = req.query;
-  if (!code || !state) return res.status(400).send("Missing code or state");
-  let userEmail;
+app.get("/uber/deeplink", async (req, res) => {
   try {
-    userEmail = Buffer.from(state, "base64").toString("utf8");
-  } catch {
-    return res.status(400).send("Invalid state");
-  }
-  try {
-    const clientId = process.env.UBER_CLIENT_ID;
-    const clientSecret = process.env.UBER_CLIENT_SECRET;
-    const redirectUri = process.env.UBER_REDIRECT_URI || "https://wingman-api-y39a.onrender.com/auth/uber/callback";
-    if (!clientId || !clientSecret) return res.status(503).send("Uber not configured");
-    // Exchange code for tokens
-    const tokenResp = await fetch("https://login.uber.com/oauth/v2/token", {
-      method: "POST",
-      headers: { "Content-Type": "application/x-www-form-urlencoded" },
-      body: new URLSearchParams({
-        client_id: clientId,
-        client_secret: clientSecret,
-        grant_type: "authorization_code",
-        redirect_uri: redirectUri,
-        code,
-      }).toString(),
-    });
-    const tokens = await tokenResp.json();
-    if (!tokens.access_token) throw new Error("Uber token exchange failed: " + JSON.stringify(tokens));
-    const expiresAt = tokens.expires_in ? new Date(Date.now() + tokens.expires_in * 1000).toISOString() : null;
-    await sql`
-      INSERT INTO uber_tokens (user_email, access_token, refresh_token, token_type, scope, expires_at)
-      VALUES (${userEmail}, ${tokens.access_token}, ${tokens.refresh_token || null}, ${tokens.token_type || 'Bearer'}, ${tokens.scope || null}, ${expiresAt})
-      ON CONFLICT (user_email) DO UPDATE SET
-        access_token = EXCLUDED.access_token,
-        refresh_token = COALESCE(EXCLUDED.refresh_token, uber_tokens.refresh_token),
-        token_type = EXCLUDED.token_type,
-        scope = EXCLUDED.scope,
-        expires_at = EXCLUDED.expires_at,
-        updated_at = NOW()
-    `;
-    await logActivity(userEmail, "uber", "Uber account connected", "Your Uber account is now linked to Wingman. Rides will be auto-dispatched when you land.", null, null, { connected: true });
-    res.send(`<html><body style="font-family:sans-serif;text-align:center;padding:60px;background:#0A0E1C;color:#fff">
-      <h2 style="color:#22D3A6">🚗 Uber connected!</h2>
-      <p>Wingman will auto-dispatch a ride when you land.</p>
-      <p style="color:#888;font-size:13px">You can close this tab and return to the app.</p>
-    </body></html>`);
+    const authHeader = req.headers.authorization || "";
+    const token = authHeader.replace("Bearer ", "");
+    const { email } = jwt.verify(token, JWT_SECRET);
+    const { airport } = req.query;
+    const coords = AIRPORT_COORDS[airport];
+    if (!coords) return res.status(400).json({ error: "Unknown airport" });
+    const userRows = await sql`SELECT preferences FROM users WHERE email = ${email}`;
+    const prefs = userRows[0]?.preferences || {};
+    const mode = (prefs.default_mode || "solo").toLowerCase();
+    // Build Uber universal deep link
+    // pickup = airport coords, dropoff = saved home address if available
+    const pickupNickname = encodeURIComponent(`${airport} Airport`);
+    const pickupLat = coords.lat;
+    const pickupLng = coords.lng;
+    let deepLink;
+    if (prefs.home_address) {
+      // With dropoff address
+      const dropoff = encodeURIComponent(prefs.home_address);
+      deepLink = `uber://?action=setPickup&pickup[latitude]=${pickupLat}&pickup[longitude]=${pickupLng}&pickup[nickname]=${pickupNickname}&dropoff[addressString]=${dropoff}`;
+    } else {
+      // Pickup only — user sets dropoff in Uber app
+      deepLink = `uber://?action=setPickup&pickup[latitude]=${pickupLat}&pickup[longitude]=${pickupLng}&pickup[nickname]=${pickupNickname}`;
+    }
+    // Also return a universal fallback URL for users without the app
+    const webFallback = `https://m.uber.com/ul/?action=setPickup&pickup[latitude]=${pickupLat}&pickup[longitude]=${pickupLng}&pickup[nickname]=${pickupNickname}`;
+    res.json({ deepLink, webFallback, airport, mode, coords });
   } catch (e) {
-    console.error("[uber/callback]", e.message);
-    res.status(500).send("OAuth error: " + e.message);
+    res.status(500).json({ error: e.message });
   }
-});
-
-// ---------------------------------------------------------------------------
-// GET /auth/uber/status — check if user has Uber connected
-// ---------------------------------------------------------------------------
-app.get("/auth/uber/status", async (req, res) => {
-  const email = await verifyAccessToken(req);
-  if (!email) return res.status(401).json({ error: "unauthorized" });
-  const rows = await sql`SELECT id, scope, expires_at, updated_at FROM uber_tokens WHERE user_email = ${email}`;
-  res.json({ connected: rows.length > 0, details: rows[0] || null });
-});
-
-// ---------------------------------------------------------------------------
-// DELETE /auth/uber/disconnect — remove user's Uber connection
-// ---------------------------------------------------------------------------
-app.delete("/auth/uber/disconnect", async (req, res) => {
-  const email = await verifyAccessToken(req);
-  if (!email) return res.status(401).json({ error: "unauthorized" });
-  await sql`DELETE FROM uber_tokens WHERE user_email = ${email}`;
-  res.json({ ok: true });
 });
 
 // ---------------------------------------------------------------------------
@@ -1669,41 +1604,8 @@ const AIRPORT_COORDS = {
   SYD: { lat: -33.9399, lng: 151.1753 }, GRU: { lat: -23.4356, lng: -46.4731 },
 };
 
-// Get a valid Uber access token for a user (refreshes if expired)
-async function getUberAccessToken(userEmail) {
-  const rows = await sql`SELECT * FROM uber_tokens WHERE user_email = ${userEmail}`;
-  if (!rows[0]) return null;
-  const tokenRow = rows[0];
-  // Check if token is expired (with 5 min buffer)
-  if (tokenRow.expires_at && new Date(tokenRow.expires_at) < new Date(Date.now() + 5 * 60 * 1000)) {
-    // Try to refresh
-    if (tokenRow.refresh_token && process.env.UBER_CLIENT_ID && process.env.UBER_CLIENT_SECRET) {
-      try {
-        const refreshResp = await fetch("https://login.uber.com/oauth/v2/token", {
-          method: "POST",
-          headers: { "Content-Type": "application/x-www-form-urlencoded" },
-          body: new URLSearchParams({
-            client_id: process.env.UBER_CLIENT_ID,
-            client_secret: process.env.UBER_CLIENT_SECRET,
-            grant_type: "refresh_token",
-            refresh_token: tokenRow.refresh_token,
-          }).toString(),
-        });
-        const newTokens = await refreshResp.json();
-        if (newTokens.access_token) {
-          const expiresAt = newTokens.expires_in ? new Date(Date.now() + newTokens.expires_in * 1000).toISOString() : null;
-          await sql`UPDATE uber_tokens SET access_token = ${newTokens.access_token}, expires_at = ${expiresAt}, updated_at = NOW() WHERE user_email = ${userEmail}`;
-          return newTokens.access_token;
-        }
-      } catch (e) {
-        console.error("[uber] token refresh failed:", e.message);
-      }
-    }
-    return null; // expired and couldn't refresh
-  }
-  return tokenRow.access_token;
-}
-
+// Dispatch Uber on landing via deep link push notification
+// No API key required — opens the Uber app pre-filled with airport pickup
 async function dispatchUberOnLanding(leg) {
   const mode = (leg.trip_mode || "solo").toLowerCase();
   const airport = leg.destination; // IATA code
@@ -1712,176 +1614,39 @@ async function dispatchUberOnLanding(leg) {
     console.log(`[uber] no coords for airport ${airport} — skipping dispatch`);
     return;
   }
-  // Fetch user's Uber token and preferences
-  const userToken = await getUberAccessToken(leg.user_email);
-  if (!userToken) {
-    // User hasn't connected Uber — send a nudge notification
-    await logActivity(
-      leg.user_email, "uber",
-      `Connect Uber for auto-dispatch`,
-      `You've landed at ${airport}. Connect your Uber account in Wingman to auto-dispatch rides on landing.`,
-      leg.trip_id, leg.id,
-      { airport, mode, status: "not_connected" }
-    );
-    await sendPushToUser(
-      leg.user_email,
-      `🚗 Connect Uber for auto-dispatch`,
-      `Landed at ${airport}? Connect your Uber account in Wingman Settings to get automatic rides.`,
-      { route: "Connections" }
-    );
-    return;
-  }
   const userRows = await sql`SELECT preferences, push_token FROM users WHERE email = ${leg.user_email}`;
   const prefs = userRows[0]?.preferences || {};
-  const dropoffAddr = prefs.home_address || null;
   const pushToken = userRows[0]?.push_token || null;
-  // Determine product
-  const productMap = UBER_PRODUCTS[mode] || UBER_PRODUCTS.solo;
-  const productId = productMap[airport] || productMap.default;
-  // Step 1: Get price estimate using user's own token
-  let fareId = null;
-  try {
-    const estimateResp = await fetch(
-      `https://api.uber.com/v1.2/requests/estimate`,
-      {
-        method: "POST",
-        headers: {
-          "Authorization": `Bearer ${userToken}`,
-          "Content-Type": "application/json",
-          "Accept-Language": "en_US",
-        },
-        body: JSON.stringify({
-          product_id: productId,
-          start_latitude: coords.lat,
-          start_longitude: coords.lng,
-          end_address: dropoffAddr || undefined,
-        }),
-      }
-    );
-    const estimateData = await estimateResp.json();
-    fareId = estimateData.fare?.fare_id || null;
-    const eta = estimateData.pickup_estimate || "unknown";
-    const price = estimateData.fare?.display || estimateData.price?.estimate || "unknown";
-    // Log estimate to activity — user can confirm or cancel
-    await logActivity(
-      leg.user_email, "uber",
-      `Ride ready at ${airport}`,
-      `${mode === "client" || mode === "partner" ? "UberBlack" : "UberX"} is ${eta} min away. Estimated fare: ${price}. Tap to confirm or cancel.`,
-      leg.trip_id, leg.id,
-      { airport, mode, productId, fareId, eta, price, status: "pending_confirmation" }
-    );
-    // Send push notification with deep link to confirm
-    if (pushToken) {
-      await sendPushToUser(
-        leg.user_email,
-        `🚗 Ride ready at ${airport}`,
-        `${mode === "client" || mode === "partner" ? "UberBlack" : "UberX"} is ${eta} min away · ${price}. Tap to confirm.`,
-        { route: "UberConfirm", legId: leg.id, fareId, productId, airport, price, eta, mode }
-      );
-    }
-    console.log(`[uber] ride estimate ready for ${leg.user_email} at ${airport}: ${price}, ETA ${eta} min`);
-  } catch (e) {
-    console.error("[uber] estimate error:", e.message);
-    // Fallback: just notify user to open Uber
-    await logActivity(
-      leg.user_email, "uber",
-      `Open Uber at ${airport}`,
-      `You've landed at ${airport}. Wingman couldn't auto-dispatch — tap to open Uber.`,
-      leg.trip_id, leg.id,
-      { airport, mode, status: "fallback" }
+  // Build Uber deep link pre-filled with airport pickup
+  const pickupNickname = encodeURIComponent(`${airport} Airport`);
+  let deepLink;
+  if (prefs.home_address) {
+    const dropoff = encodeURIComponent(prefs.home_address);
+    deepLink = `uber://?action=setPickup&pickup[latitude]=${coords.lat}&pickup[longitude]=${coords.lng}&pickup[nickname]=${pickupNickname}&dropoff[addressString]=${dropoff}`;
+  } else {
+    deepLink = `uber://?action=setPickup&pickup[latitude]=${coords.lat}&pickup[longitude]=${coords.lng}&pickup[nickname]=${pickupNickname}`;
+  }
+  const webFallback = `https://m.uber.com/ul/?action=setPickup&pickup[latitude]=${coords.lat}&pickup[longitude]=${coords.lng}&pickup[nickname]=${pickupNickname}`;
+  const rideType = mode === "client" || mode === "partner" ? "Uber Black" : "UberX";
+  // Log to activity feed
+  await logActivity(
+    leg.user_email, "uber",
+    `🚗 Tap to get a ride from ${airport}`,
+    `You've landed at ${airport}. Tap to open Uber with your pickup pre-filled${prefs.home_address ? " and home address as dropoff" : ""}.`,
+    leg.trip_id, leg.id,
+    { airport, mode, deepLink, webFallback, status: "deep_link" }
+  );
+  // Send push notification — tapping opens Uber app directly
+  if (pushToken) {
+    await sendPushToUser(
+      leg.user_email,
+      `🚗 Tap to get a ride from ${airport}`,
+      `Landed? Open Uber with ${airport} pre-filled as pickup${prefs.home_address ? " + home as dropoff" : ""}.`,
+      { deepLink, webFallback, airport, mode }
     );
   }
+  console.log(`[uber] deep link dispatched for ${leg.user_email} at ${airport}`);
 }
-
-// POST /uber/confirm — user confirms the ride from the push notification
-app.post("/uber/confirm", async (req, res) => {
-  try {
-    const authHeader = req.headers.authorization || "";
-    const token = authHeader.replace("Bearer ", "");
-    const { email } = jwt.verify(token, JWT_SECRET);
-    const { fare_id, product_id, airport } = req.body;
-    // Use user's own Uber token
-    const userToken = await getUberAccessToken(email);
-    if (!userToken) return res.status(403).json({ error: "Uber not connected. Please connect your Uber account in Settings > Connections." });
-    const coords = AIRPORT_COORDS[airport];
-    if (!coords) return res.status(400).json({ error: "Unknown airport" });
-    const userRows = await sql`SELECT preferences FROM users WHERE email = ${email}`;
-    const prefs = userRows[0]?.preferences || {};
-    const mode = prefs.default_mode || "solo";
-    const resp = await fetch("https://api.uber.com/v1.2/requests", {
-      method: "POST",
-      headers: {
-        "Authorization": `Bearer ${userToken}`,
-        "Content-Type": "application/json",
-      },
-      body: JSON.stringify({
-        fare_id,
-        product_id,
-        start_latitude: coords.lat,
-        start_longitude: coords.lng,
-        start_address: `${airport} Airport`,
-        end_address: prefs.home_address || "Home",
-        note_for_driver: mode === "client" ? "Business trip — please have water available" : "",
-      }),
-    });
-    const data = await resp.json();
-    if (data.errors || data.error) {
-      return res.status(400).json({ error: data.errors?.[0]?.message || data.error });
-    }
-    await logActivity(
-      email, "uber",
-      `Ride confirmed at ${airport}`,
-      `Your ${mode === "client" || mode === "partner" ? "UberBlack" : "UberX"} has been requested. Driver will be at arrivals shortly.`,
-      null, null,
-      { airport, rideId: data.request_id, status: "confirmed" }
-    );
-    res.json({ ok: true, ride: data });
-  } catch (e) {
-    res.status(500).json({ error: e.message });
-  }
-});
-
-// GET /uber/estimate — manual ride estimate from the app
-app.get("/uber/estimate", async (req, res) => {
-  try {
-    const authHeader = req.headers.authorization || "";
-    const token = authHeader.replace("Bearer ", "");
-    const { email } = jwt.verify(token, JWT_SECRET);
-    const { airport, mode } = req.query;
-    // Use user's own Uber token
-    const userToken = await getUberAccessToken(email);
-    if (!userToken) return res.status(403).json({ error: "Uber not connected", connect_url: "/auth/uber/connect" });
-    const coords = AIRPORT_COORDS[airport];
-    if (!coords) return res.status(400).json({ error: "Unknown airport" });
-    const productMap = UBER_PRODUCTS[mode?.toLowerCase() || "solo"] || UBER_PRODUCTS.solo;
-    const productId = productMap[airport] || productMap.default;
-    const userRows = await sql`SELECT preferences FROM users WHERE email = ${email}`;
-    const prefs = userRows[0]?.preferences || {};
-    const resp = await fetch("https://api.uber.com/v1.2/requests/estimate", {
-      method: "POST",
-      headers: {
-        "Authorization": `Bearer ${userToken}`,
-        "Content-Type": "application/json",
-      },
-      body: JSON.stringify({
-        product_id: productId,
-        start_latitude: coords.lat,
-        start_longitude: coords.lng,
-        end_address: prefs.home_address || undefined,
-      }),
-    });
-    const data = await resp.json();
-    res.json({
-      eta: data.pickup_estimate,
-      price: data.fare?.display || data.price?.estimate,
-      fare_id: data.fare?.fare_id,
-      product_id: productId,
-      mode,
-    });
-  } catch (e) {
-    res.status(500).json({ error: e.message });
-  }
-});
 
 // ---------------------------------------------------------------------------
 // Apple Wallet — PassKit .pkpass generation
