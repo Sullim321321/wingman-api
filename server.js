@@ -18,7 +18,11 @@ const path = require("path");
 
 const app = express();
 app.use(cors());
-app.use(express.json());
+// Stripe webhook requires raw body for signature verification — skip JSON parsing for that route
+app.use((req, res, next) => {
+  if (req.path === "/subscription/webhook") return next();
+  express.json()(req, res, next);
+});
 
 const PORT = process.env.PORT || 4000;
 const JWT_SECRET = process.env.JWT_SECRET || "dev-secret-change-me";
@@ -2173,7 +2177,7 @@ app.post("/subscription/activate", async (req, res) => {
 });
 
 // POST /subscription/webhook — Stripe webhook for payment events
-app.post("/subscription/webhook", express.raw({ type: "application/json" }), async (req, res) => {
+app.post("/subscription/webhook", express.raw({ type: "*/*" }), async (req, res) => {
   const sig = req.headers["stripe-signature"];
   const webhookSecret = process.env.STRIPE_WEBHOOK_SECRET;
   let event;
