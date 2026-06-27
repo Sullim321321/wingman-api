@@ -1810,7 +1810,7 @@ app.post("/trips/draft", auth, async (req, res) => {
 // ---------------------------------------------------------------------------
 app.get("/policy", auth, async (req, res) => {
   try {
-    const rows = await sql`SELECT preferences, weather_alerts, price_alerts, quiet_hours FROM users WHERE email = ${req.user.email}`;
+    const rows = await sql`SELECT preferences, weather_alerts, price_alerts, quiet_hours, locale, currency FROM users WHERE email = ${req.user.email}`;
     const prefs = rows[0]?.preferences || {};
     res.json({
       policy: {
@@ -1824,6 +1824,8 @@ app.get("/policy", auth, async (req, res) => {
         weather_alerts: rows[0]?.weather_alerts !== false,
         price_alerts: rows[0]?.price_alerts !== false,
         quiet_hours: rows[0]?.quiet_hours !== false,
+        locale: rows[0]?.locale || 'en',
+        currency: rows[0]?.currency || 'USD',
       },
     });
   } catch (e) {
@@ -4229,4 +4231,316 @@ app.post("/trips/:tripId/live-activity", auth, async (req, res) => {
 // ---------------------------------------------------------------------------
 // UPDATE HEALTH ENDPOINT VERSION TO 2.8.0
 // ---------------------------------------------------------------------------
+
+// ---------------------------------------------------------------------------
+// Ground Transport — GET /airports/:iata/ground-transport
+// Returns ranked transport options with pricing, directions, ticket links,
+// and multi-language support based on the user's locale preference
+// ---------------------------------------------------------------------------
+
+// Airport ground transport database — curated data for major hubs
+const GROUND_TRANSPORT_DB = {
+  // North America
+  JFK: {
+    city: "New York", country: "US", currency: "USD", language: "en",
+    options: [
+      { id: "airtrain_lirr", type: "train", name: "AirTrain + LIRR", name_local: "AirTrain + LIRR",
+        description: "AirTrain to Jamaica, then LIRR to Penn Station", description_local: "AirTrain to Jamaica, then LIRR to Penn Station",
+        duration_min: 55, price_from: 12.50, price_to: 15.00, frequency_min: 10,
+        runs_24h: false, hours: "5am–1am", complexity: "easy",
+        steps: ["Follow AirTrain signs inside terminal", "Take AirTrain to Jamaica station", "Board LIRR train to Penn Station Manhattan"],
+        ticket_url: "https://www.mta.info/airtrain", map_url: "https://maps.apple.com/?q=JFK+AirTrain",
+        tip: "Buy a MetroCard at the AirTrain station — it works for both AirTrain and subway." },
+      { id: "subway", type: "subway", name: "AirTrain + Subway (A train)", name_local: "AirTrain + Subway (A train)",
+        description: "AirTrain to Howard Beach, then A train to Manhattan", description_local: "AirTrain to Howard Beach, then A train to Manhattan",
+        duration_min: 75, price_from: 8.75, price_to: 8.75, frequency_min: 10,
+        runs_24h: true, hours: "24h", complexity: "moderate",
+        steps: ["Take AirTrain to Howard Beach or Jamaica", "Transfer to A train (blue line)", "Ride to your Manhattan stop"],
+        ticket_url: "https://new.mta.info/", map_url: "https://maps.apple.com/?q=JFK+Howard+Beach+Subway",
+        tip: "The A train runs 24/7 — great for late arrivals. Avoid during rush hour with luggage." },
+      { id: "taxi", type: "taxi", name: "Yellow Cab (flat rate)", name_local: "Yellow Cab (flat rate)",
+        description: "Flat rate $70 to Manhattan (plus tolls and tip)", description_local: "Flat rate $70 to Manhattan (plus tolls and tip)",
+        duration_min: 45, price_from: 70, price_to: 95, frequency_min: 0,
+        runs_24h: true, hours: "24h", complexity: "easy",
+        steps: ["Follow 'Taxi' signs to the taxi stand outside arrivals", "Give your destination — flat rate $70 to Manhattan applies", "Add tolls (~$9) and tip (15–20%)"],
+        ticket_url: null, map_url: "https://maps.apple.com/?q=JFK+Taxi+Stand",
+        tip: "Only use yellow cabs from the official taxi stand — never accept offers inside the terminal." },
+      { id: "rideshare", type: "rideshare", name: "Uber / Lyft", name_local: "Uber / Lyft",
+        description: "Pick up at the designated rideshare lot", description_local: "Pick up at the designated rideshare lot",
+        duration_min: 45, price_from: 45, price_to: 90, frequency_min: 0,
+        runs_24h: true, hours: "24h", complexity: "easy",
+        steps: ["Open Uber or Lyft app and request ride", "Follow signs to the 'App Car Pickup' area", "Match your driver's license plate"],
+        ticket_url: "https://www.uber.com", map_url: "https://maps.apple.com/?q=JFK+Rideshare+Pickup",
+        tip: "Prices surge during peak hours. The rideshare lot is a short walk from terminals — follow green signs." }
+    ]
+  },
+  LHR: {
+    city: "London", country: "GB", currency: "GBP", language: "en",
+    options: [
+      { id: "heathrow_express", type: "train", name: "Heathrow Express", name_local: "Heathrow Express",
+        description: "Non-stop to London Paddington in 15 minutes", description_local: "Non-stop to London Paddington in 15 minutes",
+        duration_min: 15, price_from: 25, price_to: 37, frequency_min: 15,
+        runs_24h: false, hours: "5am–midnight", complexity: "easy",
+        steps: ["Follow 'Heathrow Express' signs in arrivals", "Buy ticket at machine or online (cheaper)", "Board from T2/T3 underground station or T5 station"],
+        ticket_url: "https://www.heathrowexpress.com", map_url: "https://maps.apple.com/?q=Heathrow+Express",
+        tip: "Book online in advance — walk-up price is £37, online can be £25. Arrives at Paddington, not central London." },
+      { id: "elizabeth_line", type: "tube", name: "Elizabeth Line (TfL)", name_local: "Elizabeth Line (TfL)",
+        description: "Direct to central London in 30–40 minutes", description_local: "Direct to central London in 30–40 minutes",
+        duration_min: 35, price_from: 10.80, price_to: 13.50, frequency_min: 10,
+        runs_24h: false, hours: "5:30am–midnight", complexity: "easy",
+        steps: ["Follow 'London Underground / Elizabeth Line' signs", "Tap in with contactless card or Oyster", "Board purple Elizabeth line train"],
+        ticket_url: "https://tfl.gov.uk/modes/elizabeth-line/", map_url: "https://maps.apple.com/?q=Heathrow+Underground",
+        tip: "Contactless bank card works directly — no need to buy an Oyster card. Cheaper than Heathrow Express." },
+      { id: "taxi", type: "taxi", name: "Black Cab", name_local: "Black Cab",
+        description: "Licensed black cab to central London", description_local: "Licensed black cab to central London",
+        duration_min: 60, price_from: 60, price_to: 100, frequency_min: 0,
+        runs_24h: true, hours: "24h", complexity: "easy",
+        steps: ["Follow 'Taxis' signs to the taxi rank outside arrivals", "Tell driver your destination — metered fare applies", "All black cabs accept card"],
+        ticket_url: null, map_url: "https://maps.apple.com/?q=Heathrow+Taxi+Rank",
+        tip: "Black cabs are the safest option late at night. Fare to central London is typically £60–£100 depending on traffic." },
+      { id: "national_express", type: "bus", name: "National Express Coach", name_local: "National Express Coach",
+        description: "Coach to Victoria Coach Station", description_local: "Coach to Victoria Coach Station",
+        duration_min: 75, price_from: 6, price_to: 15, frequency_min: 30,
+        runs_24h: false, hours: "4am–midnight", complexity: "easy",
+        steps: ["Follow 'Coaches' signs to the Central Bus Station", "Show booking confirmation or buy ticket on board", "Alight at Victoria Coach Station"],
+        ticket_url: "https://www.nationalexpress.com/en/airports/heathrow-airport", map_url: "https://maps.apple.com/?q=Heathrow+Central+Bus+Station",
+        tip: "Cheapest option but slowest. Book in advance online for best prices." }
+    ]
+  },
+  CDG: {
+    city: "Paris", country: "FR", currency: "EUR", language: "fr",
+    options: [
+      { id: "rer_b", type: "train", name: "RER B", name_local: "RER B (train de banlieue)",
+        description: "Direct train to central Paris in 30–35 minutes", description_local: "Train direct vers le centre de Paris en 30–35 minutes",
+        duration_min: 32, price_from: 11.80, price_to: 11.80, frequency_min: 10,
+        runs_24h: false, hours: "4:50am–11:50pm", complexity: "easy",
+        steps: ["Follow 'RER B / Trains' signs in the terminal", "Buy ticket at the blue RATP machines (select 'Paris + zones 1-5')", "Board the RER B train — stops at Gare du Nord, Châtelet, Saint-Michel"],
+        steps_local: ["Suivre les panneaux 'RER B / Trains'", "Acheter un billet aux machines RATP bleues (sélectionner 'Paris + zones 1-5')", "Prendre le RER B — arrêts Gare du Nord, Châtelet, Saint-Michel"],
+        ticket_url: "https://www.ratp.fr/titres-et-tarifs/billet-aeroport-roissy-cdg", map_url: "https://maps.apple.com/?q=CDG+RER+B",
+        tip: "The cheapest and fastest option. Keep your ticket — you need it to exit at Paris stations." },
+      { id: "le_bus_direct", type: "bus", name: "Le Bus Direct", name_local: "Le Bus Direct",
+        description: "Express bus to Eiffel Tower, Arc de Triomphe, Montparnasse", description_local: "Bus express vers la Tour Eiffel, l'Arc de Triomphe, Montparnasse",
+        duration_min: 60, price_from: 17, price_to: 17, frequency_min: 30,
+        runs_24h: false, hours: "6am–11pm", complexity: "easy",
+        steps: ["Follow 'Bus' signs to the departure area outside arrivals", "Buy ticket online or at the bus stop", "Board Le Bus Direct — 4 lines covering different Paris areas"],
+        ticket_url: "https://www.lebusdirect.com", map_url: "https://maps.apple.com/?q=CDG+Le+Bus+Direct",
+        tip: "Best if your hotel is near the Eiffel Tower or Champs-Élysées. Slower than RER but drops you closer to tourist areas." },
+      { id: "taxi", type: "taxi", name: "Taxi (tarif fixe)", name_local: "Taxi (tarif fixe)",
+        description: "Fixed fare taxi to Paris — €35 (Right Bank) or €40 (Left Bank)", description_local: "Tarif fixe vers Paris — 35€ (Rive Droite) ou 40€ (Rive Gauche)",
+        duration_min: 45, price_from: 35, price_to: 40, frequency_min: 0,
+        runs_24h: true, hours: "24h", complexity: "easy",
+        steps: ["Follow 'Taxis' signs to the taxi rank outside arrivals", "Confirm the fixed fare before entering (€35 Right Bank, €40 Left Bank)", "All taxis accept card"],
+        ticket_url: null, map_url: "https://maps.apple.com/?q=CDG+Taxi",
+        tip: "Fixed fares apply from CDG to Paris — insist on the fixed rate. Only use official taxis from the rank." },
+      { id: "uber", type: "rideshare", name: "Uber / Bolt", name_local: "Uber / Bolt",
+        description: "App-based rideshare from the designated pickup zone", description_local: "VTC depuis la zone de prise en charge désignée",
+        duration_min: 45, price_from: 30, price_to: 60, frequency_min: 0,
+        runs_24h: true, hours: "24h", complexity: "easy",
+        steps: ["Open Uber or Bolt app and request ride", "Follow signs to 'VTC / Voitures de Tourisme avec Chauffeur'", "Match your driver's license plate"],
+        ticket_url: "https://www.uber.com", map_url: "https://maps.apple.com/?q=CDG+VTC+Pickup",
+        tip: "Can be cheaper than taxis during off-peak. Surge pricing applies during peak hours." }
+    ]
+  },
+  NRT: {
+    city: "Tokyo (Narita)", country: "JP", currency: "JPY", language: "ja",
+    options: [
+      { id: "narita_express", type: "train", name: "Narita Express (N'EX)", name_local: "成田エクスプレス (N'EX)",
+        description: "Direct to Tokyo Station in 53 minutes", description_local: "東京駅まで直通53分",
+        duration_min: 53, price_from: 3070, price_to: 4070, frequency_min: 30,
+        runs_24h: false, hours: "6:44am–9:44pm", complexity: "easy",
+        steps: ["Follow 'Narita Express / N'EX' signs in arrivals", "Buy ticket at JR East ticket office or machine", "Board from B1 floor — reserved seating"],
+        steps_local: ["到着ロビーで「成田エクスプレス / N'EX」の案内に従う", "JR東日本の窓口または券売機で乗車券を購入", "B1フロアから乗車 — 指定席"],
+        ticket_url: "https://www.jreast.co.jp/e/nex/", map_url: "https://maps.apple.com/?q=Narita+Express",
+        tip: "The N'EX+Suica card (¥5,000) gives you the train ticket plus a prepaid Suica card for Tokyo's subway — great value." },
+      { id: "limousine_bus", type: "bus", name: "Airport Limousine Bus", name_local: "リムジンバス",
+        description: "Direct to major Tokyo hotels and stations", description_local: "東京の主要ホテルや駅への直通バス",
+        duration_min: 90, price_from: 3200, price_to: 3200, frequency_min: 30,
+        runs_24h: false, hours: "6:30am–11pm", complexity: "easy",
+        steps: ["Follow 'Limousine Bus' signs outside arrivals", "Buy ticket at the limousine bus counter", "Board the bus for your destination — luggage stored below"],
+        ticket_url: "https://www.limousinebus.co.jp/en/", map_url: "https://maps.apple.com/?q=Narita+Limousine+Bus",
+        tip: "Goes directly to your hotel area — great if you have heavy luggage. Slower than N'EX but more comfortable." },
+      { id: "taxi", type: "taxi", name: "Taxi", name_local: "タクシー",
+        description: "Metered taxi to Tokyo — very expensive", description_local: "東京まで — 非常に高額",
+        duration_min: 70, price_from: 20000, price_to: 30000, frequency_min: 0,
+        runs_24h: true, hours: "24h", complexity: "easy",
+        steps: ["Follow 'Taxi' signs outside arrivals", "Tell driver your destination — show hotel address in Japanese if possible", "Metered fare applies"],
+        ticket_url: null, map_url: "https://maps.apple.com/?q=Narita+Taxi",
+        tip: "Only recommended if you have no other option. A taxi to central Tokyo can cost ¥20,000–¥30,000." }
+    ]
+  },
+  DXB: {
+    city: "Dubai", country: "AE", currency: "AED", language: "ar",
+    options: [
+      { id: "metro", type: "metro", name: "Dubai Metro (Red Line)", name_local: "مترو دبي (الخط الأحمر)",
+        description: "Direct to central Dubai in 30 minutes", description_local: "مباشرة إلى وسط دبي في 30 دقيقة",
+        duration_min: 30, price_from: 3, price_to: 8.50, frequency_min: 5,
+        runs_24h: false, hours: "5am–midnight (2am Fri)", complexity: "easy",
+        steps: ["Follow 'Metro' signs in the terminal — connected to T1 and T3", "Buy a Nol card at the metro station", "Board Red Line towards Rashidiya or UAE Exchange"],
+        steps_local: ["اتبع لافتات 'المترو' في المحطة — متصل بالمحطة 1 و3", "اشتر بطاقة نول في محطة المترو", "اركب الخط الأحمر باتجاه راشدية أو صرافة الإمارات"],
+        ticket_url: "https://www.rta.ae/wps/portal/rta/ae/public-transport/networks/metro-network", map_url: "https://maps.apple.com/?q=Dubai+Airport+Metro",
+        tip: "Cheapest option. The metro is clean, air-conditioned, and very reliable. Nol card works on buses too." },
+      { id: "taxi", type: "taxi", name: "Dubai Taxi (RTA)", name_local: "تاكسي دبي (هيئة الطرق والمواصلات)",
+        description: "Official metered taxi to central Dubai", description_local: "تاكسي رسمي بعداد إلى وسط دبي",
+        duration_min: 25, price_from: 50, price_to: 100, frequency_min: 0,
+        runs_24h: true, hours: "24h", complexity: "easy",
+        steps: ["Follow 'Taxi' signs outside arrivals to the taxi rank", "Only use official cream/gold RTA taxis", "Metered fare — airport surcharge applies (AED 25)"],
+        ticket_url: null, map_url: "https://maps.apple.com/?q=Dubai+Airport+Taxi",
+        tip: "AED 25 airport surcharge applies. Only use official RTA taxis — cream with gold stripe. Uber and Careem also available." },
+      { id: "careem", type: "rideshare", name: "Careem / Uber", name_local: "كريم / أوبر",
+        description: "App-based rideshare from the designated pickup zone", description_local: "خدمة توصيل عبر التطبيق من منطقة الاستلام المخصصة",
+        duration_min: 25, price_from: 40, price_to: 80, frequency_min: 0,
+        runs_24h: true, hours: "24h", complexity: "easy",
+        steps: ["Open Careem or Uber app and request ride", "Follow signs to 'App Pickup' area outside arrivals", "Match your driver's license plate"],
+        ticket_url: "https://www.careem.com", map_url: "https://maps.apple.com/?q=Dubai+Airport+Rideshare",
+        tip: "Careem is the dominant local app. Often cheaper than taxis during off-peak hours." }
+    ]
+  },
+  SIN: {
+    city: "Singapore", country: "SG", currency: "SGD", language: "en",
+    options: [
+      { id: "mrt", type: "train", name: "MRT (East West Line)", name_local: "MRT (East West Line)",
+        description: "Direct to City Hall / Raffles Place in 30 minutes", description_local: "Direct to City Hall / Raffles Place in 30 minutes",
+        duration_min: 30, price_from: 1.70, price_to: 2.50, frequency_min: 5,
+        runs_24h: false, hours: "5:31am–11:18pm", complexity: "easy",
+        steps: ["Follow 'MRT' signs in the basement of T2 or T3", "Buy an EZ-Link card or use contactless bank card", "Board the green East West Line towards Tanah Merah, then change for City Hall"],
+        ticket_url: "https://www.transitlink.com.sg/", map_url: "https://maps.apple.com/?q=Changi+Airport+MRT",
+        tip: "Cheapest option. Singapore's MRT is world-class — clean, fast, and air-conditioned. EZ-Link card works on buses too." },
+      { id: "taxi", type: "taxi", name: "Taxi", name_local: "Taxi",
+        description: "Metered taxi to central Singapore", description_local: "Metered taxi to central Singapore",
+        duration_min: 25, price_from: 20, price_to: 40, frequency_min: 0,
+        runs_24h: true, hours: "24h", complexity: "easy",
+        steps: ["Follow 'Taxi' signs to the taxi rank in the basement", "Metered fare — airport surcharge of SGD 5–8 applies", "All taxis accept card"],
+        ticket_url: null, map_url: "https://maps.apple.com/?q=Changi+Airport+Taxi",
+        tip: "Peak hour surcharges apply (Mon–Fri 6–9:30am, 6–midnight; Sat–Sun midnight–6am). Grab is usually cheaper." },
+      { id: "grab", type: "rideshare", name: "Grab", name_local: "Grab",
+        description: "Southeast Asia's dominant rideshare app", description_local: "Southeast Asia's dominant rideshare app",
+        duration_min: 25, price_from: 18, price_to: 35, frequency_min: 0,
+        runs_24h: true, hours: "24h", complexity: "easy",
+        steps: ["Open Grab app and request ride", "Follow signs to 'Grab Pickup' at T1/T2/T3 basement", "Match your driver's license plate"],
+        ticket_url: "https://www.grab.com/sg/", map_url: "https://maps.apple.com/?q=Changi+Airport+Grab",
+        tip: "Grab is the Uber of Southeast Asia — widely used and reliable. Usually cheaper than taxis." }
+    ]
+  },
+  // Default fallback for unknown airports
+  DEFAULT: {
+    options: [
+      { id: "taxi", type: "taxi", name: "Taxi", name_local: "Taxi",
+        description: "Licensed taxi from the official taxi rank", description_local: "Licensed taxi from the official taxi rank",
+        duration_min: null, price_from: null, price_to: null, frequency_min: 0,
+        runs_24h: true, hours: "24h", complexity: "easy",
+        steps: ["Follow 'Taxi' signs outside arrivals", "Only use official taxis from the designated rank", "Ask for a receipt"],
+        ticket_url: null, map_url: null,
+        tip: "Always use the official taxi rank — never accept offers from touts inside the terminal." },
+      { id: "rideshare", type: "rideshare", name: "Uber / Local Rideshare", name_local: "Uber / Local Rideshare",
+        description: "App-based rideshare from the designated pickup zone", description_local: "App-based rideshare from the designated pickup zone",
+        duration_min: null, price_from: null, price_to: null, frequency_min: 0,
+        runs_24h: true, hours: "24h", complexity: "easy",
+        steps: ["Open your rideshare app and request a ride", "Follow signs to the designated app pickup area", "Match your driver's license plate"],
+        ticket_url: "https://www.uber.com", map_url: null,
+        tip: "Check if Uber operates at this airport — some countries have local alternatives (Grab, Careem, Bolt, DiDi)." }
+    ]
+  }
+};
+
+// Translation helper — translate key transport phrases to user's locale
+function localizeTransportOption(option, locale) {
+  const lang = locale?.split("-")[0] || "en";
+  if (lang === "en") return option;
+  // Return localized name/description/steps if available, otherwise fall back to English
+  return {
+    ...option,
+    name: option.name_local || option.name,
+    description: option.description_local || option.description,
+    steps: option.steps_local || option.steps,
+  };
+}
+
+// GET /airports/:iata/ground-transport
+// Returns ranked transport options for the given airport
+app.get("/airports/:iata/ground-transport", auth, async (req, res) => {
+  const iata = (req.params.iata || "").toUpperCase();
+  const { destination, locale: queryLocale } = req.query;
+
+  try {
+    // Get user's locale preference
+    const userRows = await sql`SELECT locale, currency FROM users WHERE email = ${req.user.email}`;
+    const userLocale = queryLocale || userRows[0]?.locale || "en";
+    const userCurrency = userRows[0]?.currency || "USD";
+
+    const airportData = GROUND_TRANSPORT_DB[iata] || GROUND_TRANSPORT_DB.DEFAULT;
+    const airportCurrency = airportData.currency || userCurrency;
+
+    // Rank options: trains/metro first, then bus, then rideshare, then taxi
+    const rankOrder = { train: 1, metro: 1, tube: 1, subway: 1, bus: 2, rideshare: 3, taxi: 4 };
+    const ranked = [...(airportData.options || [])].sort((a, b) =>
+      (rankOrder[a.type] || 5) - (rankOrder[b.type] || 5)
+    );
+
+    // Localize options
+    const localized = ranked.map(opt => localizeTransportOption(opt, userLocale));
+
+    // Build AI-powered recommendation if Anthropic is available
+    let recommendation = null;
+    try {
+      const anthropic = getAnthropic();
+      const prompt = `You are a local travel expert. A traveler just landed at ${iata} airport${airportData.city ? ` (${airportData.city})` : ""}. 
+Their preferred language is ${userLocale} and currency is ${userCurrency}.
+${destination ? `They are heading to: ${destination}.` : ""}
+
+Available transport options: ${ranked.map(o => `${o.name} (${o.type}, ~${o.duration_min ? o.duration_min + "min" : "varies"}, ${o.price_from ? airportCurrency + o.price_from : "varies"})`).join(", ")}.
+
+Give a 2-sentence recommendation of the BEST option for this traveler, mentioning the option name and one key reason. Be specific and practical. Respond in ${userLocale === "fr" ? "French" : userLocale === "ja" ? "Japanese" : userLocale === "ar" ? "Arabic" : userLocale === "de" ? "German" : userLocale === "es" ? "Spanish" : "English"}.`;
+
+      const msg = await anthropic.messages.create({
+        model: "claude-3-5-haiku-20241022",
+        max_tokens: 150,
+        messages: [{ role: "user", content: prompt }],
+      });
+      recommendation = msg.content[0]?.text || null;
+    } catch (aiErr) {
+      console.log("[ground-transport] AI recommendation skipped:", aiErr.message);
+    }
+
+    res.json({
+      airport: iata,
+      city: airportData.city || null,
+      country: airportData.country || null,
+      local_currency: airportCurrency,
+      user_locale: userLocale,
+      recommendation,
+      options: localized,
+      data_source: GROUND_TRANSPORT_DB[iata] ? "curated" : "generic",
+    });
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
+// GET /airports/:iata/ground-transport/directions
+// Returns step-by-step directions for a specific transport option
+app.get("/airports/:iata/ground-transport/:option_id/directions", auth, async (req, res) => {
+  const iata = (req.params.iata || "").toUpperCase();
+  const optionId = req.params.option_id;
+
+  const airportData = GROUND_TRANSPORT_DB[iata] || GROUND_TRANSPORT_DB.DEFAULT;
+  const option = airportData.options?.find(o => o.id === optionId);
+
+  if (!option) return res.status(404).json({ error: "Transport option not found" });
+
+  const userRows = await sql`SELECT locale FROM users WHERE email = ${req.user.email}`;
+  const locale = userRows[0]?.locale || "en";
+  const localized = localizeTransportOption(option, locale);
+
+  res.json({
+    airport: iata,
+    option_id: optionId,
+    name: localized.name,
+    steps: localized.steps,
+    tip: localized.tip,
+    map_url: localized.map_url,
+    ticket_url: localized.ticket_url,
+  });
+});
+
+
 app.listen(PORT, () => console.log("Wingman API on http://localhost:" + PORT));
