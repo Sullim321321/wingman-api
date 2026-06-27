@@ -269,6 +269,50 @@ async function bootstrapDB() {
         UNIQUE(user_email, destination)
       )
     `;
+    await sql`
+      CREATE TABLE IF NOT EXISTS compensation_claims (
+        id SERIAL PRIMARY KEY,
+        user_email TEXT NOT NULL,
+        trip_id INTEGER REFERENCES trips(id) ON DELETE CASCADE,
+        leg_id INTEGER,
+        flight_ident TEXT,
+        regulation TEXT NOT NULL DEFAULT 'EU261',
+        delay_minutes INTEGER,
+        amount_eur INTEGER,
+        status TEXT NOT NULL DEFAULT 'draft',
+        airline_ref TEXT,
+        submitted_at TIMESTAMPTZ,
+        resolved_at TIMESTAMPTZ,
+        created_at TIMESTAMPTZ DEFAULT NOW()
+      )
+    `;
+    await sql`
+      CREATE TABLE IF NOT EXISTS upgrade_bids (
+        id SERIAL PRIMARY KEY,
+        user_email TEXT NOT NULL,
+        trip_id INTEGER REFERENCES trips(id) ON DELETE CASCADE,
+        leg_id INTEGER,
+        flight_ident TEXT NOT NULL,
+        cabin_target TEXT NOT NULL DEFAULT 'business',
+        max_points INTEGER,
+        max_cash_usd INTEGER,
+        status TEXT NOT NULL DEFAULT 'watching',
+        offer_found_at TIMESTAMPTZ,
+        offer_details JSONB,
+        created_at TIMESTAMPTZ DEFAULT NOW()
+      )
+    `;
+    await sql`
+      CREATE TABLE IF NOT EXISTS booking_imports (
+        id SERIAL PRIMARY KEY,
+        user_email TEXT NOT NULL,
+        source TEXT NOT NULL DEFAULT 'gmail',
+        raw_subject TEXT,
+        parsed JSONB,
+        trip_id INTEGER REFERENCES trips(id) ON DELETE SET NULL,
+        created_at TIMESTAMPTZ DEFAULT NOW()
+      )
+    `;
     console.log("[db] tables ready");
   } catch (e) {
     console.error("[db] bootstrap error:", e.message);
@@ -3835,7 +3879,354 @@ app.get('/wallet/pass/:legId', auth, async (req, res) => {
 });
 
 // ---------------------------------------------------------------------------
-// UPDATE HEALTH ENDPOINT VERSION
+// COMPENSATION FILING (EU261 / DOT)
 // ---------------------------------------------------------------------------
 
+// Calculate EU261 compensation amount based on flight distance and delay
+function calcEU261Amount(distanceKm, delayMinutes) {
+  if (delayMinutes < 180) return 0;
+  if (distanceKm <= 1500) return 250;
+  if (distanceKm <= 3500) return 400;
+  return delayMinutes >= 240 ? 600 : 300;
+}
+
+// Rough great-circle distance between two IATA codes (uses a lookup table for common routes)
+function estimateDistanceKm(origin, dest) {
+  const coords = {
+    LHR: [51.47, -0.46], JFK: [40.64, -73.78], LAX: [33.94, -118.41], CDG: [49.01, 2.55],
+    FRA: [50.03, 8.57], AMS: [52.31, 4.76], DXB: [25.25, 55.36], SIN: [1.36, 103.99],
+    HKG: [22.31, 113.92], NRT: [35.77, 140.39], SYD: [-33.95, 151.18], ORD: [41.98, -87.91],
+    ATL: [33.64, -84.43], DFW: [32.90, -97.04], MIA: [25.80, -80.29], SFO: [37.62, -122.38],
+    BOS: [42.37, -71.00], SEA: [47.45, -122.31], DEN: [39.86, -104.67], LAS: [36.08, -115.15],
+    BCN: [41.30, 2.08], MAD: [40.47, -3.57], FCO: [41.80, 12.25], MUC: [48.35, 11.79],
+    ZRH: [47.46, 8.55], GVA: [46.24, 6.11], CPH: [55.62, 12.66], ARN: [59.65, 17.92],
+  };
+  const a = coords[origin?.toUpperCase()]; const b = coords[dest?.toUpperCase()];
+  if (!a || !b) return 2000; // default mid-range
+  const R = 6371;
+  const dLat = (b[0]-a[0]) * Math.PI/180;
+  const dLon = (b[1]-a[1]) * Math.PI/180;
+  const x = Math.sin(dLat/2)**2 + Math.cos(a[0]*Math.PI/180)*Math.cos(b[0]*Math.PI/180)*Math.sin(dLon/2)**2;
+  return Math.round(R * 2 * Math.atan2(Math.sqrt(x), Math.sqrt(1-x)));
+}
+
+// POST /trips/:tripId/compensation — create or get a compensation claim
+app.post("/trips/:tripId/compensation", auth, async (req, res) => {
+  try {
+    const { tripId } = req.params;
+    const { leg_id, flight_ident, delay_minutes, origin, destination, regulation } = req.body;
+    const distanceKm = estimateDistanceKm(origin, destination);
+    const reg = regulation || (distanceKm > 5000 ? "DOT" : "EU261");
+    const amount = reg === "EU261" ? calcEU261Amount(distanceKm, delay_minutes || 0) : 0;
+    const [claim] = await sql`
+      INSERT INTO compensation_claims (user_email, trip_id, leg_id, flight_ident, regulation, delay_minutes, amount_eur, status)
+      VALUES (${req.email}, ${tripId}, ${leg_id || null}, ${flight_ident || null}, ${reg}, ${delay_minutes || 0}, ${amount}, 'draft')
+      ON CONFLICT DO NOTHING
+      RETURNING *
+    `;
+    // Log activity
+    await sql`INSERT INTO activity_events (user_email, type, title, body, trip_id) VALUES (${req.email}, 'compensation_started', 'Compensation claim started', ${`${reg} claim for ${flight_ident || 'flight'} — up to €${amount}`}, ${tripId})`;
+    res.json({ claim: claim || { status: 'exists' }, amount_eur: amount, regulation: reg, distance_km: distanceKm });
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
+// GET /trips/:tripId/compensation — list claims for a trip
+app.get("/trips/:tripId/compensation", auth, async (req, res) => {
+  try {
+    const claims = await sql`SELECT * FROM compensation_claims WHERE user_email = ${req.email} AND trip_id = ${req.params.tripId} ORDER BY created_at DESC`;
+    res.json({ claims });
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
+// GET /compensation — all claims for user
+app.get("/compensation", auth, async (req, res) => {
+  try {
+    const claims = await sql`SELECT cc.*, t.title as trip_title FROM compensation_claims cc LEFT JOIN trips t ON t.id = cc.trip_id WHERE cc.user_email = ${req.email} ORDER BY cc.created_at DESC`;
+    res.json({ claims });
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
+// PATCH /compensation/:id — update claim status (submit, resolve)
+app.patch("/compensation/:id", auth, async (req, res) => {
+  try {
+    const { status, airline_ref } = req.body;
+    const updates = {};
+    if (status) updates.status = status;
+    if (airline_ref) updates.airline_ref = airline_ref;
+    if (status === 'submitted') updates.submitted_at = new Date().toISOString();
+    if (status === 'resolved') updates.resolved_at = new Date().toISOString();
+    const [claim] = await sql`
+      UPDATE compensation_claims SET
+        status = COALESCE(${updates.status || null}, status),
+        airline_ref = COALESCE(${updates.airline_ref || null}, airline_ref),
+        submitted_at = COALESCE(${updates.submitted_at || null}::TIMESTAMPTZ, submitted_at),
+        resolved_at = COALESCE(${updates.resolved_at || null}::TIMESTAMPTZ, resolved_at)
+      WHERE id = ${req.params.id} AND user_email = ${req.email}
+      RETURNING *
+    `;
+    res.json({ claim });
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
+// ---------------------------------------------------------------------------
+// UPGRADE BIDDING
+// ---------------------------------------------------------------------------
+
+// POST /trips/:tripId/upgrade-bid — set an upgrade bid for a flight leg
+app.post("/trips/:tripId/upgrade-bid", auth, async (req, res) => {
+  try {
+    const { leg_id, flight_ident, cabin_target, max_points, max_cash_usd } = req.body;
+    if (!flight_ident) return res.status(400).json({ error: "flight_ident required" });
+    const [bid] = await sql`
+      INSERT INTO upgrade_bids (user_email, trip_id, leg_id, flight_ident, cabin_target, max_points, max_cash_usd)
+      VALUES (${req.email}, ${req.params.tripId}, ${leg_id || null}, ${flight_ident}, ${cabin_target || 'business'}, ${max_points || null}, ${max_cash_usd || null})
+      RETURNING *
+    `;
+    await sql`INSERT INTO activity_events (user_email, type, title, body, trip_id) VALUES (${req.email}, 'upgrade_bid_set', 'Upgrade bid watching', ${`Watching ${flight_ident} for ${cabin_target || 'business'} upgrade`}, ${req.params.tripId})`;
+    res.json({ bid });
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
+// GET /trips/:tripId/upgrade-bids — list upgrade bids for a trip
+app.get("/trips/:tripId/upgrade-bids", auth, async (req, res) => {
+  try {
+    const bids = await sql`SELECT * FROM upgrade_bids WHERE user_email = ${req.email} AND trip_id = ${req.params.tripId} ORDER BY created_at DESC`;
+    res.json({ bids });
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
+// DELETE /upgrade-bids/:id — cancel an upgrade bid
+app.delete("/upgrade-bids/:id", auth, async (req, res) => {
+  try {
+    await sql`DELETE FROM upgrade_bids WHERE id = ${req.params.id} AND user_email = ${req.email}`;
+    res.json({ ok: true });
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
+// Upgrade bid watcher cron — runs every 6 hours, checks award availability for active bids
+const cron = require("node-cron");
+cron.schedule("0 */6 * * *", async () => {
+  console.log("[cron] upgrade-bid watcher running");
+  try {
+    const bids = await sql`SELECT ub.*, u.push_token FROM upgrade_bids ub JOIN users u ON u.email = ub.user_email WHERE ub.status = 'watching' AND ub.flight_ident IS NOT NULL`;
+    for (const bid of bids) {
+      try {
+        // Check award availability via AwardWallet / Point.me API
+        const pmKey = process.env.POINTME_API_KEY;
+        if (!pmKey) continue;
+        const pmResp = await fetch(`https://api.point.me/v1/search?origin=${bid.flight_ident.slice(0,3)}&destination=${bid.flight_ident.slice(3,6)}&cabin=${bid.cabin_target}&date=${new Date().toISOString().slice(0,10)}`, {
+          headers: { Authorization: `Bearer ${pmKey}` }
+        });
+        if (!pmResp.ok) continue;
+        const pmData = await pmResp.json();
+        const offers = pmData.results || [];
+        const match = offers.find(o => o.available && (!bid.max_points || o.points <= bid.max_points));
+        if (match) {
+          await sql`UPDATE upgrade_bids SET status = 'offer_found', offer_found_at = NOW(), offer_details = ${JSON.stringify(match)} WHERE id = ${bid.id}`;
+          if (bid.push_token) {
+            await fetch("https://exp.host/--/api/v2/push/send", {
+              method: "POST", headers: { "Content-Type": "application/json" },
+              body: JSON.stringify({ to: bid.push_token, title: "✈ Upgrade available!", body: `${bid.cabin_target} upgrade found for ${bid.flight_ident} — ${match.points?.toLocaleString()} pts`, data: { type: "upgrade_offer", bid_id: bid.id } })
+            });
+          }
+        }
+      } catch (bidErr) { console.error("[upgrade-bid] check error:", bidErr.message); }
+    }
+  } catch (e) { console.error("[upgrade-bid cron] error:", e.message); }
+});
+
+// ---------------------------------------------------------------------------
+// GMAIL BOOKING AUTO-IMPORT
+// ---------------------------------------------------------------------------
+
+// POST /auth/gmail/import — scan Gmail for booking confirmations and auto-create trips
+app.post("/auth/gmail/import", auth, async (req, res) => {
+  try {
+    const tokenRows = await sql`SELECT * FROM gmail_tokens WHERE user_email = ${req.email}`;
+    if (!tokenRows.length) return res.status(400).json({ error: "Gmail not connected" });
+    const oAuth2Client = makeOAuth2Client();
+    oAuth2Client.setCredentials({
+      access_token: tokenRows[0].access_token,
+      refresh_token: tokenRows[0].refresh_token,
+      expiry_date: Number(tokenRows[0].expiry_date),
+    });
+    const gmail = google.gmail({ version: "v1", auth: oAuth2Client });
+    // Search for booking confirmation emails from the last 6 months
+    const sixMonthsAgo = Math.floor(Date.now() / 1000) - 6 * 30 * 24 * 3600;
+    const query = `after:${sixMonthsAgo} (subject:"booking confirmation" OR subject:"your flight" OR subject:"itinerary" OR subject:"e-ticket" OR subject:"reservation confirmed" OR from:noreply@aa.com OR from:noreply@united.com OR from:noreply@delta.com OR from:noreply@duffel.com)`;
+    const listResp = await gmail.users.messages.list({ userId: "me", q: query, maxResults: 20 });
+    const messages = listResp.data.messages || [];
+    const imported = [];
+    for (const msg of messages.slice(0, 10)) {
+      try {
+        // Check if already imported
+        const existing = await sql`SELECT id FROM booking_imports WHERE user_email = ${req.email} AND raw_subject LIKE ${'%' + msg.id + '%'}`;
+        if (existing.length) continue;
+        const full = await gmail.users.messages.get({ userId: "me", id: msg.id, format: "metadata", metadataHeaders: ["Subject", "From", "Date"] });
+        const headers = full.data.payload?.headers || [];
+        const subject = headers.find(h => h.name === "Subject")?.value || "";
+        const from = headers.find(h => h.name === "From")?.value || "";
+        const date = headers.find(h => h.name === "Date")?.value || "";
+        // Use Anthropic to parse the booking details
+        let parsed = null;
+        try {
+          const anthropic = getAnthropic();
+          const parseResp = await anthropic.messages.create({
+            model: "claude-3-haiku-20240307",
+            max_tokens: 400,
+            messages: [{ role: "user", content: `Extract booking details from this email subject and sender. Return JSON only with fields: type (flight/hotel/car), origin, destination, departs_at (ISO), arrives_at (ISO), carrier, flight_number, confirmation, title. Subject: "${subject}" From: "${from}" Date: "${date}"` }]
+          });
+          parsed = JSON.parse(parseResp.content[0].text.replace(/```json\n?|```/g, "").trim());
+        } catch (_) { parsed = { type: "flight", title: subject.slice(0, 60) }; }
+        // Store import record
+        await sql`INSERT INTO booking_imports (user_email, source, raw_subject, parsed) VALUES (${req.email}, 'gmail', ${msg.id + ':' + subject}, ${JSON.stringify(parsed)})`;
+        // Auto-create trip if we have enough data
+        if (parsed?.destination && parsed?.departs_at) {
+          const tripTitle = parsed.title || `${parsed.origin || '?'} → ${parsed.destination}`;
+          const [trip] = await sql`INSERT INTO trips (user_email, title, status, source) VALUES (${req.email}, ${tripTitle}, 'upcoming', 'gmail_import') RETURNING id`;
+          if (trip && parsed.type === "flight") {
+            await sql`INSERT INTO trip_legs (trip_id, type, carrier, flight_number, origin, destination, departs_at, arrives_at, confirmation) VALUES (${trip.id}, 'flight', ${parsed.carrier || null}, ${parsed.flight_number || null}, ${parsed.origin || null}, ${parsed.destination || null}, ${parsed.departs_at || null}::TIMESTAMPTZ, ${parsed.arrives_at || null}::TIMESTAMPTZ, ${parsed.confirmation || null})`;
+          }
+          await sql`UPDATE booking_imports SET trip_id = ${trip?.id || null} WHERE user_email = ${req.email} AND raw_subject = ${msg.id + ':' + subject}`;
+          imported.push({ subject, trip_id: trip?.id, parsed });
+        }
+      } catch (msgErr) { console.error("[gmail-import] msg error:", msgErr.message); }
+    }
+    res.json({ imported_count: imported.length, imported });
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
+// ---------------------------------------------------------------------------
+// MULTI-CITY AI TRIP PLANNING
+// ---------------------------------------------------------------------------
+
+// POST /plan — AI-powered multi-city trip planning with Duffel flight search
+app.post("/plan", auth, async (req, res) => {
+  try {
+    const { prompt, passengers, cabin } = req.body;
+    if (!prompt) return res.status(400).json({ error: "prompt required" });
+    // Step 1: Use Anthropic to parse the trip intent into structured legs
+    const anthropic = getAnthropic();
+    const parseResp = await anthropic.messages.create({
+      model: "claude-3-haiku-20240307",
+      max_tokens: 600,
+      messages: [{ role: "user", content: `Parse this travel request into a structured multi-city itinerary. Return JSON only with: { title, legs: [{ origin, destination, depart_date (YYYY-MM-DD), type: 'flight'|'hotel', nights (for hotel), notes }] }. Request: "${prompt}"` }]
+    });
+    let plan;
+    try {
+      plan = JSON.parse(parseResp.content[0].text.replace(/```json\n?|```/g, "").trim());
+    } catch (_) {
+      return res.status(422).json({ error: "Could not parse trip intent", raw: parseResp.content[0].text });
+    }
+    // Step 2: Search Duffel for each flight leg
+    const duffel = new Duffel({ token: process.env.DUFFEL_API_KEY || "" });
+    const flightLegs = plan.legs?.filter(l => l.type === "flight") || [];
+    const flightResults = [];
+    for (const leg of flightLegs.slice(0, 4)) {
+      try {
+        const offerReq = await duffel.offerRequests.create({
+          slices: [{ origin: leg.origin, destination: leg.destination, departure_date: leg.depart_date }],
+          passengers: [{ type: "adult" }],
+          cabin_class: cabin || "economy",
+        });
+        const offers = await duffel.offers.list({ offer_request_id: offerReq.data.id, limit: 3 });
+        const best = offers.data?.[0];
+        if (best) flightResults.push({ leg, offer: { id: best.id, price: best.total_amount, currency: best.total_currency, segments: best.slices?.[0]?.segments?.map(s => ({ carrier: s.operating_carrier?.iata_code, flight_number: s.operating_carrier_flight_number, departs_at: s.departing_at, arrives_at: s.arriving_at })) } });
+      } catch (duffelErr) {
+        flightResults.push({ leg, offer: null, error: duffelErr.message });
+      }
+    }
+    // Step 3: Generate a natural language summary
+    const summaryResp = await anthropic.messages.create({
+      model: "claude-3-haiku-20240307",
+      max_tokens: 300,
+      messages: [{ role: "user", content: `Write a 2-sentence excited summary of this trip plan for the user: ${JSON.stringify(plan)}. Be specific about cities and dates. Sound like a knowledgeable travel companion.` }]
+    });
+    res.json({
+      title: plan.title,
+      legs: plan.legs,
+      flight_results: flightResults,
+      summary: summaryResp.content[0].text,
+      total_flights: flightLegs.length,
+    });
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
+// POST /plan/confirm — confirm a plan and create the trip + legs in the DB
+app.post("/plan/confirm", auth, async (req, res) => {
+  try {
+    const { title, legs, flight_results } = req.body;
+    if (!title || !legs?.length) return res.status(400).json({ error: "title and legs required" });
+    const [trip] = await sql`INSERT INTO trips (user_email, title, status, source) VALUES (${req.email}, ${title}, 'upcoming', 'ai_plan') RETURNING id`;
+    for (const leg of legs) {
+      const flightResult = flight_results?.find(fr => fr.leg.origin === leg.origin && fr.leg.destination === leg.destination);
+      const seg = flightResult?.offer?.segments?.[0];
+      await sql`INSERT INTO trip_legs (trip_id, type, carrier, flight_number, origin, destination, departs_at, arrives_at) VALUES (${trip.id}, ${leg.type || 'flight'}, ${seg?.carrier || null}, ${seg?.flight_number || null}, ${leg.origin || null}, ${leg.destination || null}, ${seg?.departs_at || leg.depart_date + 'T00:00:00Z'}::TIMESTAMPTZ, ${seg?.arrives_at || null}::TIMESTAMPTZ)`;
+    }
+    await sql`INSERT INTO activity_events (user_email, type, title, body, trip_id) VALUES (${req.email}, 'trip_planned', 'AI trip planned', ${`Wingman planned your trip: ${title}`}, ${trip.id})`;
+    res.json({ trip_id: trip.id, title, legs_created: legs.length });
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
+// ---------------------------------------------------------------------------
+// PARSED SIGNALS (for SignalScreen)
+// ---------------------------------------------------------------------------
+
+// GET /signals — return recent parsed signals from messages/calendar/email
+app.get("/signals", auth, async (req, res) => {
+  try {
+    // Pull recent activity events of type 'signal' or 'gmail_scan'
+    const signals = await sql`
+      SELECT ae.*, t.title as trip_title
+      FROM activity_events ae
+      LEFT JOIN trips t ON t.id = ae.trip_id
+      WHERE ae.user_email = ${req.email}
+        AND ae.type IN ('signal', 'gmail_scan', 'calendar_sync', 'message_sync')
+      ORDER BY ae.created_at DESC
+      LIMIT 20
+    `;
+    // Also pull recent booking imports
+    const imports = await sql`SELECT * FROM booking_imports WHERE user_email = ${req.email} ORDER BY created_at DESC LIMIT 10`;
+    res.json({ signals, imports });
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
+// ---------------------------------------------------------------------------
+// LIVE ACTIVITY PUSH PAYLOAD
+// ---------------------------------------------------------------------------
+
+// POST /trips/:tripId/live-activity — send a Live Activity update for a flight leg
+app.post("/trips/:tripId/live-activity", auth, async (req, res) => {
+  try {
+    const { leg_id, gate, terminal, delay_minutes, status, baggage_claim } = req.body;
+    const [user] = await sql`SELECT push_token FROM users WHERE email = ${req.email}`;
+    if (!user?.push_token) return res.status(400).json({ error: "No push token" });
+    // Expo doesn't support Live Activities directly — we send a high-priority push
+    // that the app can use to update a Live Activity via ActivityKit
+    const payload = {
+      to: user.push_token,
+      title: delay_minutes > 0 ? `✈ Delayed ${delay_minutes} min` : "✈ Flight update",
+      body: [
+        gate ? `Gate ${gate}` : null,
+        terminal ? `Terminal ${terminal}` : null,
+        delay_minutes > 0 ? `+${delay_minutes} min delay` : null,
+        status ? status : null,
+        baggage_claim ? `Baggage: ${baggage_claim}` : null,
+      ].filter(Boolean).join(" · "),
+      data: { type: "live_activity", leg_id, gate, terminal, delay_minutes, status, baggage_claim, trip_id: req.params.tripId },
+      priority: "high",
+      channelId: "flight-status",
+    };
+    const pushResp = await fetch("https://exp.host/--/api/v2/push/send", {
+      method: "POST", headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(payload),
+    });
+    const pushData = await pushResp.json();
+    res.json({ ok: true, push: pushData });
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
+// ---------------------------------------------------------------------------
+// UPDATE HEALTH ENDPOINT VERSION TO 2.8.0
+// ---------------------------------------------------------------------------
 app.listen(PORT, () => console.log("Wingman API on http://localhost:" + PORT));
