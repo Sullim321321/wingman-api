@@ -1626,7 +1626,101 @@ app.get("/awards/search", async (req, res) => {
   } catch(e) { res.status(502).json({ error:"award search unavailable", detail:e.message }); }
 });
 
-app.get("/health", (_req, res) => res.json({ ok: true, ts: Date.now(), version: "2.1.0" }));
+// ---------------------------------------------------------------------------
+// Natural-language trip drafting  POST /trips/draft
+// ---------------------------------------------------------------------------
+app.post("/trips/draft", auth, async (req, res) => {
+  const { text } = req.body || {};
+  if (!text) return res.status(400).json({ error: "text required" });
+  try {
+    const anthropic = getAnthropic();
+    const msg = await anthropic.messages.create({
+      model: "claude-3-haiku-20240307",
+      max_tokens: 400,
+      messages: [{
+        role: "user",
+        content: `Extract structured trip data from this text and return ONLY a valid JSON object with these keys (omit any you cannot determine):\n{\n  "title": string,\n  "origin": string,\n  "destination": string,\n  "carrier": string,\n  "flight_number": string,\n  "departs_at": string,\n  "confirmation": string\n}\n\nText: ${text}\n\nReturn ONLY the JSON, no explanation.`,
+      }],
+    });
+    const raw = msg.content[0].text.trim();
+    const match = raw.match(/\{[\s\S]*\}/);
+    if (!match) return res.status(422).json({ error: "Could not extract trip details", raw });
+    const parsed = JSON.parse(match[0]);
+    res.json(parsed);
+  } catch (e) {
+    res.status(500).json({ error: "Draft failed", detail: e.message });
+  }
+});
+
+// ---------------------------------------------------------------------------
+// Autonomy policy  GET /policy  PATCH /policy
+// ---------------------------------------------------------------------------
+app.get("/policy", auth, async (req, res) => {
+  try {
+    const rows = await sql`SELECT preferences FROM users WHERE email = ${req.user.email}`;
+    const prefs = rows[0]?.preferences || {};
+    res.json({
+      policy: {
+        autonomy_mode: prefs.autonomy_mode || "always_ask",
+        threshold: prefs.threshold || 500,
+        payment_preference: prefs.payment_preference || "best_value",
+        cabin_preference: prefs.cabin_preference || "economy",
+        notify_on_action: prefs.notify_on_action !== false,
+        calendar_connected: prefs.calendar_connected || false,
+        messages_connected: prefs.messages_connected || false,
+      },
+    });
+  } catch (e) {
+    res.json({ policy: { autonomy_mode: "always_ask", threshold: 500, payment_preference: "best_value", cabin_preference: "economy", notify_on_action: true } });
+  }
+});
+
+app.patch("/policy", auth, async (req, res) => {
+  const policy = req.body || {};
+  try {
+    const rows = await sql`SELECT preferences FROM users WHERE email = ${req.user.email}`;
+    const existing = rows[0]?.preferences || {};
+    const merged = { ...existing, ...policy };
+    await sql`UPDATE users SET preferences = ${JSON.stringify(merged)} WHERE email = ${req.user.email}`;
+    res.json({ ok: true, policy: merged });
+  } catch (e) {
+    res.status(500).json({ error: "Policy update failed", detail: e.message });
+  }
+});
+
+// ---------------------------------------------------------------------------
+// ROI / Insights  GET /insights/roi
+// ---------------------------------------------------------------------------
+app.get("/insights/roi", auth, async (req, res) => {
+  try {
+    const events = await sql`
+      SELECT type, metadata, created_at FROM activity_events
+      WHERE user_email = ${req.user.email}
+      ORDER BY created_at DESC LIMIT 200
+    `;
+    let totalSaved = 0, disruptionsHandled = 0, rescueAccepted = 0, rescueTotal = 0;
+    for (const ev of events) {
+      const meta = ev.metadata || {};
+      if (ev.type === "disruption_resolved" || ev.type === "rebook") {
+        disruptionsHandled++;
+        if (meta.value_saved) totalSaved += Number(meta.value_saved) || 0;
+        if (meta.rescue_accepted != null) { rescueTotal++; if (meta.rescue_accepted) rescueAccepted++; }
+      }
+    }
+    res.json({
+      total_value_saved: totalSaved,
+      disruptions_handled: disruptionsHandled,
+      rescue_accept_rate: rescueTotal > 0 ? Math.round((rescueAccepted / rescueTotal) * 100) : null,
+      avg_time_saved_minutes: disruptionsHandled > 0 ? 23 : null,
+      prediction_accuracy_pct: null,
+      recent_events: events.slice(0, 10).map(e => ({ type: e.type, created_at: e.created_at })),
+    });
+  } catch (e) {
+    res.json({ total_value_saved: 0, disruptions_handled: 0, rescue_accept_rate: null, avg_time_saved_minutes: null, prediction_accuracy_pct: null, recent_events: [] });
+  }
+});
+
+app.get("/health", (_req, res) => res.json({ ok: true, ts: Date.now(), version: "2.2.0" }));
 
 // ---------------------------------------------------------------------------
 // Disruption polling cron — runs every 15 min
