@@ -1720,7 +1720,7 @@ app.get("/insights/roi", auth, async (req, res) => {
   }
 });
 
-app.get("/health", (_req, res) => res.json({ ok: true, ts: Date.now(), version: "2.2.0" }));
+app.get("/health", (_req, res) => res.json({ ok: true, ts: Date.now(), version: "2.3.0" }));
 
 // ---------------------------------------------------------------------------
 // Disruption polling cron — runs every 15 min
