@@ -98,6 +98,11 @@ async function bootstrapDB() {
     await sql`ALTER TABLE users ADD COLUMN IF NOT EXISTS subscription_status TEXT DEFAULT 'inactive'`;
     await sql`ALTER TABLE users ADD COLUMN IF NOT EXISTS stripe_customer_id TEXT`;
     await sql`ALTER TABLE users ADD COLUMN IF NOT EXISTS stripe_subscription_id TEXT`;
+    await sql`ALTER TABLE users ADD COLUMN IF NOT EXISTS locale TEXT DEFAULT 'en'`;
+    await sql`ALTER TABLE users ADD COLUMN IF NOT EXISTS currency TEXT DEFAULT 'USD'`;
+    await sql`ALTER TABLE users ADD COLUMN IF NOT EXISTS weather_alerts BOOLEAN DEFAULT true`;
+    await sql`ALTER TABLE users ADD COLUMN IF NOT EXISTS price_alerts BOOLEAN DEFAULT true`;
+    await sql`ALTER TABLE users ADD COLUMN IF NOT EXISTS quiet_hours BOOLEAN DEFAULT true`;
     await sql`
       CREATE TABLE IF NOT EXISTS refresh_tokens (
         id SERIAL PRIMARY KEY,
@@ -1680,7 +1685,7 @@ app.post("/trips/draft", auth, async (req, res) => {
 // ---------------------------------------------------------------------------
 app.get("/policy", auth, async (req, res) => {
   try {
-    const rows = await sql`SELECT preferences FROM users WHERE email = ${req.user.email}`;
+    const rows = await sql`SELECT preferences, weather_alerts, price_alerts, quiet_hours FROM users WHERE email = ${req.user.email}`;
     const prefs = rows[0]?.preferences || {};
     res.json({
       policy: {
@@ -1691,21 +1696,38 @@ app.get("/policy", auth, async (req, res) => {
         notify_on_action: prefs.notify_on_action !== false,
         calendar_connected: prefs.calendar_connected || false,
         messages_connected: prefs.messages_connected || false,
+        weather_alerts: rows[0]?.weather_alerts !== false,
+        price_alerts: rows[0]?.price_alerts !== false,
+        quiet_hours: rows[0]?.quiet_hours !== false,
       },
     });
   } catch (e) {
-    res.json({ policy: { autonomy_mode: "always_ask", threshold: 500, payment_preference: "best_value", cabin_preference: "economy", notify_on_action: true } });
+    res.json({ policy: { autonomy_mode: "always_ask", threshold: 500, payment_preference: "best_value", cabin_preference: "economy", notify_on_action: true, weather_alerts: true, price_alerts: true, quiet_hours: true } });
   }
 });
+
+// Alias: /profile/policy → /policy (backward compat for older app builds)
+app.get("/profile/policy", auth, (req, res) => { req.url = "/policy"; app._router.handle(req, res, () => {}); });
+app.patch("/profile/policy", auth, (req, res) => { req.url = "/policy"; app._router.handle(req, res, () => {}); });
 
 app.patch("/policy", auth, async (req, res) => {
   const policy = req.body || {};
   try {
+    // Extract top-level boolean alert prefs from the policy body
+    const { weather_alerts, price_alerts, quiet_hours, ...prefFields } = policy;
     const rows = await sql`SELECT preferences FROM users WHERE email = ${req.user.email}`;
     const existing = rows[0]?.preferences || {};
-    const merged = { ...existing, ...policy };
-    await sql`UPDATE users SET preferences = ${JSON.stringify(merged)} WHERE email = ${req.user.email}`;
-    res.json({ ok: true, policy: merged });
+    const merged = { ...existing, ...prefFields };
+    // Update preferences JSONB and alert columns together
+    await sql`
+      UPDATE users SET
+        preferences = ${JSON.stringify(merged)}::jsonb,
+        weather_alerts = COALESCE(${weather_alerts !== undefined ? weather_alerts : null}, weather_alerts),
+        price_alerts   = COALESCE(${price_alerts   !== undefined ? price_alerts   : null}, price_alerts),
+        quiet_hours    = COALESCE(${quiet_hours    !== undefined ? quiet_hours    : null}, quiet_hours)
+      WHERE email = ${req.user.email}
+    `;
+    res.json({ ok: true, policy: { ...merged, weather_alerts, price_alerts, quiet_hours } });
   } catch (e) {
     res.status(500).json({ error: "Policy update failed", detail: e.message });
   }
@@ -1723,12 +1745,22 @@ app.get("/insights/roi", auth, async (req, res) => {
     `;
     let totalSaved = 0, disruptionsHandled = 0, rescueAccepted = 0, rescueTotal = 0;
     for (const ev of events) {
-      const meta = ev.metadata || {};
-      if (ev.type === "disruption_resolved" || ev.type === "rebook") {
+      // metadata may be a string (from JSONB) or already parsed
+      const meta = typeof ev.metadata === "string" ? JSON.parse(ev.metadata || "{}") : (ev.metadata || {});
+      if (ev.type === "disruption_resolved" || ev.type === "rebook" || ev.type === "trip_outcome") {
         disruptionsHandled++;
         if (meta.value_saved) totalSaved += Number(meta.value_saved) || 0;
         if (meta.rescue_accepted != null) { rescueTotal++; if (meta.rescue_accepted) rescueAccepted++; }
       }
+    }
+    // Also sum value_saved from trip outcomes table
+    const outcomeRows = await sql`
+      SELECT metadata FROM activity_events
+      WHERE user_email = ${req.user.email} AND type = 'trip_outcome'
+    `;
+    for (const row of outcomeRows) {
+      const m = typeof row.metadata === "string" ? JSON.parse(row.metadata || "{}") : (row.metadata || {});
+      if (m.value_saved) totalSaved += Number(m.value_saved) || 0;
     }
     res.json({
       total_value_saved: totalSaved,
@@ -1739,11 +1771,12 @@ app.get("/insights/roi", auth, async (req, res) => {
       recent_events: events.slice(0, 10).map(e => ({ type: e.type, created_at: e.created_at })),
     });
   } catch (e) {
+    console.error("[insights/roi] error:", e.message);
     res.json({ total_value_saved: 0, disruptions_handled: 0, rescue_accept_rate: null, avg_time_saved_minutes: null, prediction_accuracy_pct: null, recent_events: [] });
   }
 });
 
-app.get("/health", (_req, res) => res.json({ ok: true, ts: Date.now(), version: "2.3.0" }));
+app.get("/health", (_req, res) => res.json({ ok: true, ts: Date.now(), version: "2.5.0" }));
 
 // ---------------------------------------------------------------------------
 // Disruption polling cron — runs every 15 min
@@ -1859,7 +1892,12 @@ async function pollDisruptions() {
 
       // Send push notification (only for actionable events)
       if (pushTitle) {
-        await sendPushToUser(leg.user_email, pushTitle, pushBody, { route: "Activity" });
+        await sendPushToUser(leg.user_email, pushTitle, pushBody, {
+          route: newStatus === "Cancelled" || newStatus === "Delayed" ? "Alert" : "Activity",
+          tripId: String(leg.trip_id),
+          legId: String(leg.id),
+          flightIdent: ident,
+        });
       }
     }
     // Feature E: Seat preference alerts — check if preferred seat type is available
@@ -3100,6 +3138,81 @@ app.post("/trips/:tripId/outcome", auth, async (req, res) => {
   } catch (e) {
     res.status(500).json({ error: e.message });
   }
+});
+
+// ---------------------------------------------------------------------------
+// PATCH /profile/locale — save language and currency preferences
+// ---------------------------------------------------------------------------
+app.patch("/profile/locale", auth, async (req, res) => {
+  const { locale, currency } = req.body || {};
+  if (!locale && !currency) return res.status(400).json({ error: "locale or currency required" });
+  try {
+    await sql`
+      UPDATE users SET
+        locale   = COALESCE(${locale   || null}, locale),
+        currency = COALESCE(${currency || null}, currency)
+      WHERE email = ${req.user.email}
+    `;
+    const rows = await sql`SELECT locale, currency FROM users WHERE email = ${req.user.email}`;
+    res.json({ ok: true, locale: rows[0].locale, currency: rows[0].currency });
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
+// ---------------------------------------------------------------------------
+// POST /sync/calendar — store calendar events as trip context
+// ---------------------------------------------------------------------------
+app.post("/sync/calendar", auth, async (req, res) => {
+  const { events } = req.body || {};
+  if (!Array.isArray(events)) return res.status(400).json({ error: "events array required" });
+  let created = 0;
+  for (const ev of events) {
+    try {
+      // Look for travel keywords in event title/description
+      const text = `${ev.title || ""} ${ev.notes || ""} ${ev.location || ""}`;
+      const travelKeywords = /flight|hotel|check.?in|check.?out|airport|depart|arrive|booking|reservation|itinerary|transit|train|cruise/i;
+      if (!travelKeywords.test(text)) continue;
+      // Log as a signal event for the concierge to pick up
+      await logActivity(
+        req.user.email, "calendar_signal",
+        `Calendar: ${ev.title || "Travel event"}`,
+        `${ev.notes || ""} ${ev.location ? `· ${ev.location}` : ""}`.trim(),
+        null, null,
+        { source: "calendar", startDate: ev.startDate, endDate: ev.endDate, location: ev.location }
+      );
+      created++;
+    } catch (_) {}
+  }
+  // Mark calendar as connected in preferences
+  await sql`UPDATE users SET preferences = COALESCE(preferences,'{}'::jsonb) || '{"calendar_connected":true}'::jsonb WHERE email = ${req.user.email}`;
+  res.json({ ok: true, signals_created: created, total_events: events.length });
+});
+
+// ---------------------------------------------------------------------------
+// POST /sync/messages — store message signals as trip context
+// ---------------------------------------------------------------------------
+app.post("/sync/messages", auth, async (req, res) => {
+  const { messages } = req.body || {};
+  if (!Array.isArray(messages)) return res.status(400).json({ error: "messages array required" });
+  let created = 0;
+  for (const msg of messages) {
+    try {
+      const text = `${msg.body || ""} ${msg.sender || ""}`;
+      const travelKeywords = /flight|hotel|trip|travel|airport|booking|reservation|passport|visa|itinerary|luggage|suitcase|vacation|holiday/i;
+      if (!travelKeywords.test(text)) continue;
+      await logActivity(
+        req.user.email, "message_signal",
+        `Message signal: ${msg.sender || "Unknown"}`,
+        (msg.body || "").slice(0, 200),
+        null, null,
+        { source: "messages", sender: msg.sender, timestamp: msg.timestamp }
+      );
+      created++;
+    } catch (_) {}
+  }
+  await sql`UPDATE users SET preferences = COALESCE(preferences,'{}'::jsonb) || '{"messages_connected":true}'::jsonb WHERE email = ${req.user.email}`;
+  res.json({ ok: true, signals_created: created, total_messages: messages.length });
 });
 
 app.listen(PORT, () => console.log("Wingman API on http://localhost:" + PORT));
