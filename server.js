@@ -414,7 +414,8 @@ app.post("/auth/verify", async (req, res) => {
 app.post("/push-token", async (req, res) => {
   const email = await verifyAccessToken(req);
   if (!email) return res.status(401).json({ error: "unauthorized" });
-  const { token } = req.body || {};
+  // App sends { pushToken } (Expo convention); also accept legacy { token }
+  const token = req.body?.pushToken || req.body?.token;
   if (!token) return res.status(400).json({ error: "token required" });
   try {
     await sql`UPDATE users SET push_token = ${token} WHERE email = ${email}`;
@@ -740,6 +741,20 @@ app.patch("/profile", async (req, res) => {
     res.status(500).json({ error: "db error" });
   }
 });
+// GET /profile — alias for GET /me (app calls this from HomeAddressScreen, LoyaltyScreen)
+// ---------------------------------------------------------------------------
+app.get("/profile", async (req, res) => {
+  const email = await verifyAccessToken(req);
+  if (!email) return res.status(401).json({ error: "unauthorized" });
+  try {
+    const rows = await sql`SELECT email, push_token, preferences, created_at FROM users WHERE email = ${email}`;
+    if (!rows[0]) return res.status(404).json({ error: "user not found" });
+    const gmailRows = await sql`SELECT id FROM gmail_tokens WHERE user_email = ${email}`;
+    res.json({ ...rows[0], gmail_connected: gmailRows.length > 0 });
+  } catch (e) {
+    res.status(500).json({ error: "db error" });
+  }
+});
 // ---------------------------------------------------------------------------
 // Gmail OAuth — GET /auth/gmail/connect — returns URL to open in browser
 // ---------------------------------------------------------------------------
@@ -968,13 +983,69 @@ Return this exact JSON structure (null for unknown fields):
 app.post("/auth/gmail/scan", async (req, res) => {
   const email = await verifyAccessToken(req);
   if (!email) return res.status(401).json({ error: "unauthorized" });
+  const { emailBody, source } = req.body || {};
+
+  // If emailBody provided: extract trips from pasted confirmation text
+  if (emailBody) {
+    try {
+      const trips_added = await parsePastedEmailBody(email, emailBody, source || "paste");
+      return res.json({ ok: true, trips_created: trips_added, trips_found: trips_added });
+    } catch (e) {
+      console.error("[scan/paste]", e.message);
+      return res.status(500).json({ error: e.message });
+    }
+  }
+
+  // Otherwise: trigger a background Gmail re-scan (existing behaviour)
   try {
     scanGmailForTrips(email).catch(e => console.error("[scan]", e.message));
-    res.json({ ok: true, message: "Scan started" });
+    res.json({ ok: true, message: "Scan started", trips_created: 0 });
   } catch (e) {
     res.status(500).json({ error: e.message });
   }
 });
+
+// Parse a pasted email body and store any trips found
+async function parsePastedEmailBody(userEmail, body, source) {
+  const flightPattern = /(?:flight|flt)[:\s#]*([A-Z]{2}\d{3,4})/gi;
+  const routePattern  = /([A-Z]{3})\s*(?:to|→|->)\s*([A-Z]{3})/g;
+  const datePattern   = /(?:departs?|departure)[:\s]*([A-Za-z]+ \d{1,2},? \d{4}|\d{1,2}\/\d{1,2}\/\d{4})/gi;
+
+  const flights = [...body.matchAll(flightPattern)].map(m => m[1]);
+  const routes  = [...body.matchAll(routePattern)].map(m => ({ origin: m[1], destination: m[2] }));
+  const dates   = [...body.matchAll(datePattern)].map(m => m[1]);
+
+  if (routes.length === 0 && flights.length === 0) return 0;
+
+  const route = routes[0] || {};
+  const tripTitle = route.destination ? `Trip to ${route.destination}` : "Imported Trip";
+
+  const tripRows = await sql`
+    INSERT INTO trips (user_email, title, source)
+    VALUES (${userEmail}, ${tripTitle}, ${source})
+    RETURNING id
+  `;
+  if (tripRows.length === 0) return 0;
+  const tripId = tripRows[0].id;
+
+  for (let i = 0; i < Math.max(flights.length, 1); i++) {
+    const f = flights[i] || null;
+    await sql`
+      INSERT INTO trip_legs (trip_id, type, carrier, flight_number, origin, destination, departs_at)
+      VALUES (
+        ${tripId}, 'flight',
+        ${f ? f.slice(0, 2) : null},
+        ${f ? f.slice(2) : null},
+        ${routes[i]?.origin || route.origin || null},
+        ${routes[i]?.destination || route.destination || null},
+        ${dates[i] || dates[0] || null}
+      )
+    `;
+  }
+
+  await logActivity(userEmail, "import", `Imported: ${tripTitle}`, `Booking pasted manually.`, tripId);
+  return 1;
+}
 
 // ---------------------------------------------------------------------------
 // GET /uber/deeplink — returns a pre-filled Uber deep link for a given airport
@@ -1007,7 +1078,8 @@ app.get("/uber/deeplink", async (req, res) => {
     }
     // Also return a universal fallback URL for users without the app
     const webFallback = `https://m.uber.com/ul/?action=setPickup&pickup[latitude]=${pickupLat}&pickup[longitude]=${pickupLng}&pickup[nickname]=${pickupNickname}`;
-    res.json({ deepLink, webFallback, airport, mode, coords });
+    // App reads data.url — include as alias for deepLink
+    res.json({ deepLink, url: deepLink, webFallback, airport, mode, coords });
   } catch (e) {
     res.status(500).json({ error: e.message });
   }
@@ -1412,6 +1484,18 @@ app.get("/flight-status", async (req, res) => {
   res.json({ ident, live: true, ...status });
 });
 
+// GET /flight-status/:ident — path-param alias (app calls this form)
+// ---------------------------------------------------------------------------
+app.get("/flight-status/:ident", async (req, res) => {
+  const email = await verifyAccessToken(req);
+  if (!email) return res.status(401).json({ error: "unauthorized" });
+  const ident = String(req.params.ident || "").toUpperCase().replace(/\s/g, "");
+  if (!ident) return res.status(400).json({ error: "ident required" });
+  const status = await getFlightStatus(ident);
+  if (!status) return res.json({ ident, status: "Unknown", live: false });
+  res.json({ ident, live: true, ...status });
+});
+// ---------------------------------------------------------------------------
 // POST /trips/:id/refresh — refresh all leg statuses for a trip
 app.post("/trips/:id/refresh", async (req, res) => {
   const email = await verifyAccessToken(req);
@@ -1446,7 +1530,103 @@ app.get("/privacy", (_req, res) => {
 // ---------------------------------------------------------------------------
 // Health check
 // ---------------------------------------------------------------------------
-app.get("/health", (_req, res) => res.json({ ok: true, ts: Date.now() }));
+// ---------------------------------------------------------------------------
+// GET /tsa-wait — TSA security wait estimate (modeled, no API key needed)
+// Called by HomeScreen ground intel panel
+// ---------------------------------------------------------------------------
+const TSA_BUSYNESS = { ATL:1.6,LAX:1.5,ORD:1.45,DFW:1.4,DEN:1.3,JFK:1.35,SFO:1.3,LAS:1.25,MCO:1.3,SEA:1.2,MIA:1.2,CLT:1.15,EWR:1.25,LGA:1.2,BOS:1.15,MSP:1.1,DTW:1.1,PHL:1.15,FLL:1.1,BWI:1.05,IAH:1.15,PHX:1.1,SLC:1.05,SAN:1.0,TPA:0.95,PDX:0.95,HNL:0.9,AUS:1.05,BNA:0.95,RDU:0.9,STL:0.85,MCI:0.85,ASE:0.4,EGE:0.35,JAC:0.35 };
+const HOUR_CURVE = [0.05,0.03,0.02,0.02,0.04,0.12,0.25,0.55,0.80,0.90,0.85,0.75,0.70,0.65,0.70,0.75,0.90,1.00,0.95,0.85,0.70,0.55,0.35,0.15];
+const DOW_MULT   = [1.15,0.85,0.90,0.90,0.95,1.20,1.25];
+function estimateTsaWait(airport, hour, dow) {
+  const b = TSA_BUSYNESS[(airport||"").toUpperCase()] || 1.0;
+  const h = HOUR_CURVE[Math.max(0,Math.min(23,hour))] || 0.5;
+  const d = DOW_MULT[dow] || 1.0;
+  const wait = Math.max(3, Math.min(Math.round(22*b*h*d), 90));
+  return { wait, level: wait>=45?"busy":wait>=20?"moderate":"light", source:"modeled" };
+}
+app.get("/tsa-wait", (req, res) => {
+  const airport = (req.query.airport||"").toUpperCase();
+  const hour    = parseInt(req.query.hour) || new Date().getHours();
+  const dow     = parseInt(req.query.dow)  || new Date().getDay();
+  if (!airport) return res.status(400).json({ error:"airport required" });
+  res.json({ airport, ...estimateTsaWait(airport, hour, dow) });
+});
+// ---------------------------------------------------------------------------
+// GET /ground-intel — drive time + TSA + gate walk timeline
+// ---------------------------------------------------------------------------
+const GATE_WALK_DB = { ATL:{default:12,same:5},ORD:{default:18,same:6},DFW:{default:20,same:5},JFK:{default:30,same:8},LAX:{default:25,same:7},LGA:{default:15,same:6},EWR:{default:20,same:6},BOS:{default:12,same:5},SFO:{default:18,same:6},SEA:{default:10,same:5},DEN:{default:14,same:5},MIA:{default:15,same:6} };
+function estimateGateWalk(airport, fromGate, toGate) {
+  const db = GATE_WALK_DB[(airport||"").toUpperCase()];
+  if (!db) return { walk:10, note:"estimated" };
+  const concourse = g => { if(!g) return null; const m=g.match(/^([A-Z]|\d)/i); return m?m[1].toUpperCase():null; };
+  const from = concourse(fromGate), to = concourse(toGate);
+  if (!from||!to||from===to) return { walk:db.same||5, note:"same concourse" };
+  return { walk:db.default||12, note:`${from}→${to} concourse transfer` };
+}
+app.get("/ground-intel", async (req, res) => {
+  const email = await verifyAccessToken(req);
+  if (!email) return res.status(401).json({ error:"unauthorized" });
+  const { airport, departure_time, from_gate, to_gate, lat, lon, delay_minutes } = req.query;
+  if (!airport||!departure_time) return res.status(400).json({ error:"airport and departure_time required" });
+  const dep = new Date(departure_time);
+  const now = new Date();
+  const minutesToDep = Math.round((dep-now)/60000);
+  const localHour = dep.getHours(), dayOfWeek = dep.getDay();
+  const result = { airport, minutesToDeparture:minutesToDep, timeline:[], verdict:null, bufferMinutes:null, atRisk:false };
+  if (lat && lon && !from_gate) {
+    const tsa = estimateTsaWait(airport, localHour, dayOfWeek);
+    const driveMin = 20, gateWalk = 8;
+    const totalMin = driveMin + tsa.wait + gateWalk;
+    const buffer = minutesToDep - totalMin;
+    result.timeline = [
+      { label:"Drive to airport", minutes:driveMin, source:"modeled" },
+      { label:`Security (${tsa.level})`, minutes:tsa.wait, source:tsa.source },
+      { label:"Walk to gate", minutes:gateWalk, source:"modeled" },
+    ];
+    result.bufferMinutes = buffer;
+    result.atRisk = buffer < 20;
+    result.verdict = buffer>=45?"plenty_of_time":buffer>=20?"on_track":buffer>=0?"tight":"will_miss";
+  }
+  if (from_gate && to_gate) {
+    const gw = estimateGateWalk(airport, from_gate, to_gate);
+    const delay = parseInt(delay_minutes)||0;
+    const buffer = minutesToDep - delay - gw.walk - 5;
+    result.timeline = [
+      { label:`Land at ${from_gate}`, minutes:0, source:"scheduled" },
+      { label:`Walk to ${to_gate}`, minutes:gw.walk, source:"modeled", note:gw.note },
+    ];
+    if (delay>0) result.timeline.unshift({ label:"Inbound delay", minutes:delay, source:"live" });
+    result.bufferMinutes = buffer;
+    result.atRisk = buffer < 15;
+    result.verdict = buffer>=30?"plenty_of_time":buffer>=15?"on_track":buffer>=0?"tight":"will_miss";
+  }
+  res.json(result);
+});
+// ---------------------------------------------------------------------------
+// GET /awards/search — award seat search (demo data; live requires Point.me key)
+// ---------------------------------------------------------------------------
+app.get("/awards/search", async (req, res) => {
+  const email = await verifyAccessToken(req);
+  if (!email) return res.status(401).json({ error:"unauthorized" });
+  const { origin, destination, date, cabin="economy" } = req.query;
+  if (!origin||!destination||!date) return res.status(400).json({ error:"origin, destination, date required" });
+  const POINTME_KEY = process.env.POINTME_KEY || null;
+  if (!POINTME_KEY) {
+    return res.json({ origin, destination, date, cabin, source:"demo", results:[
+      { program:"Air Canada Aeroplan",         points:55000, cash_fee:75,  airline:"United Airlines",   flight:"UA 412",  availability:"available" },
+      { program:"Flying Blue (Air France/KLM)",points:50000, cash_fee:60,  airline:"Air France",        flight:"AF 8234", availability:"available" },
+      { program:"American AAdvantage",         points:60000, cash_fee:25,  airline:"American Airlines", flight:"AA 100",  availability:"waitlist"  },
+    ], note:"Live award search requires POINTME_KEY env var" });
+  }
+  try {
+    const r = await fetch(`https://api.point.me/v2/search?origin=${origin}&destination=${destination}&date=${date}&cabin=${cabin}`, { headers:{ "Authorization":`Bearer ${POINTME_KEY}` } });
+    if (!r.ok) throw new Error(`Point.me ${r.status}`);
+    const j = await r.json();
+    res.json({ origin, destination, date, cabin, results:j.results||[], source:"pointme" });
+  } catch(e) { res.status(502).json({ error:"award search unavailable", detail:e.message }); }
+});
+
+app.get("/health", (_req, res) => res.json({ ok: true, ts: Date.now(), version: "2.1.0" }));
 
 // ---------------------------------------------------------------------------
 // Disruption polling cron — runs every 15 min
