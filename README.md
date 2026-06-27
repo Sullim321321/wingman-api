@@ -32,3 +32,4 @@ Push to GitHub → Render → New → Blueprint (reads `render.yaml`). Put the r
 | `PORT` | 4000 | |
 | `JWT_SECRET` | dev-secret | set in prod |
 | `NODE_ENV` | — | `production` stops returning `devCode` |
+# Deploy trigger Sat Jun 27 17:37:12 UTC 2026
