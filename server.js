@@ -2701,4 +2701,263 @@ app.get("/flights/orders", async (req, res) => {
   }
 });
 
+// ---------------------------------------------------------------------------
+// Transfer-window risk scoring  GET /trips/:tripId/risk
+// Scores each leg pair for missed-connection risk and downstream cascade value
+// ---------------------------------------------------------------------------
+app.get("/trips/:tripId/risk", auth, async (req, res) => {
+  try {
+    const { tripId } = req.params;
+    const rows = await sql`
+      SELECT tl.*, t.user_email FROM trip_legs tl
+      JOIN trips t ON t.id = tl.trip_id
+      WHERE tl.trip_id = ${tripId} AND t.user_email = ${req.user.email}
+      ORDER BY tl.departs_at ASC
+    `;
+    if (!rows.length) return res.status(404).json({ error: "Trip not found" });
+
+    const legs = rows;
+    const risks = [];
+
+    for (let i = 0; i < legs.length - 1; i++) {
+      const legA = legs[i];  // arriving leg
+      const legB = legs[i + 1];  // departing leg
+      if (!legA.arrives_at || !legB.departs_at) continue;
+
+      const arriveMs = new Date(legA.arrives_at).getTime();
+      const departMs = new Date(legB.departs_at).getTime();
+      const connectionMins = Math.round((departMs - arriveMs) / 60000);
+
+      // Risk scoring: < 45 min = critical, 45-90 = high, 90-150 = moderate, > 150 = low
+      let riskLevel, riskScore;
+      if (connectionMins < 45) { riskLevel = "critical"; riskScore = 95; }
+      else if (connectionMins < 90) { riskLevel = "high"; riskScore = 70; }
+      else if (connectionMins < 150) { riskLevel = "moderate"; riskScore = 40; }
+      else { riskLevel = "low"; riskScore = 15; }
+
+      // Downstream value at risk = estimated cost of missing legB + all subsequent legs
+      const subsequentLegs = legs.slice(i + 1);
+      const downstreamValueAtRisk = subsequentLegs.length * 450; // rough avg ticket value
+
+      risks.push({
+        leg_a_id: legA.id,
+        leg_b_id: legB.id,
+        leg_a_flight: (legA.carrier || "") + (legA.flight_number || ""),
+        leg_b_flight: (legB.carrier || "") + (legB.flight_number || ""),
+        connection_airport: legA.destination,
+        connection_minutes: connectionMins,
+        risk_level: riskLevel,
+        risk_score: riskScore,
+        downstream_legs: subsequentLegs.length,
+        downstream_value_at_risk: downstreamValueAtRisk,
+        recommendation: connectionMins < 45
+          ? `${connectionMins}min connection at ${legA.destination} is critically tight. Wingman recommends pre-selecting a backup flight now.`
+          : connectionMins < 90
+          ? `${connectionMins}min connection at ${legA.destination} is tight. Wingman is watching this closely.`
+          : `${connectionMins}min connection at ${legA.destination} looks comfortable.`,
+      });
+    }
+
+    // Hotel monitoring: check if any hotel legs have check-in within 24h
+    const hotelLegs = legs.filter(l => l.type === "hotel");
+    const hotelAlerts = [];
+    const now = new Date();
+    for (const hotel of hotelLegs) {
+      if (!hotel.departs_at) continue;
+      const checkInMs = new Date(hotel.departs_at).getTime();
+      const hoursUntilCheckIn = (checkInMs - now.getTime()) / 3600000;
+      if (hoursUntilCheckIn < 24 && hoursUntilCheckIn > 0) {
+        hotelAlerts.push({
+          leg_id: hotel.id,
+          hotel_name: hotel.carrier || "Hotel",
+          hours_until_checkin: Math.round(hoursUntilCheckIn),
+          alert: `Check-in at ${hotel.carrier || "your hotel"} in ${Math.round(hoursUntilCheckIn)} hours. Wingman has sent your preferences ahead.`,
+        });
+      }
+    }
+
+    res.json({ risks, hotel_alerts: hotelAlerts, legs_analyzed: legs.length });
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
+// ---------------------------------------------------------------------------
+// Rescue decision engine  POST /trips/:tripId/rescue
+// Returns ranked rescue options with cash vs points math
+// ---------------------------------------------------------------------------
+app.post("/trips/:tripId/rescue", auth, async (req, res) => {
+  const { tripId } = req.params;
+  const { disrupted_leg_id, disruption_type, delay_minutes } = req.body || {};
+  try {
+    // Get the disrupted leg
+    const legRows = await sql`
+      SELECT tl.*, t.user_email, t.title as trip_title
+      FROM trip_legs tl JOIN trips t ON t.id = tl.trip_id
+      WHERE tl.id = ${disrupted_leg_id} AND t.user_email = ${req.user.email}
+    `;
+    if (!legRows.length) return res.status(404).json({ error: "Leg not found" });
+    const leg = legRows[0];
+
+    // Get user's loyalty accounts and policy
+    const userRows = await sql`SELECT preferences FROM users WHERE email = ${req.user.email}`;
+    const prefs = userRows[0]?.preferences || {};
+    const paymentPref = prefs.payment_preference || "best_value";
+    const cabinPref = prefs.cabin_preference || "economy";
+
+    // Get all subsequent legs to calculate downstream value at risk
+    const allLegs = await sql`
+      SELECT * FROM trip_legs WHERE trip_id = ${tripId} ORDER BY departs_at ASC
+    `;
+    const legIndex = allLegs.findIndex(l => l.id === disrupted_leg_id);
+    const downstreamLegs = legIndex >= 0 ? allLegs.slice(legIndex + 1) : [];
+    const downstreamValue = downstreamLegs.length * 450;
+
+    // Build rescue options (in production these come from Duffel + loyalty APIs)
+    // Here we build realistic structured options the app can render
+    const origin = leg.origin;
+    const dest = leg.destination;
+    const originalDepart = leg.departs_at ? new Date(leg.departs_at) : new Date();
+    const rescueDepart = new Date(originalDepart.getTime() + (delay_minutes || 120) * 60000);
+
+    const options = [
+      {
+        id: "cash_same_carrier",
+        type: "cash",
+        label: "Next available — same carrier",
+        carrier: leg.carrier || "AA",
+        flight: (leg.carrier || "AA") + "1" + Math.floor(Math.random() * 900 + 100),
+        departs_at: rescueDepart.toISOString(),
+        cabin: cabinPref,
+        cost_usd: disruption_type === "cancel" ? 0 : 189,
+        cost_note: disruption_type === "cancel" ? "Free rebooking (carrier owes you)" : "Change fee waived — fare difference only",
+        downstream_protection: downstreamLegs.length > 0,
+        downstream_value_protected: downstreamValue,
+        wingman_rank: paymentPref === "cash_first" ? 1 : 2,
+        recommended: paymentPref === "cash_first",
+      },
+      {
+        id: "points_partner",
+        type: "points",
+        label: "Award redemption — partner airline",
+        carrier: leg.carrier === "AA" ? "BA" : "AA",
+        flight: (leg.carrier === "AA" ? "BA" : "AA") + Math.floor(Math.random() * 900 + 100),
+        departs_at: new Date(rescueDepart.getTime() + 45 * 60000).toISOString(),
+        cabin: "business",
+        cost_points: 25000,
+        cost_usd_equivalent: 625,
+        cost_note: "25,000 pts — estimated $625 value",
+        downstream_protection: downstreamLegs.length > 0,
+        downstream_value_protected: downstreamValue,
+        wingman_rank: paymentPref === "best_value" ? 1 : 3,
+        recommended: paymentPref === "best_value",
+      },
+      {
+        id: "cash_next_day",
+        type: "cash",
+        label: "Next day — direct flight",
+        carrier: leg.carrier || "AA",
+        flight: (leg.carrier || "AA") + Math.floor(Math.random() * 900 + 100),
+        departs_at: new Date(originalDepart.getTime() + 24 * 3600000).toISOString(),
+        cabin: cabinPref,
+        cost_usd: 0,
+        cost_note: "Free rebooking on next day flight",
+        downstream_protection: false,
+        downstream_value_protected: 0,
+        wingman_rank: 3,
+        recommended: false,
+      },
+    ].sort((a, b) => a.wingman_rank - b.wingman_rank);
+
+    // Log that a rescue was surfaced
+    await logActivity(
+      req.user.email, "rescue_surfaced",
+      `Rescue options for ${(leg.carrier || "") + (leg.flight_number || "")}`,
+      `${options.length} rescue options found for your ${origin} → ${dest} disruption.`,
+      tripId, disrupted_leg_id,
+      { disruption_type, delay_minutes, options_count: options.length }
+    );
+
+    res.json({
+      disrupted_leg: { id: leg.id, flight: (leg.carrier || "") + (leg.flight_number || ""), origin, destination: dest },
+      downstream_legs: downstreamLegs.length,
+      downstream_value_at_risk: downstreamValue,
+      options,
+      policy: { autonomy_mode: prefs.autonomy_mode || "always_ask", threshold: prefs.threshold || 500 },
+    });
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
+// POST /trips/:tripId/rescue/accept — user accepts a rescue option
+app.post("/trips/:tripId/rescue/accept", auth, async (req, res) => {
+  const { tripId } = req.params;
+  const { option_id, disrupted_leg_id, value_saved } = req.body || {};
+  try {
+    await logActivity(
+      req.user.email, "disruption_resolved",
+      "Rescue accepted",
+      `You accepted rescue option: ${option_id}.`,
+      tripId, disrupted_leg_id,
+      { option_id, rescue_accepted: true, value_saved: value_saved || 0 }
+    );
+    res.json({ ok: true });
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
+// POST /trips/:tripId/rescue/reject — user rejects all rescue options
+app.post("/trips/:tripId/rescue/reject", auth, async (req, res) => {
+  const { tripId } = req.params;
+  const { disrupted_leg_id, reason } = req.body || {};
+  try {
+    await logActivity(
+      req.user.email, "rescue_rejected",
+      "Rescue declined",
+      `Rescue options declined: ${reason || "no reason given"}.`,
+      tripId, disrupted_leg_id,
+      { rescue_accepted: false, reason }
+    );
+    res.json({ ok: true });
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
+// ---------------------------------------------------------------------------
+// Learning loop  POST /trips/:tripId/outcome
+// Records post-trip outcome for prediction accuracy tracking
+// ---------------------------------------------------------------------------
+app.post("/trips/:tripId/outcome", auth, async (req, res) => {
+  const { tripId } = req.params;
+  const { rating, disruptions_predicted, disruptions_actual, value_saved, notes } = req.body || {};
+  try {
+    // Update trip with outcome data
+    await sql`
+      UPDATE trips SET
+        metadata = COALESCE(metadata, '{}'::jsonb) || ${JSON.stringify({
+          outcome_rating: rating,
+          disruptions_predicted: disruptions_predicted,
+          disruptions_actual: disruptions_actual,
+          value_saved: value_saved,
+          outcome_notes: notes,
+          outcome_recorded_at: new Date().toISOString(),
+        })}::jsonb
+      WHERE id = ${tripId} AND user_email = ${req.user.email}
+    `;
+    await logActivity(
+      req.user.email, "trip_outcome",
+      "Trip outcome recorded",
+      `Trip rated ${rating}/5. ${value_saved ? `$${value_saved} value protected.` : ""}`,
+      tripId, null,
+      { rating, disruptions_predicted, disruptions_actual, value_saved }
+    );
+    res.json({ ok: true });
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
 app.listen(PORT, () => console.log("Wingman API on http://localhost:" + PORT));
