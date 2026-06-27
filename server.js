@@ -92,7 +92,8 @@ async function bootstrapDB() {
         created_at TIMESTAMPTZ DEFAULT NOW()
       )
     `;
-    // Add subscription columns to existing users tables (idempotent)
+    // Add columns to existing users tables (idempotent)
+    await sql`ALTER TABLE users ADD COLUMN IF NOT EXISTS first_name TEXT`;
     await sql`ALTER TABLE users ADD COLUMN IF NOT EXISTS subscription_tier TEXT DEFAULT 'free'`;
     await sql`ALTER TABLE users ADD COLUMN IF NOT EXISTS subscription_status TEXT DEFAULT 'inactive'`;
     await sql`ALTER TABLE users ADD COLUMN IF NOT EXISTS stripe_customer_id TEXT`;
@@ -725,7 +726,7 @@ app.get("/me", async (req, res) => {
   const email = await verifyAccessToken(req);
   if (!email) return res.status(401).json({ error: "unauthorized" });
   try {
-    const rows = await sql`SELECT email, push_token, preferences, created_at FROM users WHERE email = ${email}`;
+    const rows = await sql`SELECT email, first_name, push_token, preferences, created_at FROM users WHERE email = ${email}`;
     if (!rows[0]) return res.status(404).json({ error: "user not found" });
     // Check if Gmail is connected
     const gmailRows = await sql`SELECT id FROM gmail_tokens WHERE user_email = ${email}`;
@@ -742,17 +743,22 @@ app.patch("/profile", async (req, res) => {
   const email = await verifyAccessToken(req);
   if (!email) return res.status(401).json({ error: "unauthorized" });
   try {
-    const { preferences } = req.body || {};
-    if (!preferences || typeof preferences !== "object") {
-      return res.status(400).json({ error: "preferences object required" });
+    const { preferences, first_name } = req.body || {};
+    if (!preferences && !first_name) {
+      return res.status(400).json({ error: "preferences or first_name required" });
     }
-    await sql`
-      UPDATE users
-      SET preferences = COALESCE(preferences, '{}'::jsonb) || ${JSON.stringify(preferences)}::jsonb
-      WHERE email = ${email}
-    `;
-    const rows = await sql`SELECT preferences FROM users WHERE email = ${email}`;
-    res.json({ preferences: rows[0].preferences });
+    if (first_name) {
+      await sql`UPDATE users SET first_name = ${first_name} WHERE email = ${email}`;
+    }
+    if (preferences && typeof preferences === "object") {
+      await sql`
+        UPDATE users
+        SET preferences = COALESCE(preferences, '{}'::jsonb) || ${JSON.stringify(preferences)}::jsonb
+        WHERE email = ${email}
+      `;
+    }
+    const rows = await sql`SELECT first_name, preferences FROM users WHERE email = ${email}`;
+    res.json({ first_name: rows[0].first_name, preferences: rows[0].preferences });
   } catch (e) {
     console.error("PATCH /profile error:", e);
     res.status(500).json({ error: "db error" });
@@ -2801,7 +2807,8 @@ app.get("/trips/:tripId/risk", auth, async (req, res) => {
 
 // ---------------------------------------------------------------------------
 // Rescue decision engine  POST /trips/:tripId/rescue
-// Returns ranked rescue options with cash vs points math
+// Queries live Duffel for cash options; Point.me for award options if key present.
+// Falls back to structured estimates when APIs are unavailable.
 // ---------------------------------------------------------------------------
 app.post("/trips/:tripId/rescue", auth, async (req, res) => {
   const { tripId } = req.params;
@@ -2822,77 +2829,194 @@ app.post("/trips/:tripId/rescue", auth, async (req, res) => {
     const paymentPref = prefs.payment_preference || "best_value";
     const cabinPref = prefs.cabin_preference || "economy";
 
-    // Get all subsequent legs to calculate downstream value at risk
-    const allLegs = await sql`
-      SELECT * FROM trip_legs WHERE trip_id = ${tripId} ORDER BY departs_at ASC
-    `;
+    // Downstream value at risk
+    const allLegs = await sql`SELECT * FROM trip_legs WHERE trip_id = ${tripId} ORDER BY departs_at ASC`;
     const legIndex = allLegs.findIndex(l => l.id === disrupted_leg_id);
     const downstreamLegs = legIndex >= 0 ? allLegs.slice(legIndex + 1) : [];
     const downstreamValue = downstreamLegs.length * 450;
 
-    // Build rescue options (in production these come from Duffel + loyalty APIs)
-    // Here we build realistic structured options the app can render
     const origin = leg.origin;
     const dest = leg.destination;
     const originalDepart = leg.departs_at ? new Date(leg.departs_at) : new Date();
-    const rescueDepart = new Date(originalDepart.getTime() + (delay_minutes || 120) * 60000);
+    // Rescue window: next departure after the delay
+    const rescueDate = new Date(originalDepart.getTime() + (delay_minutes || 120) * 60000);
+    const rescueDateStr = rescueDate.toISOString().slice(0, 10);
 
-    const options = [
-      {
-        id: "cash_same_carrier",
-        type: "cash",
-        label: "Next available — same carrier",
-        carrier: leg.carrier || "AA",
-        flight: (leg.carrier || "AA") + "1" + Math.floor(Math.random() * 900 + 100),
-        departs_at: rescueDepart.toISOString(),
-        cabin: cabinPref,
-        cost_usd: disruption_type === "cancel" ? 0 : 189,
-        cost_note: disruption_type === "cancel" ? "Free rebooking (carrier owes you)" : "Change fee waived — fare difference only",
-        downstream_protection: downstreamLegs.length > 0,
-        downstream_value_protected: downstreamValue,
-        wingman_rank: paymentPref === "cash_first" ? 1 : 2,
-        recommended: paymentPref === "cash_first",
-      },
-      {
-        id: "points_partner",
+    const options = [];
+    let duffelSource = false;
+
+    // ── 1. Live Duffel cash options ────────────────────────────────────────
+    if (origin && dest && process.env.DUFFEL_API_KEY) {
+      try {
+        const duffel = getDuffel();
+        const offerRequest = await duffel.offerRequests.create({
+          slices: [{ origin, destination: dest, departure_date: rescueDateStr }],
+          passengers: [{ type: "adult" }],
+          cabin_class: cabinPref,
+          return_offers: true,
+          supplier_timeout: 12000,
+        });
+        const duffelOffers = (offerRequest.data.offers || [])
+          .sort((a, b) => parseFloat(a.total_amount) - parseFloat(b.total_amount))
+          .slice(0, 3);
+        duffelOffers.forEach((o, i) => {
+          const seg = o.slices?.[0]?.segments?.[0];
+          options.push({
+            id: `duffel_${o.id}`,
+            duffel_offer_id: o.id,
+            type: "cash",
+            label: i === 0 ? "Next available flight" : i === 1 ? "Alternative routing" : "Later departure",
+            carrier: seg?.marketing_carrier?.iata_code || "",
+            carrier_name: seg?.marketing_carrier?.name || "",
+            flight: (seg?.marketing_carrier?.iata_code || "") + (seg?.marketing_carrier_flight_number || ""),
+            departs_at: seg?.departing_at || rescueDate.toISOString(),
+            arrives_at: seg?.arriving_at || null,
+            cabin: cabinPref,
+            cost_usd: parseFloat(o.total_amount),
+            cost_currency: o.total_currency || "USD",
+            cost_note: disruption_type === "cancel"
+              ? "Carrier owes you a free rebook — this is the next available seat"
+              : `$${parseFloat(o.total_amount).toFixed(0)} — change fee waived`,
+            refundable: o.conditions?.refund_before_departure?.allowed || false,
+            changeable: o.conditions?.change_before_departure?.allowed || false,
+            stops: seg?.stops?.length || 0,
+            downstream_protection: downstreamLegs.length > 0,
+            downstream_value_protected: downstreamValue,
+            wingman_rank: i + 1,
+            recommended: i === 0 && paymentPref !== "points_first",
+            source: "duffel",
+          });
+        });
+        duffelSource = duffelOffers.length > 0;
+      } catch (duffelErr) {
+        console.error("[rescue-duffel]", duffelErr.message);
+        // Fall through to estimate below
+      }
+    }
+
+    // ── 2. Live Point.me award options ────────────────────────────────────
+    const POINTME_KEY = process.env.POINTME_KEY;
+    if (origin && dest && POINTME_KEY) {
+      try {
+        const pmRes = await fetch(
+          `https://api.point.me/v2/search?origin=${origin}&destination=${dest}&date=${rescueDateStr}&cabin=business`,
+          { headers: { Authorization: `Bearer ${POINTME_KEY}` } }
+        );
+        if (pmRes.ok) {
+          const pmData = await pmRes.json();
+          const pmOffers = (pmData.results || []).slice(0, 2);
+          pmOffers.forEach((o, i) => {
+            options.push({
+              id: `pointme_${i}_${o.program || "award"}`,
+              type: "points",
+              label: `Award — ${o.program_name || "Frequent Flyer"}`,
+              carrier: o.carrier_iata || "",
+              carrier_name: o.carrier_name || "",
+              flight: o.flight_number || "",
+              departs_at: o.departure_datetime || rescueDate.toISOString(),
+              cabin: o.cabin || "business",
+              cost_points: o.points || 25000,
+              cost_usd_equivalent: o.cash_value_usd || null,
+              cost_note: `${(o.points || 25000).toLocaleString()} pts${o.cash_value_usd ? ` — est. $${o.cash_value_usd} value` : ""}`,
+              program: o.program || null,
+              downstream_protection: downstreamLegs.length > 0,
+              downstream_value_protected: downstreamValue,
+              wingman_rank: paymentPref === "best_value" ? 1 : options.length + 1,
+              recommended: paymentPref === "best_value" || paymentPref === "points_first",
+              source: "pointme",
+            });
+          });
+        }
+      } catch (pmErr) {
+        console.error("[rescue-pointme]", pmErr.message);
+      }
+    }
+
+    // ── 3. Fallback estimates when APIs unavailable ────────────────────────
+    if (options.length === 0) {
+      const nextDay = new Date(originalDepart.getTime() + 24 * 3600000);
+      options.push(
+        {
+          id: "est_cash_next",
+          type: "cash",
+          label: "Next available — same carrier",
+          carrier: leg.carrier || "",
+          flight: "",
+          departs_at: rescueDate.toISOString(),
+          cabin: cabinPref,
+          cost_usd: disruption_type === "cancel" ? 0 : 189,
+          cost_note: disruption_type === "cancel" ? "Free rebooking (carrier owes you)" : "Estimated fare difference",
+          downstream_protection: downstreamLegs.length > 0,
+          downstream_value_protected: downstreamValue,
+          wingman_rank: 1,
+          recommended: paymentPref !== "points_first",
+          source: "estimate",
+        },
+        {
+          id: "est_points",
+          type: "points",
+          label: "Award redemption — partner airline",
+          carrier: "",
+          flight: "",
+          departs_at: new Date(rescueDate.getTime() + 45 * 60000).toISOString(),
+          cabin: "business",
+          cost_points: 25000,
+          cost_usd_equivalent: 625,
+          cost_note: "~25,000 pts — add Point.me key for live award availability",
+          downstream_protection: downstreamLegs.length > 0,
+          downstream_value_protected: downstreamValue,
+          wingman_rank: paymentPref === "best_value" ? 1 : 2,
+          recommended: paymentPref === "best_value",
+          source: "estimate",
+        },
+        {
+          id: "est_cash_nextday",
+          type: "cash",
+          label: "Next day — direct flight",
+          carrier: leg.carrier || "",
+          flight: "",
+          departs_at: nextDay.toISOString(),
+          cabin: cabinPref,
+          cost_usd: 0,
+          cost_note: "Free rebooking on next day flight",
+          downstream_protection: false,
+          downstream_value_protected: 0,
+          wingman_rank: 3,
+          recommended: false,
+          source: "estimate",
+        }
+      );
+    } else if (!options.some(o => o.type === "points") && !POINTME_KEY) {
+      // Duffel found cash options but no Point.me key — add an estimate award option
+      options.push({
+        id: "est_points",
         type: "points",
         label: "Award redemption — partner airline",
-        carrier: leg.carrier === "AA" ? "BA" : "AA",
-        flight: (leg.carrier === "AA" ? "BA" : "AA") + Math.floor(Math.random() * 900 + 100),
-        departs_at: new Date(rescueDepart.getTime() + 45 * 60000).toISOString(),
+        carrier: "",
+        flight: "",
+        departs_at: new Date(rescueDate.getTime() + 45 * 60000).toISOString(),
         cabin: "business",
         cost_points: 25000,
         cost_usd_equivalent: 625,
-        cost_note: "25,000 pts — estimated $625 value",
+        cost_note: "~25,000 pts — add Point.me key for live award availability",
         downstream_protection: downstreamLegs.length > 0,
         downstream_value_protected: downstreamValue,
-        wingman_rank: paymentPref === "best_value" ? 1 : 3,
+        wingman_rank: paymentPref === "best_value" ? 1 : options.length + 1,
         recommended: paymentPref === "best_value",
-      },
-      {
-        id: "cash_next_day",
-        type: "cash",
-        label: "Next day — direct flight",
-        carrier: leg.carrier || "AA",
-        flight: (leg.carrier || "AA") + Math.floor(Math.random() * 900 + 100),
-        departs_at: new Date(originalDepart.getTime() + 24 * 3600000).toISOString(),
-        cabin: cabinPref,
-        cost_usd: 0,
-        cost_note: "Free rebooking on next day flight",
-        downstream_protection: false,
-        downstream_value_protected: 0,
-        wingman_rank: 3,
-        recommended: false,
-      },
-    ].sort((a, b) => a.wingman_rank - b.wingman_rank);
+        source: "estimate",
+      });
+    }
 
-    // Log that a rescue was surfaced
+    // Sort by wingman_rank
+    options.sort((a, b) => a.wingman_rank - b.wingman_rank);
+
+    // Log rescue surfaced
     await logActivity(
       req.user.email, "rescue_surfaced",
       `Rescue options for ${(leg.carrier || "") + (leg.flight_number || "")}`,
       `${options.length} rescue options found for your ${origin} → ${dest} disruption.`,
       tripId, disrupted_leg_id,
-      { disruption_type, delay_minutes, options_count: options.length }
+      { disruption_type, delay_minutes, options_count: options.length, source: duffelSource ? "duffel" : "estimate" }
     );
 
     res.json({
@@ -2900,6 +3024,7 @@ app.post("/trips/:tripId/rescue", auth, async (req, res) => {
       downstream_legs: downstreamLegs.length,
       downstream_value_at_risk: downstreamValue,
       options,
+      data_source: duffelSource ? "live" : "estimate",
       policy: { autonomy_mode: prefs.autonomy_mode || "always_ask", threshold: prefs.threshold || 500 },
     });
   } catch (e) {
