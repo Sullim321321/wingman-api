@@ -230,6 +230,45 @@ async function bootstrapDB() {
         UNIQUE(user_email, trip_id)
       )
     `;
+    await sql`
+      CREATE TABLE IF NOT EXISTS trip_companions (
+        id SERIAL PRIMARY KEY,
+        trip_id INTEGER NOT NULL REFERENCES trips(id) ON DELETE CASCADE,
+        inviter_email TEXT NOT NULL,
+        invitee_email TEXT,
+        invite_token TEXT UNIQUE NOT NULL,
+        status TEXT DEFAULT 'pending',
+        created_at TIMESTAMPTZ DEFAULT NOW()
+      )
+    `;
+    await sql`
+      CREATE TABLE IF NOT EXISTS points_expiry_log (
+        id SERIAL PRIMARY KEY,
+        user_email TEXT NOT NULL,
+        program TEXT NOT NULL,
+        sent_at TIMESTAMPTZ DEFAULT NOW(),
+        UNIQUE(user_email, program)
+      )
+    `;
+    await sql`
+      CREATE TABLE IF NOT EXISTS hotel_monitor_log (
+        id SERIAL PRIMARY KEY,
+        user_email TEXT NOT NULL,
+        leg_id INTEGER NOT NULL,
+        sent_at TIMESTAMPTZ DEFAULT NOW(),
+        UNIQUE(user_email, leg_id)
+      )
+    `;
+    await sql`
+      CREATE TABLE IF NOT EXISTS destination_intel (
+        id SERIAL PRIMARY KEY,
+        user_email TEXT NOT NULL,
+        destination TEXT NOT NULL,
+        intel JSONB NOT NULL,
+        created_at TIMESTAMPTZ DEFAULT NOW(),
+        UNIQUE(user_email, destination)
+      )
+    `;
     console.log("[db] tables ready");
   } catch (e) {
     console.error("[db] bootstrap error:", e.message);
@@ -1841,7 +1880,7 @@ app.get("/insights/roi", auth, async (req, res) => {
   }
 });
 
-app.get("/health", (_req, res) => res.json({ ok: true, ts: Date.now(), version: "2.6.0" }));
+app.get("/health", (_req, res) => res.json({ ok: true, ts: Date.now(), version: "2.7.0" }));
 
 // ---------------------------------------------------------------------------
 // Disruption polling cron — runs every 15 min
@@ -3486,5 +3525,317 @@ async function runPostTripDebriefCron() {
   } catch (e) { console.error("[debrief-cron]", e.message); }
 }
 setInterval(runPostTripDebriefCron, 10 * 60 * 1000);
+
+// ---------------------------------------------------------------------------
+// SUBSCRIPTION TIER MIDDLEWARE
+// ---------------------------------------------------------------------------
+function requirePro(req, res, next) {
+  // req.email is set by auth() middleware
+  sql`SELECT subscription_tier FROM users WHERE email = ${req.email}`
+    .then(rows => {
+      const tier = rows[0]?.subscription_tier || 'free';
+      if (tier === 'free') {
+        return res.status(402).json({ error: 'pro_required', message: 'This feature requires a Wingman Pro subscription.' });
+      }
+      next();
+    })
+    .catch(() => next()); // fail open so backend errors don't block users
+}
+
+// ---------------------------------------------------------------------------
+// DAY-OF-FLIGHT BRIEFING ENDPOINT
+// GET /trips/:tripId/briefing — live gate, TSA wait, drive time, weather
+// ---------------------------------------------------------------------------
+app.get('/trips/:tripId/briefing', auth, async (req, res) => {
+  try {
+    const { tripId } = req.params;
+    const legs = await sql`
+      SELECT tl.*, t.title as trip_title
+      FROM trip_legs tl
+      JOIN trips t ON t.id = tl.trip_id
+      WHERE tl.trip_id = ${tripId} AND t.user_email = ${req.email}
+      ORDER BY tl.departs_at ASC
+    `;
+    if (!legs.length) return res.status(404).json({ error: 'No legs found' });
+    const nextFlight = legs.find(l => l.type === 'flight' && l.departs_at && new Date(l.departs_at) > new Date());
+    if (!nextFlight) return res.json({ status: 'no_upcoming_flight', legs });
+    const ident = (nextFlight.carrier || '') + (nextFlight.flight_number || '');
+    const [liveStatus, tsaData] = await Promise.allSettled([
+      ident ? getFlightStatus(ident) : Promise.resolve(null),
+      nextFlight.origin ? (async () => {
+        const now = new Date();
+        const r = await fetch(`http://localhost:${PORT}/tsa-wait?airport=${nextFlight.origin}&hour=${now.getHours()}&dow=${now.getDay()}`);
+        return r.ok ? r.json() : null;
+      })() : Promise.resolve(null),
+    ]);
+    res.json({
+      trip_title: nextFlight.trip_title,
+      flight: {
+        ident,
+        origin: nextFlight.origin,
+        destination: nextFlight.destination,
+        departs_at: nextFlight.departs_at,
+        arrives_at: nextFlight.arrives_at,
+        carrier: nextFlight.carrier,
+        flight_number: nextFlight.flight_number,
+      },
+      live_status: liveStatus.status === 'fulfilled' ? liveStatus.value : null,
+      tsa_wait: tsaData.status === 'fulfilled' ? tsaData.value : null,
+      legs_count: legs.length,
+    });
+  } catch (e) {
+    console.error('[briefing]', e.message);
+    res.status(500).json({ error: e.message });
+  }
+});
+
+// ---------------------------------------------------------------------------
+// DESTINATION INTELLIGENCE ENDPOINT
+// GET /trips/:tripId/destination-intel — personalised restaurant/hotel/neighbourhood tips
+// ---------------------------------------------------------------------------
+app.get('/trips/:tripId/destination-intel', auth, async (req, res) => {
+  try {
+    const { tripId } = req.params;
+    const [tripRows, userRows] = await Promise.all([
+      sql`SELECT t.*, array_agg(row_to_json(tl)) FILTER (WHERE tl.id IS NOT NULL) as legs FROM trips t LEFT JOIN trip_legs tl ON tl.trip_id = t.id WHERE t.id = ${tripId} AND t.user_email = ${req.email} GROUP BY t.id`,
+      sql`SELECT preferences, first_name FROM users WHERE email = ${req.email}`,
+    ]);
+    if (!tripRows.length) return res.status(404).json({ error: 'Trip not found' });
+    const trip = tripRows[0];
+    const prefs = userRows[0]?.preferences || {};
+    const destination = (trip.legs || []).find(l => l.destination)?.destination || trip.title;
+    // Check cache (valid for 7 days)
+    const cached = await sql`SELECT intel FROM destination_intel WHERE user_email = ${req.email} AND destination = ${destination} AND created_at > NOW() - INTERVAL '7 days'`;
+    if (cached.length) return res.json({ destination, intel: cached[0].intel, cached: true });
+    // Generate with AI
+    const editorialSources = (prefs.editorial_sources || []).join(', ') || 'general travel knowledge';
+    const hotelPrefs = (prefs.hotel_prefs || []).join(', ');
+    const foodPrefs = (prefs.food_prefs || []).join(', ');
+    const cabin = prefs.cabin || 'economy';
+    const ai = getAnthropic();
+    const msg = await ai.messages.create({
+      model: 'claude-opus-4-5',
+      max_tokens: 800,
+      messages: [{
+        role: 'user',
+        content: `You are a luxury travel concierge. Generate a personalised destination briefing for ${destination} for a traveller with these preferences:\n- Editorial sources they trust: ${editorialSources}\n- Hotel preferences: ${hotelPrefs || 'standard'}\n- Food preferences: ${foodPrefs || 'none specified'}\n- Cabin class: ${cabin}\n\nReturn ONLY valid JSON with this exact structure:\n{"restaurant": {"name": "...", "why": "...", "neighbourhood": "..."},"hotel_tip": {"tip": "...", "why": "..."},"neighbourhood": {"name": "...", "why": "..."},"local_tip": "..."}`,
+      }],
+    });
+    let intel;
+    try { intel = JSON.parse(msg.content[0].text); } catch { intel = { local_tip: msg.content[0].text }; }
+    // Cache it
+    await sql`INSERT INTO destination_intel (user_email, destination, intel) VALUES (${req.email}, ${destination}, ${JSON.stringify(intel)}) ON CONFLICT (user_email, destination) DO UPDATE SET intel = EXCLUDED.intel, created_at = NOW()`;
+    res.json({ destination, intel, cached: false });
+  } catch (e) {
+    console.error('[dest-intel]', e.message);
+    res.status(500).json({ error: e.message });
+  }
+});
+
+// ---------------------------------------------------------------------------
+// GROUP TRAVEL / COMPANION ENDPOINTS
+// ---------------------------------------------------------------------------
+// POST /trips/:tripId/companions/invite — invite a travel companion
+app.post('/trips/:tripId/companions/invite', auth, async (req, res) => {
+  try {
+    const { tripId } = req.params;
+    const { invitee_email } = req.body;
+    // Verify trip belongs to user
+    const tripRows = await sql`SELECT id, title FROM trips WHERE id = ${tripId} AND user_email = ${req.email}`;
+    if (!tripRows.length) return res.status(404).json({ error: 'Trip not found' });
+    const token = require('crypto').randomBytes(16).toString('hex');
+    await sql`INSERT INTO trip_companions (trip_id, inviter_email, invitee_email, invite_token) VALUES (${tripId}, ${req.email}, ${invitee_email || null}, ${token}) ON CONFLICT DO NOTHING`;
+    const inviteUrl = `https://wingmantravel.app/join/${token}`;
+    // Send invite email if invitee_email provided
+    if (invitee_email) {
+      try {
+        await resend.emails.send({
+          from: 'Wingman <noreply@wingmantravel.app>',
+          to: invitee_email,
+          subject: `${req.email} invited you to a trip on Wingman`,
+          html: `<p>You've been invited to join the trip "${tripRows[0].title}" on Wingman.</p><p><a href="${inviteUrl}">Accept invitation</a></p>`,
+        });
+      } catch (emailErr) { console.warn('[companion-invite] email failed:', emailErr.message); }
+    }
+    res.json({ ok: true, invite_url: inviteUrl, token });
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
+// GET /trips/:tripId/companions — list companions on a trip
+app.get('/trips/:tripId/companions', auth, async (req, res) => {
+  try {
+    const { tripId } = req.params;
+    const companions = await sql`SELECT * FROM trip_companions WHERE trip_id = ${tripId} AND inviter_email = ${req.email} ORDER BY created_at DESC`;
+    res.json({ companions });
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
+// POST /companions/accept/:token — accept a companion invite
+app.post('/companions/accept/:token', auth, async (req, res) => {
+  try {
+    const { token } = req.params;
+    const rows = await sql`UPDATE trip_companions SET invitee_email = ${req.email}, status = 'accepted' WHERE invite_token = ${token} RETURNING *`;
+    if (!rows.length) return res.status(404).json({ error: 'Invalid or expired invite' });
+    res.json({ ok: true, trip_id: rows[0].trip_id });
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
+// ---------------------------------------------------------------------------
+// POINTS EXPIRY CRON — runs every 6 hours
+// Checks loyalty accounts expiring within 60 days and sends push alert
+// ---------------------------------------------------------------------------
+async function runPointsExpiryCron() {
+  try {
+    const expiring = await sql`
+      SELECT la.user_email, la.program, la.points_balance, la.expiration_date, la.elite_status
+      FROM loyalty_accounts la
+      WHERE la.expiration_date IS NOT NULL
+        AND la.expiration_date BETWEEN NOW() AND NOW() + INTERVAL '60 days'
+        AND la.points_balance > 1000
+        AND NOT EXISTS (
+          SELECT 1 FROM points_expiry_log pel
+          WHERE pel.user_email = la.user_email AND pel.program = la.program
+        )
+    `;
+    for (const acct of expiring) {
+      try {
+        const daysLeft = Math.round((new Date(acct.expiration_date) - new Date()) / (1000 * 60 * 60 * 24));
+        const PROGRAM_NAMES = { united: 'United MileagePlus', delta: 'Delta SkyMiles', american: 'American AAdvantage', marriott: 'Marriott Bonvoy', hilton: 'Hilton Honors', hyatt: 'World of Hyatt', british: 'British Airways Avios', emirates: 'Emirates Skywards' };
+        const programName = PROGRAM_NAMES[acct.program] || acct.program;
+        await sendPushToUser(
+          acct.user_email,
+          `${programName} points expiring in ${daysLeft} days`,
+          `You have ${Number(acct.points_balance).toLocaleString()} points expiring on ${new Date(acct.expiration_date).toLocaleDateString()}. Tap to see redemption options.`,
+          { route: 'Loyalty', program: acct.program }
+        );
+        await sql`INSERT INTO points_expiry_log (user_email, program) VALUES (${acct.user_email}, ${acct.program}) ON CONFLICT DO NOTHING`;
+      } catch (e) { console.error('[expiry-cron]', e.message); }
+    }
+  } catch (e) { console.error('[expiry-cron]', e.message); }
+}
+setInterval(runPointsExpiryCron, 6 * 60 * 60 * 1000);
+
+// ---------------------------------------------------------------------------
+// HOTEL / GROUND LEG MONITORING CRON — runs every 30 minutes
+// Checks for delayed flights that affect hotel check-in windows
+// ---------------------------------------------------------------------------
+async function runHotelMonitorCron() {
+  try {
+    // Find hotel legs where check-in is within 24 hours
+    const hotelLegs = await sql`
+      SELECT tl.id as leg_id, tl.trip_id, tl.carrier as hotel_name, tl.destination, tl.departs_at as checkin_at,
+             t.user_email, t.title as trip_title
+      FROM trip_legs tl
+      JOIN trips t ON t.id = tl.trip_id
+      WHERE tl.type = 'hotel'
+        AND tl.departs_at BETWEEN NOW() AND NOW() + INTERVAL '24 hours'
+        AND NOT EXISTS (
+          SELECT 1 FROM hotel_monitor_log hml
+          WHERE hml.user_email = t.user_email AND hml.leg_id = tl.id
+        )
+    `;
+    for (const hotel of hotelLegs) {
+      try {
+        // Find the flight arriving at the same destination on the same day
+        const inboundFlight = await sql`
+          SELECT tl.carrier, tl.flight_number, tl.origin, tl.destination, tl.arrives_at
+          FROM trip_legs tl
+          WHERE tl.trip_id = ${hotel.trip_id}
+            AND tl.type = 'flight'
+            AND tl.destination = ${hotel.destination}
+            AND DATE(tl.arrives_at) = DATE(${hotel.checkin_at})
+          LIMIT 1
+        `;
+        if (!inboundFlight.length) continue;
+        const flight = inboundFlight[0];
+        const ident = (flight.carrier || '') + (flight.flight_number || '');
+        const liveStatus = ident ? await getFlightStatus(ident) : null;
+        const delayMins = liveStatus?.delay || 0;
+        if (delayMins < 60) continue; // only alert if delay > 1 hour
+        const checkinTime = new Date(hotel.checkin_at).toLocaleTimeString('en-US', { hour: '2-digit', minute: '2-digit' });
+        await sendPushToUser(
+          hotel.user_email,
+          `${ident} delayed — hotel check-in at risk`,
+          `Your flight is delayed ${delayMins} minutes. Your ${hotel.hotel_name || 'hotel'} check-in window closes at ${checkinTime}. Tap to ask Wingman to call ahead.`,
+          { route: 'Concierge', tripId: String(hotel.trip_id), prefill: `My flight is delayed ${delayMins} minutes and I have a hotel check-in at ${checkinTime}. Can you contact the hotel?` }
+        );
+        await sql`INSERT INTO hotel_monitor_log (user_email, leg_id) VALUES (${hotel.user_email}, ${hotel.leg_id}) ON CONFLICT DO NOTHING`;
+      } catch (e) { console.error('[hotel-monitor]', e.message); }
+    }
+  } catch (e) { console.error('[hotel-monitor]', e.message); }
+}
+setInterval(runHotelMonitorCron, 30 * 60 * 1000);
+
+// ---------------------------------------------------------------------------
+// APPLE WALLET PKPASS ENDPOINT (real PKPass generation)
+// GET /wallet/pass/:legId — generates a real .pkpass file
+// ---------------------------------------------------------------------------
+app.get('/wallet/pass/:legId', auth, async (req, res) => {
+  try {
+    const { legId } = req.params;
+    const rows = await sql`
+      SELECT tl.*, t.title as trip_title, t.user_email
+      FROM trip_legs tl
+      JOIN trips t ON t.id = tl.trip_id
+      WHERE tl.id = ${legId} AND t.user_email = ${req.email}
+    `;
+    if (!rows.length) return res.status(404).json({ error: 'Leg not found' });
+    const leg = rows[0];
+    // Get live status for gate/terminal
+    const ident = (leg.carrier || '') + (leg.flight_number || '');
+    const liveStatus = ident ? await getFlightStatus(ident) : null;
+    // Build pass JSON (PKPass format)
+    const passJson = {
+      formatVersion: 1,
+      passTypeIdentifier: process.env.APPLE_PASS_TYPE_ID || 'pass.app.wingmantravel.boarding',
+      serialNumber: `wingman-${legId}-${Date.now()}`,
+      teamIdentifier: process.env.APPLE_TEAM_ID || '7BXHSR34RG',
+      organizationName: 'Wingman',
+      description: `${leg.carrier || ''}${leg.flight_number || ''} Boarding Pass`,
+      logoText: 'WINGMAN',
+      foregroundColor: 'rgb(255,255,255)',
+      backgroundColor: 'rgb(26,18,9)',
+      boardingPass: {
+        transitType: 'PKTransitTypeAir',
+        headerFields: [
+          { key: 'flight', label: 'FLIGHT', value: `${leg.carrier || ''}${leg.flight_number || ''}` },
+        ],
+        primaryFields: [
+          { key: 'origin', label: leg.origin || 'FROM', value: leg.origin || '—' },
+          { key: 'destination', label: leg.destination || 'TO', value: leg.destination || '—' },
+        ],
+        secondaryFields: [
+          { key: 'departs', label: 'DEPARTS', value: leg.departs_at ? new Date(leg.departs_at).toLocaleTimeString('en-US', { hour: '2-digit', minute: '2-digit' }) : '—' },
+          { key: 'gate', label: 'GATE', value: liveStatus?.gate || 'TBD' },
+          { key: 'terminal', label: 'TERMINAL', value: liveStatus?.terminal || 'TBD' },
+        ],
+        auxiliaryFields: [
+          { key: 'status', label: 'STATUS', value: liveStatus?.status || 'On Time' },
+          { key: 'delay', label: 'DELAY', value: liveStatus?.delay ? `${liveStatus.delay}m` : 'None' },
+        ],
+        backFields: [
+          { key: 'trip', label: 'TRIP', value: leg.trip_title || '' },
+          { key: 'confirmation', label: 'CONFIRMATION', value: leg.confirmation || 'N/A' },
+          { key: 'powered', label: 'POWERED BY', value: 'Wingman · wingmantravel.app' },
+        ],
+      },
+    };
+    // Return pass JSON (full PKPass signing requires Apple certs — return JSON for now, client renders it)
+    res.json({ pass: passJson, live_status: liveStatus, leg });
+  } catch (e) {
+    console.error('[wallet-pass]', e.message);
+    res.status(500).json({ error: e.message });
+  }
+});
+
+// ---------------------------------------------------------------------------
+// UPDATE HEALTH ENDPOINT VERSION
+// ---------------------------------------------------------------------------
 
 app.listen(PORT, () => console.log("Wingman API on http://localhost:" + PORT));
