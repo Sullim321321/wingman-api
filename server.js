@@ -188,6 +188,48 @@ async function bootstrapDB() {
         UNIQUE(user_email, provider_code)
       )
     `;
+    // Concierge threads (persistent memory per trip or general)
+    await sql`
+      CREATE TABLE IF NOT EXISTS concierge_threads (
+        id SERIAL PRIMARY KEY,
+        user_email TEXT NOT NULL,
+        trip_id INTEGER REFERENCES trips(id) ON DELETE CASCADE,
+        messages JSONB DEFAULT '[]',
+        updated_at TIMESTAMPTZ DEFAULT NOW()
+      )
+    `;
+    await sql`CREATE UNIQUE INDEX IF NOT EXISTS idx_concierge_thread ON concierge_threads(user_email, COALESCE(trip_id, -1))`;
+    // Trip share tokens
+    await sql`
+      CREATE TABLE IF NOT EXISTS trip_shares (
+        id SERIAL PRIMARY KEY,
+        trip_id INTEGER REFERENCES trips(id) ON DELETE CASCADE,
+        user_email TEXT NOT NULL,
+        share_token TEXT UNIQUE NOT NULL,
+        created_at TIMESTAMPTZ DEFAULT NOW()
+      )
+    `;
+    // Pre-departure push dedup log
+    await sql`
+      CREATE TABLE IF NOT EXISTS departure_push_log (
+        id SERIAL PRIMARY KEY,
+        user_email TEXT NOT NULL,
+        leg_id INTEGER NOT NULL,
+        push_type TEXT NOT NULL,
+        sent_at TIMESTAMPTZ DEFAULT NOW(),
+        UNIQUE(user_email, leg_id, push_type)
+      )
+    `;
+    // Post-trip debrief push dedup log
+    await sql`
+      CREATE TABLE IF NOT EXISTS debrief_push_log (
+        id SERIAL PRIMARY KEY,
+        user_email TEXT NOT NULL,
+        trip_id INTEGER NOT NULL,
+        sent_at TIMESTAMPTZ DEFAULT NOW(),
+        UNIQUE(user_email, trip_id)
+      )
+    `;
     console.log("[db] tables ready");
   } catch (e) {
     console.error("[db] bootstrap error:", e.message);
@@ -1738,9 +1780,16 @@ app.patch("/policy", auth, async (req, res) => {
 // ---------------------------------------------------------------------------
 app.get("/insights/roi", auth, async (req, res) => {
   try {
+    const period = req.query.period || "all";
+    const since = period === "30d"
+      ? new Date(Date.now() - 30 * 86400000).toISOString()
+      : period === "90d"
+        ? new Date(Date.now() - 90 * 86400000).toISOString()
+        : new Date(0).toISOString();
     const events = await sql`
       SELECT type, metadata, created_at FROM activity_events
       WHERE user_email = ${req.user.email}
+        AND created_at >= ${since}::timestamptz
       ORDER BY created_at DESC LIMIT 200
     `;
     let totalSaved = 0, disruptionsHandled = 0, rescueAccepted = 0, rescueTotal = 0;
@@ -1762,21 +1811,37 @@ app.get("/insights/roi", auth, async (req, res) => {
       const m = typeof row.metadata === "string" ? JSON.parse(row.metadata || "{}") : (row.metadata || {});
       if (m.value_saved) totalSaved += Number(m.value_saved) || 0;
     }
+    // Trip streak count
+    const tripCount = await sql`SELECT COUNT(DISTINCT id) as cnt FROM trips WHERE user_email = ${req.user.email}`;
+    const tripsTotal = Number(tripCount[0]?.cnt || 0);
+    // Best rescue
+    const bestRescueRows = await sql`
+      SELECT metadata FROM activity_events
+      WHERE user_email = ${req.user.email} AND type IN ('rebook','disruption_resolved')
+        AND (metadata->>'value_saved') IS NOT NULL
+      ORDER BY (metadata->>'value_saved')::numeric DESC LIMIT 1
+    `;
+    const bestMeta = bestRescueRows[0]?.metadata || {};
+    const bestM = typeof bestMeta === "string" ? JSON.parse(bestMeta || "{}") : bestMeta;
     res.json({
       total_value_saved: totalSaved,
       disruptions_handled: disruptionsHandled,
       rescue_accept_rate: rescueTotal > 0 ? Math.round((rescueAccepted / rescueTotal) * 100) : null,
       avg_time_saved_minutes: disruptionsHandled > 0 ? 23 : null,
       prediction_accuracy_pct: null,
+      trips_total: tripsTotal,
+      best_rescue_value: bestM.value_saved || null,
+      best_rescue_flight: bestM.flight || null,
+      period,
       recent_events: events.slice(0, 10).map(e => ({ type: e.type, created_at: e.created_at })),
     });
   } catch (e) {
     console.error("[insights/roi] error:", e.message);
-    res.json({ total_value_saved: 0, disruptions_handled: 0, rescue_accept_rate: null, avg_time_saved_minutes: null, prediction_accuracy_pct: null, recent_events: [] });
+    res.json({ total_value_saved: 0, disruptions_handled: 0, rescue_accept_rate: null, avg_time_saved_minutes: null, prediction_accuracy_pct: null, trips_total: 0, best_rescue_value: null, best_rescue_flight: null, period: "all", recent_events: [] });
   }
 });
 
-app.get("/health", (_req, res) => res.json({ ok: true, ts: Date.now(), version: "2.5.0" }));
+app.get("/health", (_req, res) => res.json({ ok: true, ts: Date.now(), version: "2.6.0" }));
 
 // ---------------------------------------------------------------------------
 // Disruption polling cron — runs every 15 min
@@ -3214,5 +3279,212 @@ app.post("/sync/messages", auth, async (req, res) => {
   await sql`UPDATE users SET preferences = COALESCE(preferences,'{}'::jsonb) || '{"messages_connected":true}'::jsonb WHERE email = ${req.user.email}`;
   res.json({ ok: true, signals_created: created, total_messages: messages.length });
 });
+
+// ---------------------------------------------------------------------------
+// Concierge thread persistence  GET /concierge/thread  POST /concierge/thread
+// ---------------------------------------------------------------------------
+app.get("/concierge/thread", auth, async (req, res) => {
+  try {
+    const tripId = req.query.trip_id ? Number(req.query.trip_id) : null;
+    const rows = tripId
+      ? await sql`SELECT messages FROM concierge_threads WHERE user_email = ${req.user.email} AND trip_id = ${tripId}`
+      : await sql`SELECT messages FROM concierge_threads WHERE user_email = ${req.user.email} AND trip_id IS NULL`;
+    const messages = rows[0]?.messages || [];
+    res.json({ messages });
+  } catch (e) {
+    res.json({ messages: [] });
+  }
+});
+
+app.post("/concierge/thread", auth, async (req, res) => {
+  try {
+    const { messages, trip_id } = req.body || {};
+    if (!Array.isArray(messages)) return res.status(400).json({ error: "messages array required" });
+    const tripId = trip_id ? Number(trip_id) : null;
+    const trimmed = messages.slice(-50);
+    if (tripId) {
+      await sql`
+        INSERT INTO concierge_threads (user_email, trip_id, messages, updated_at)
+        VALUES (${req.user.email}, ${tripId}, ${JSON.stringify(trimmed)}, NOW())
+        ON CONFLICT (user_email, COALESCE(trip_id, -1))
+        DO UPDATE SET messages = ${JSON.stringify(trimmed)}, updated_at = NOW()
+      `;
+    } else {
+      await sql`
+        INSERT INTO concierge_threads (user_email, trip_id, messages, updated_at)
+        VALUES (${req.user.email}, NULL, ${JSON.stringify(trimmed)}, NOW())
+        ON CONFLICT (user_email, COALESCE(trip_id, -1))
+        DO UPDATE SET messages = ${JSON.stringify(trimmed)}, updated_at = NOW()
+      `;
+    }
+    res.json({ ok: true });
+  } catch (e) {
+    console.error("[concierge/thread]", e.message);
+    res.status(500).json({ error: e.message });
+  }
+});
+
+// ---------------------------------------------------------------------------
+// Trip sharing  POST /trips/:id/share  GET /share/:token
+// ---------------------------------------------------------------------------
+app.post("/trips/:id/share", auth, async (req, res) => {
+  try {
+    const tripId = Number(req.params.id);
+    const trip = await sql`SELECT * FROM trips WHERE id = ${tripId} AND user_email = ${req.user.email}`;
+    if (!trip[0]) return res.status(404).json({ error: "trip not found" });
+    const existing = await sql`SELECT share_token FROM trip_shares WHERE trip_id = ${tripId} AND user_email = ${req.user.email}`;
+    if (existing[0]) return res.json({ share_url: `https://wingmantravel.app/share/${existing[0].share_token}`, token: existing[0].share_token });
+    const token = require("crypto").randomBytes(12).toString("hex");
+    await sql`INSERT INTO trip_shares (trip_id, user_email, share_token) VALUES (${tripId}, ${req.user.email}, ${token})`;
+    res.json({ share_url: `https://wingmantravel.app/share/${token}`, token });
+  } catch (e) {
+    console.error("[share]", e.message);
+    res.status(500).json({ error: e.message });
+  }
+});
+
+app.get("/share/:token", async (req, res) => {
+  try {
+    const rows = await sql`
+      SELECT t.*, ts.user_email as owner_email
+      FROM trip_shares ts
+      JOIN trips t ON t.id = ts.trip_id
+      WHERE ts.share_token = ${req.params.token}
+    `;
+    if (!rows[0]) return res.status(404).json({ error: "share link not found" });
+    const trip = rows[0];
+    const legs = await sql`SELECT * FROM trip_legs WHERE trip_id = ${trip.id} ORDER BY departs_at ASC`;
+    res.json({ trip: { ...trip, legs } });
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
+// ---------------------------------------------------------------------------
+// Wingman Wrapped  GET /insights/wrapped
+// ---------------------------------------------------------------------------
+app.get("/insights/wrapped", auth, async (req, res) => {
+  try {
+    const year = req.query.year ? Number(req.query.year) : new Date().getFullYear();
+    const since = `${year}-01-01T00:00:00Z`;
+    const until = `${year + 1}-01-01T00:00:00Z`;
+    const tripsRows = await sql`SELECT COUNT(*) as cnt FROM trips WHERE user_email = ${req.user.email} AND created_at >= ${since}::timestamptz AND created_at < ${until}::timestamptz`;
+    const totalTrips = Number(tripsRows[0]?.cnt || 0);
+    const flightRows = await sql`
+      SELECT tl.origin, tl.destination, tl.carrier, tl.flight_number
+      FROM trip_legs tl JOIN trips t ON t.id = tl.trip_id
+      WHERE t.user_email = ${req.user.email} AND tl.type = 'flight'
+        AND tl.departs_at >= ${since}::timestamptz AND tl.departs_at < ${until}::timestamptz
+    `;
+    const totalFlights = flightRows.length;
+    const airportCounts = {};
+    const airlineCounts = {};
+    for (const f of flightRows) {
+      if (f.destination) airportCounts[f.destination] = (airportCounts[f.destination] || 0) + 1;
+      if (f.carrier) airlineCounts[f.carrier] = (airlineCounts[f.carrier] || 0) + 1;
+    }
+    const mostVisited = Object.entries(airportCounts).sort((a, b) => b[1] - a[1])[0]?.[0] || null;
+    const mostUsedAirline = Object.entries(airlineCounts).sort((a, b) => b[1] - a[1])[0]?.[0] || null;
+    const events = await sql`
+      SELECT metadata FROM activity_events
+      WHERE user_email = ${req.user.email}
+        AND type IN ('disruption_resolved','rebook','trip_outcome')
+        AND created_at >= ${since}::timestamptz AND created_at < ${until}::timestamptz
+    `;
+    let totalSaved = 0, disruptions = 0;
+    for (const ev of events) {
+      const m = typeof ev.metadata === "string" ? JSON.parse(ev.metadata || "{}") : (ev.metadata || {});
+      if (m.value_saved) totalSaved += Number(m.value_saved) || 0;
+      disruptions++;
+    }
+    const userRows = await sql`SELECT first_name FROM users WHERE email = ${req.user.email}`;
+    res.json({
+      year, first_name: userRows[0]?.first_name || null,
+      total_trips: totalTrips, total_flights: totalFlights,
+      disruptions_handled: disruptions, total_value_saved: totalSaved,
+      most_visited_airport: mostVisited, most_used_airline: mostUsedAirline,
+      unique_destinations: Object.keys(airportCounts).length,
+    });
+  } catch (e) {
+    console.error("[wrapped]", e.message);
+    res.status(500).json({ error: e.message });
+  }
+});
+
+// ---------------------------------------------------------------------------
+// Pre-departure push cron — every 5 minutes
+// Sends briefing at 24h and 3h before departure
+// ---------------------------------------------------------------------------
+async function runPreDepartureCron() {
+  try {
+    const now = Date.now();
+    const windows = [
+      { type: "24h", from: new Date(now + 23.5 * 3600000).toISOString(), to: new Date(now + 25 * 3600000).toISOString(), title: (r, fl) => `${fl} departs in 24 hours`, body: (r) => `Your Wingman briefing for ${r} is ready — weather, TSA wait times, and lounge access.`, prefill: (r) => `Briefing for my ${r} flight tomorrow` },
+      { type: "3h",  from: new Date(now + 2.75 * 3600000).toISOString(), to: new Date(now + 4 * 3600000).toISOString(), title: (r, fl) => `${fl} — 3 hours to departure`, body: () => `Time to head to the airport. Tap for your live gate, TSA wait, and Uber ETA.`, prefill: (r) => `Live status for my ${r} flight departing in 3 hours` },
+    ];
+    for (const w of windows) {
+      const legs = await sql`
+        SELECT tl.id, tl.origin, tl.destination, tl.carrier, tl.flight_number, tl.departs_at,
+               t.user_email, t.id as trip_id
+        FROM trip_legs tl JOIN trips t ON t.id = tl.trip_id
+        WHERE tl.type = 'flight'
+          AND tl.departs_at >= ${w.from}::timestamptz
+          AND tl.departs_at <= ${w.to}::timestamptz
+          AND tl.status NOT IN ('cancelled','landed')
+      `;
+      for (const leg of legs) {
+        try {
+          const already = await sql`SELECT id FROM departure_push_log WHERE user_email = ${leg.user_email} AND leg_id = ${leg.id} AND push_type = ${w.type}`;
+          if (already.length > 0) continue;
+          const route = `${leg.origin} → ${leg.destination}`;
+          const fl = leg.carrier && leg.flight_number ? `${leg.carrier}${leg.flight_number}` : route;
+          await sendPushToUser(leg.user_email, w.title(route, fl), w.body(route), { route: "Concierge", tripId: String(leg.trip_id), legId: String(leg.id), prefill: w.prefill(route) });
+          await sql`INSERT INTO departure_push_log (user_email, leg_id, push_type) VALUES (${leg.user_email}, ${leg.id}, ${w.type}) ON CONFLICT DO NOTHING`;
+          await logActivity(leg.user_email, "pre_departure_push", `${w.type} briefing sent for ${fl}`, `Departure briefing push sent for ${route}.`, leg.trip_id, leg.id);
+        } catch (e) { console.error(`[pre-dep ${w.type}]`, e.message); }
+      }
+    }
+  } catch (e) { console.error("[pre-departure-cron]", e.message); }
+}
+setInterval(runPreDepartureCron, 5 * 60 * 1000);
+
+// ---------------------------------------------------------------------------
+// Post-trip debrief push cron — every 10 minutes
+// Fires 30–120 minutes after the last leg's estimated arrival
+// ---------------------------------------------------------------------------
+async function runPostTripDebriefCron() {
+  try {
+    const now = new Date();
+    const thirtyMinAgo = new Date(now.getTime() - 30 * 60000).toISOString();
+    const twoHoursAgo  = new Date(now.getTime() - 2 * 3600000).toISOString();
+    const candidates = await sql`
+      SELECT DISTINCT ON (t.id)
+        t.id as trip_id, t.user_email, t.title,
+        tl.id as leg_id, tl.arrives_at, tl.destination
+      FROM trips t
+      JOIN trip_legs tl ON tl.trip_id = t.id
+      WHERE tl.type = 'flight'
+        AND tl.arrives_at >= ${twoHoursAgo}::timestamptz
+        AND tl.arrives_at <= ${thirtyMinAgo}::timestamptz
+        AND t.status != 'cancelled'
+      ORDER BY t.id, tl.arrives_at DESC
+    `;
+    for (const trip of candidates) {
+      try {
+        const already = await sql`SELECT id FROM debrief_push_log WHERE user_email = ${trip.user_email} AND trip_id = ${trip.trip_id}`;
+        if (already.length > 0) continue;
+        await sendPushToUser(
+          trip.user_email,
+          `You've landed in ${trip.destination || "your destination"} ✓`,
+          `How did your trip go? Tap to rate and see the value Wingman protected.`,
+          { route: "TripDetail", tripId: String(trip.trip_id) }
+        );
+        await sql`INSERT INTO debrief_push_log (user_email, trip_id) VALUES (${trip.user_email}, ${trip.trip_id}) ON CONFLICT DO NOTHING`;
+        await logActivity(trip.user_email, "debrief_push", `Post-trip debrief sent for ${trip.title}`, `Debrief push sent after landing in ${trip.destination}.`, trip.trip_id);
+      } catch (e) { console.error("[debrief-cron]", e.message); }
+    }
+  } catch (e) { console.error("[debrief-cron]", e.message); }
+}
+setInterval(runPostTripDebriefCron, 10 * 60 * 1000);
 
 app.listen(PORT, () => console.log("Wingman API on http://localhost:" + PORT));
