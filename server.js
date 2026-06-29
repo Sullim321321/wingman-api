@@ -787,17 +787,25 @@ app.post("/auth/request", async (req, res) => {
   const code = String(Math.floor(100000 + Math.random() * 900000));
   try {
     await redis.set("otp:" + email, code, { ex: 600 });
-    await resend.emails.send({
-      from: "Wingman <noreply@wingmantravel.app>",
-      to: email,
-      subject: "Your Wingman sign-in code: " + code,
-      html: `<div style="font-family:sans-serif;max-width:400px;margin:0 auto;padding:32px">
-        <h2 style="color:#5B8CFF;margin-bottom:8px">✈ Wingman</h2>
-        <p style="font-size:16px;color:#222">Your sign-in code is:</p>
-        <div style="font-size:48px;font-weight:700;letter-spacing:8px;color:#111;margin:16px 0">${code}</div>
-        <p style="color:#666;font-size:13px">Expires in 10 minutes. If you didn't request this, ignore this email.</p>
-      </div>`,
-    });
+    // Send via Resend if key is configured; otherwise log to console for dev/staging
+    const resendKey = process.env.RESEND_API_KEY || "";
+    const hasResend = resendKey && resendKey !== "re_placeholder" && resendKey.startsWith("re_");
+    if (hasResend) {
+      await resend.emails.send({
+        from: "Wingman <noreply@wingmantravel.app>",
+        to: email,
+        subject: "Your Wingman sign-in code: " + code,
+        html: `<div style="font-family:sans-serif;max-width:400px;margin:0 auto;padding:32px">
+          <h2 style="color:#5B8CFF;margin-bottom:8px">✈ Wingman</h2>
+          <p style="font-size:16px;color:#222">Your sign-in code is:</p>
+          <div style="font-size:48px;font-weight:700;letter-spacing:8px;color:#111;margin:16px 0">${code}</div>
+          <p style="color:#666;font-size:13px">Expires in 10 minutes. If you didn't request this, ignore this email.</p>
+        </div>`,
+      });
+    } else {
+      // Dev / staging fallback — log OTP so you can still test sign-in without Resend
+      console.log(`[auth/request] OTP for ${email}: ${code}  (RESEND_API_KEY not configured — email not sent)`);
+    }
     res.json({ ok: true });
   } catch (e) {
     console.error("[auth/request]", e.message);
@@ -5383,6 +5391,40 @@ app.delete('/me/hotel-affinity/:propertyName', auth, async (req, res) => {
     await sql`DELETE FROM hotel_affinity WHERE user_email = ${email} AND property_name = ${req.params.propertyName}`;
     res.json({ ok: true });
   } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
+// ---------------------------------------------------------------------------
+// POST /email/inbound — Resend inbound routing webhook
+// Users forward booking confirmations to import@wingmantravel.app
+// Resend parses the email and POSTs the body here
+// ---------------------------------------------------------------------------
+app.post("/email/inbound", async (req, res) => {
+  try {
+    const payload = req.body || {};
+    // Resend inbound payload shape: { from, to, subject, html, text, ... }
+    const fromAddr = (payload.from || "").toLowerCase();
+    const subject  = payload.subject || "";
+    const bodyText = payload.text || payload.html || "";
+    // Identify user by the From address
+    const userRows = await sql`SELECT email FROM users WHERE email = ${fromAddr}`;
+    if (!userRows.length) {
+      // Unknown sender — still try to parse and store as anonymous import
+      console.log(`[email/inbound] unknown sender: ${fromAddr}`);
+      return res.json({ ok: true, message: "unknown sender — ignored" });
+    }
+    const userEmail = userRows[0].email;
+    // Re-use the same paste parser
+    const tripsAdded = await parsePastedEmailBody(userEmail, bodyText || subject, "email_forward");
+    console.log(`[email/inbound] ${fromAddr} → ${tripsAdded} trip(s) created from forwarded email`);
+    // Award points for the import
+    if (tripsAdded > 0) {
+      awardPoints(userEmail, "gmail_trip_import").catch(() => {});
+    }
+    res.json({ ok: true, trips_created: tripsAdded });
+  } catch (e) {
+    console.error("[email/inbound]", e.message);
     res.status(500).json({ error: e.message });
   }
 });
