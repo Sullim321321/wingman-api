@@ -739,6 +739,44 @@ app.post("/points/award", auth, async (req, res) => {
   }
 });
 
+// POST /points/redeem — redeem Wingman Points for a perk
+app.post("/points/redeem", auth, async (req, res) => {
+  try {
+    const email = req.email;
+    const { perk_id } = req.body || {};
+    const REDEEMABLE_PERKS = {
+      "free_month":        { cost: 500,  label: "1 Month Free",        description: "One month of Wingman Premium" },
+      "priority_support":  { cost: 300,  label: "Priority Support",     description: "Jump to the front of the support queue" },
+      "upgrade_boost":     { cost: 400,  label: "Upgrade Bid Boost",    description: "2x points on your next upgrade bid" },
+      "lounge_day_pass":   { cost: 600,  label: "Lounge Day Pass",      description: "One-day Priority Pass lounge access" },
+      "concierge_call":    { cost: 800,  label: "Concierge Call",       description: "30-min call with a Wingman travel expert" },
+    };
+    if (!perk_id || !REDEEMABLE_PERKS[perk_id]) {
+      return res.status(400).json({ error: "unknown perk" });
+    }
+    const perk = REDEEMABLE_PERKS[perk_id];
+    const balRows = await sql`SELECT balance FROM wingman_points WHERE user_email = ${email}`;
+    const balance = balRows[0]?.balance || 0;
+    if (balance < perk.cost) {
+      return res.status(400).json({ error: "insufficient_points", balance, required: perk.cost });
+    }
+    const newBalance = balance - perk.cost;
+    await sql`
+      INSERT INTO wingman_points (user_email, balance, tier)
+      VALUES (${email}, ${newBalance}, ${getTier(newBalance)})
+      ON CONFLICT (user_email) DO UPDATE
+      SET balance = ${newBalance}, tier = ${getTier(newBalance)}, updated_at = NOW()
+    `;
+    await sql`
+      INSERT INTO wingman_points_events (user_email, action, points, description)
+      VALUES (${email}, ${'redeem_' + perk_id}, ${-perk.cost}, ${`Redeemed: ${perk.label}`})
+    `;
+    res.json({ ok: true, perk_id, perk_label: perk.label, cost: perk.cost, new_balance: newBalance });
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
 // POST /auth/request — send OTP
 // ---------------------------------------------------------------------------
 app.post("/auth/request", async (req, res) => {
