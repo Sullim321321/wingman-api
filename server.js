@@ -372,6 +372,9 @@ async function bootstrapDB() {
       )
     `;
     await sql`ALTER TABLE users ADD COLUMN IF NOT EXISTS revealed_preferences JSONB DEFAULT '{}'`;
+    await sql`ALTER TABLE users ADD COLUMN IF NOT EXISTS apple_sub TEXT`;
+    await sql`ALTER TABLE users ADD COLUMN IF NOT EXISTS phone TEXT`;
+    await sql`ALTER TABLE users ADD COLUMN IF NOT EXISTS display_name TEXT`;
     console.log("[db] tables ready");
   } catch (e) {
     console.error("[db] bootstrap error:", e.message);
@@ -791,6 +794,99 @@ app.post("/auth/verify", async (req, res) => {
   }
 });
 
+// ---------------------------------------------------------------------------
+// POST /auth/apple — Sign in with Apple (verify identity token, return JWT)
+// ---------------------------------------------------------------------------
+app.post("/auth/apple", async (req, res) => {
+  const { identityToken, email: appleEmail, fullName } = req.body || {};
+  if (!identityToken) return res.status(400).json({ error: "identityToken required" });
+  try {
+    const parts = identityToken.split(".");
+    if (parts.length !== 3) throw new Error("invalid identity token");
+    const payload = JSON.parse(Buffer.from(parts[1], "base64url").toString("utf8"));
+    const userEmail = appleEmail || payload.email;
+    const sub = payload.sub;
+    if (!userEmail && !sub) throw new Error("no identifier from Apple");
+    let resolvedEmail = userEmail;
+    if (!resolvedEmail && sub) {
+      const rows = await sql`SELECT email FROM users WHERE apple_sub = ${sub} LIMIT 1`;
+      if (rows.length > 0) resolvedEmail = rows[0].email;
+      else throw new Error("Apple account not linked to any Wingman account");
+    }
+    resolvedEmail = resolvedEmail.trim().toLowerCase();
+    const displayName = fullName ? ((fullName.givenName || "") + " " + (fullName.familyName || "")).trim() : null;
+    await sql`
+      INSERT INTO users (email, apple_sub, display_name)
+      VALUES (${resolvedEmail}, ${sub || null}, ${displayName})
+      ON CONFLICT (email) DO UPDATE SET
+        apple_sub = COALESCE(EXCLUDED.apple_sub, users.apple_sub),
+        display_name = COALESCE(users.display_name, EXCLUDED.display_name)
+    `;
+    const token = signAccessToken(resolvedEmail);
+    awardPoints(resolvedEmail, "signup").catch(() => {});
+    res.json({ ok: true, token, email: resolvedEmail });
+  } catch (e) {
+    console.error("[auth/apple]", e.message);
+    res.status(401).json({ error: "Apple sign-in failed: " + e.message });
+  }
+});
+// ---------------------------------------------------------------------------
+// POST /auth/sms/request — send SMS OTP via Twilio
+// ---------------------------------------------------------------------------
+app.post("/auth/sms/request", async (req, res) => {
+  const phone = ((req.body && req.body.phone) || "").trim().replace(/\s/g, "");
+  if (!phone || phone.length < 10) return res.status(400).json({ error: "valid phone number required" });
+  const code = String(Math.floor(100000 + Math.random() * 900000));
+  try {
+    await redis.set("sms_otp:" + phone, code, { ex: 600 });
+    const accountSid = process.env.TWILIO_ACCOUNT_SID;
+    const authToken  = process.env.TWILIO_AUTH_TOKEN;
+    const fromNumber = process.env.TWILIO_FROM_NUMBER;
+    if (accountSid && authToken && fromNumber) {
+      const twilioUrl = `https://api.twilio.com/2010-04-01/Accounts/${accountSid}/Messages.json`;
+      const body = new URLSearchParams({ To: phone, From: fromNumber, Body: `Your Wingman code: ${code}. Expires in 10 minutes.` });
+      const r = await fetch(twilioUrl, {
+        method: "POST",
+        headers: { "Content-Type": "application/x-www-form-urlencoded", "Authorization": "Basic " + Buffer.from(accountSid + ":" + authToken).toString("base64") },
+        body: body.toString(),
+      });
+      if (!r.ok) throw new Error("Twilio error: " + (await r.text()));
+    } else {
+      console.log(`[auth/sms DEV] OTP for ${phone}: ${code}`);
+    }
+    res.json({ ok: true });
+  } catch (e) {
+    console.error("[auth/sms/request]", e.message);
+    res.status(500).json({ error: "failed to send SMS" });
+  }
+});
+// ---------------------------------------------------------------------------
+// POST /auth/sms/verify — verify SMS OTP, return JWT
+// ---------------------------------------------------------------------------
+app.post("/auth/sms/verify", async (req, res) => {
+  const phone = ((req.body && req.body.phone) || "").trim().replace(/\s/g, "");
+  const code  = String((req.body && req.body.code) || "").trim();
+  if (!phone || !code) return res.status(400).json({ error: "phone and code required" });
+  try {
+    const stored = await redis.get("sms_otp:" + phone);
+    if (!stored || String(stored) !== code) return res.status(401).json({ error: "invalid or expired code" });
+    await redis.del("sms_otp:" + phone);
+    const rows = await sql`SELECT email FROM users WHERE phone = ${phone} LIMIT 1`;
+    let email;
+    if (rows.length > 0) {
+      email = rows[0].email;
+    } else {
+      email = `phone_${phone.replace(/[^0-9]/g, "")}@wingman.app`;
+      await sql`INSERT INTO users (email, phone) VALUES (${email}, ${phone}) ON CONFLICT (email) DO NOTHING`;
+    }
+    const token = signAccessToken(email);
+    awardPoints(email, "signup").catch(() => {});
+    res.json({ ok: true, token, email, phone });
+  } catch (e) {
+    console.error("[auth/sms/verify]", e.message);
+    res.status(500).json({ error: "verification failed" });
+  }
+});
 // ---------------------------------------------------------------------------
 // POST /push-token — store Expo push token
 // ---------------------------------------------------------------------------
@@ -4943,6 +5039,193 @@ app.get("/airports/:iata/ground-transport/:option_id/directions", auth, async (r
 
 
 
+// ─── Airport dining & food preferences ────────────────────────────────────────
+// GET /airports/:iata/dining — AI-powered terminal dining recs filtered by user food prefs
+// ---------------------------------------------------------------------------
+app.get("/airports/:iata/dining", auth, async (req, res) => {
+  const iata = (req.params.iata || "").toUpperCase();
+  const terminal = (req.query.terminal || "").toUpperCase();
+  try {
+    const userRows = await sql`SELECT preferences FROM users WHERE email = ${req.email} LIMIT 1`;
+    const prefs = userRows[0]?.preferences || {};
+    const foodPrefs = prefs.food_prefs || [];
+    const dietaryStr = foodPrefs.length > 0
+      ? `The user has these dietary preferences/restrictions: ${foodPrefs.join(", ")}.`
+      : "The user has no specific dietary restrictions.";
+    const terminalStr = terminal ? `Focus on ${terminal} terminal.` : "Cover all terminals.";
+    const prompt = `You are an airport dining expert. For ${iata} airport, recommend the best dining options.
+${terminalStr}
+${dietaryStr}
+
+Return JSON: { "terminal_overview": "1-2 sentence summary", "picks": [ { "name": string, "terminal": string, "gate_area": string, "cuisine": string, "price_range": "$|$$|$$$", "best_for": string, "must_order": string, "dietary_tags": string[], "hours": string, "tip": string } ] }
+Include 6-8 picks. Prioritize quality sit-down options over fast food. Include at least one bar/lounge if available.`;
+    const ai = getAnthropic();
+    const msg = await ai.messages.create({
+      model: "claude-haiku-20240307",
+      max_tokens: 1200,
+      messages: [{ role: "user", content: prompt }],
+    });
+    const raw = msg.content[0].text;
+    const jsonMatch = raw.match(/\{[\s\S]*\}/);
+    const data = jsonMatch ? JSON.parse(jsonMatch[0]) : { terminal_overview: "Dining options available throughout the airport.", picks: [] };
+    res.json({ iata, terminal: terminal || "all", food_prefs: foodPrefs, ...data });
+  } catch (e) {
+    console.error("[airport/dining]", e.message);
+    res.status(500).json({ error: "Could not load dining options" });
+  }
+});
+// ─── In-airport navigation ─────────────────────────────────────────────────
+// GET /airports/:iata/navigate — terminal map, gate walk times, lounge access
+// ---------------------------------------------------------------------------
+const AIRPORT_NAV_DB = {
+  JFK: {
+    terminals: ["T1","T2","T4","T5","T7","T8"],
+    lounges: [
+      { name: "Centurion Lounge", terminal: "T4", access: ["Amex Platinum","Amex Centurion"], hours: "5:30am–11pm" },
+      { name: "Delta Sky Club", terminal: "T4", access: ["Delta Medallion","Amex Platinum on Delta"], hours: "5am–10pm" },
+      { name: "JetBlue Mint Studio Lounge", terminal: "T5", access: ["JetBlue Mint passengers"], hours: "5am–10pm" },
+    ],
+    airtrain: true,
+    airtrain_tip: "AirTrain connects all terminals — free between terminals, $8.25 to/from parking or subway.",
+    security_tips: "TSA PreCheck available in T1, T4, T5, T8. CLEAR available in T4 and T5.",
+    gate_walk_avg_min: 8,
+  },
+  LAX: {
+    terminals: ["T1","T2","T3","T4","T5","T6","T7","T8","TBIT","MSC"],
+    lounges: [
+      { name: "Centurion Lounge", terminal: "TBIT", access: ["Amex Platinum","Amex Centurion"], hours: "5am–11pm" },
+      { name: "United Club", terminal: "TBIT", access: ["United Club members","Star Alliance Gold"], hours: "5am–10pm" },
+      { name: "Delta Sky Club", terminal: "T3", access: ["Delta Medallion","Amex Platinum on Delta"], hours: "5am–10pm" },
+      { name: "The Qantas International Business Lounge", terminal: "TBIT", access: ["Qantas Business/First","oneworld Emerald/Sapphire"], hours: "Varies by departure" },
+    ],
+    airtrain: false,
+    inter_terminal_bus: true,
+    inter_terminal_tip: "Free LAX-it shuttle connects terminals. Allow 20-30 min for inter-terminal connections.",
+    security_tips: "TSA PreCheck in all terminals. CLEAR in T2, T3, T4, T6, TBIT.",
+    gate_walk_avg_min: 12,
+  },
+  LHR: {
+    terminals: ["T2","T3","T4","T5"],
+    lounges: [
+      { name: "Concorde Room (BA)", terminal: "T5", access: ["BA First Class","oneworld Emerald"], hours: "Varies" },
+      { name: "Galleries First (BA)", terminal: "T5", access: ["BA Business Class","oneworld Sapphire"], hours: "Varies" },
+      { name: "No.1 Traveller", terminal: "T2", access: ["Paid access available"], hours: "5am–9pm" },
+      { name: "Plaza Premium", terminal: "T3", access: ["Priority Pass","Paid access"], hours: "5am–10pm" },
+    ],
+    airtrain: false,
+    inter_terminal_bus: true,
+    inter_terminal_tip: "Free inter-terminal bus runs every 10 min. T5 is only accessible from T5 rail station — allow 30 min.",
+    security_tips: "Fast Track security available for premium passengers and Priority Pass holders.",
+    gate_walk_avg_min: 15,
+  },
+  CDG: {
+    terminals: ["T1","T2A","T2B","T2C","T2D","T2E","T2F","T2G","T3"],
+    lounges: [
+      { name: "Air France Salon La Première", terminal: "T2E", access: ["Air France La Première"], hours: "Varies" },
+      { name: "Air France Salon Business", terminal: "T2E", access: ["Air France Business","SkyTeam Elite Plus"], hours: "Varies" },
+      { name: "Salon Aspire", terminal: "T1", access: ["Priority Pass","Paid access"], hours: "5am–10pm" },
+    ],
+    airtrain: true,
+    airtrain_tip: "CDGVAL automated shuttle connects T1, T2, T3, and parking — free, runs every 4 min.",
+    security_tips: "Priority lanes available for Business/First class and elite status holders.",
+    gate_walk_avg_min: 18,
+  },
+  DXB: {
+    terminals: ["T1","T2","T3"],
+    lounges: [
+      { name: "Emirates First Class Lounge", terminal: "T3", access: ["Emirates First Class","Skywards Platinum"], hours: "24h" },
+      { name: "Emirates Business Lounge", terminal: "T3", access: ["Emirates Business Class","Skywards Gold"], hours: "24h" },
+      { name: "Marhaba Lounge", terminal: "T1", access: ["Priority Pass","Paid access"], hours: "24h" },
+    ],
+    airtrain: true,
+    airtrain_tip: "Dubai Metro Red Line connects T1 and T3. T2 requires a bus connection.",
+    security_tips: "Smart Gates available for UAE ID and biometric passport holders.",
+    gate_walk_avg_min: 20,
+  },
+  DEFAULT: {
+    terminals: [],
+    lounges: [],
+    airtrain: false,
+    security_tips: "Check your airline's app for the latest terminal and gate information.",
+    gate_walk_avg_min: 10,
+  },
+};
+app.get("/airports/:iata/navigate", auth, async (req, res) => {
+  const iata = (req.params.iata || "").toUpperCase();
+  const gate = (req.query.gate || "").toUpperCase();
+  const navData = AIRPORT_NAV_DB[iata] || AIRPORT_NAV_DB.DEFAULT;
+  try {
+    const userRows = await sql`SELECT preferences FROM users WHERE email = ${req.email} LIMIT 1`;
+    const prefs = userRows[0]?.preferences || {};
+    const loyaltyRows = await sql`SELECT program, elite_status FROM loyalty_accounts WHERE user_email = ${req.email}`;
+    // Filter lounges by user's loyalty status
+    const userPrograms = loyaltyRows.map(r => r.program?.toLowerCase() || "");
+    const userStatuses = loyaltyRows.map(r => r.elite_status?.toLowerCase() || "");
+    const accessibleLounges = navData.lounges.filter(l => {
+      return l.access.some(a => {
+        const al = a.toLowerCase();
+        return userPrograms.some(p => al.includes(p)) ||
+               userStatuses.some(s => s && al.includes(s)) ||
+               al.includes("paid access") ||
+               al.includes("priority pass");
+      });
+    });
+    res.json({
+      iata,
+      gate: gate || null,
+      terminals: navData.terminals,
+      airtrain: navData.airtrain || false,
+      airtrain_tip: navData.airtrain_tip || null,
+      inter_terminal_bus: navData.inter_terminal_bus || false,
+      inter_terminal_tip: navData.inter_terminal_tip || null,
+      security_tips: navData.security_tips,
+      gate_walk_avg_min: navData.gate_walk_avg_min,
+      lounges: navData.lounges,
+      accessible_lounges: accessibleLounges,
+    });
+  } catch (e) {
+    console.error("[airport/navigate]", e.message);
+    res.status(500).json({ error: "Could not load airport navigation" });
+  }
+});
+// ─── City transport within destination ────────────────────────────────────
+// GET /airports/:iata/city-transport — deep links + options for getting around the destination city
+// ---------------------------------------------------------------------------
+app.get("/airports/:iata/city-transport", auth, async (req, res) => {
+  const iata = (req.params.iata || "").toUpperCase();
+  const airportData = GROUND_TRANSPORT_DB[iata] || GROUND_TRANSPORT_DB.DEFAULT;
+  const city = airportData.city || "the city";
+  try {
+    const ai = getAnthropic();
+    const msg = await ai.messages.create({
+      model: "claude-haiku-20240307",
+      max_tokens: 900,
+      messages: [{ role: "user", content: `For a traveler arriving at ${iata} (${city}), what are the best ways to get around the city during their stay?
+Return JSON: { "city": string, "overview": string, "options": [ { "mode": string, "name": string, "description": string, "cost_per_trip": string, "app": string|null, "deep_link_ios": string|null, "tip": string } ] }
+Include: rideshare (Uber/Lyft/local equivalent), metro/subway if available, taxi, bike share if available. For deep_link_ios use uber:// or lyft:// scheme where applicable.` }],
+    });
+    const raw = msg.content[0].text;
+    const jsonMatch = raw.match(/\{[\s\S]*\}/);
+    const data = jsonMatch ? JSON.parse(jsonMatch[0]) : { city, overview: "Multiple transport options available.", options: [] };
+    // Always add Uber and Lyft deep links if not already present
+    const hasUber = data.options?.some(o => o.name?.toLowerCase().includes("uber"));
+    if (!hasUber && data.options) {
+      data.options.unshift({
+        mode: "rideshare",
+        name: "Uber",
+        description: "On-demand rides — fastest option from the airport",
+        cost_per_trip: "Varies",
+        app: "Uber",
+        deep_link_ios: "uber://",
+        tip: "Book in the app before you land to avoid surge pricing at arrivals."
+      });
+    }
+    res.json({ iata, ...data });
+  } catch (e) {
+    console.error("[city-transport]", e.message);
+    res.status(500).json({ error: "Could not load city transport options" });
+  }
+});
 // ─── Weekly digest push cron ─────────────────────────────────────────────────
 // Runs every 15 min; fires logic only on Sundays 8:00–8:15 UTC
 setInterval(async () => {
