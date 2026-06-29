@@ -104,6 +104,28 @@ async function bootstrapDB() {
     await sql`ALTER TABLE users ADD COLUMN IF NOT EXISTS price_alerts BOOLEAN DEFAULT true`;
     await sql`ALTER TABLE users ADD COLUMN IF NOT EXISTS quiet_hours BOOLEAN DEFAULT true`;
     await sql`ALTER TABLE users ADD COLUMN IF NOT EXISTS last_weekly_digest TIMESTAMPTZ`;
+    // ── Wingman Points ────────────────────────────────────────────────────────
+    await sql`
+      CREATE TABLE IF NOT EXISTS wingman_points (
+        id SERIAL PRIMARY KEY,
+        user_email TEXT NOT NULL REFERENCES users(email) ON DELETE CASCADE,
+        balance INTEGER NOT NULL DEFAULT 0,
+        tier TEXT NOT NULL DEFAULT 'explorer',
+        updated_at TIMESTAMPTZ DEFAULT NOW(),
+        UNIQUE(user_email)
+      )
+    `;
+    await sql`
+      CREATE TABLE IF NOT EXISTS wingman_points_events (
+        id SERIAL PRIMARY KEY,
+        user_email TEXT NOT NULL,
+        action TEXT NOT NULL,
+        points INTEGER NOT NULL,
+        description TEXT,
+        created_at TIMESTAMPTZ DEFAULT NOW()
+      )
+    `;
+    await sql`CREATE INDEX IF NOT EXISTS idx_points_events_user ON wingman_points_events(user_email, created_at DESC)`;
     await sql`
       CREATE TABLE IF NOT EXISTS refresh_tokens (
         id SERIAL PRIMARY KEY,
@@ -504,6 +526,123 @@ async function verifyAccessToken(req) {
 }
 
 // ---------------------------------------------------------------------------
+
+// ─── Wingman Points ────────────────────────────────────────────────────────────
+// Earn rules: each action can only award points once (deduped by action key)
+const POINT_RULES = {
+  signup:           { pts: 200, desc: "Joined Wingman" },
+  gmail_connected:  { pts: 300, desc: "Connected Gmail" },
+  trip_added:       { pts: 100, desc: "Added a trip" },
+  profile_complete: { pts: 150, desc: "Completed profile" },
+  push_enabled:     { pts: 100, desc: "Enabled push notifications" },
+  concierge_first:  { pts: 50,  desc: "First concierge message" },
+  loyalty_connected:{ pts: 150, desc: "Connected loyalty account" },
+  trip_completed:   { pts: 75,  desc: "Completed a trip" },
+  gmail_trip_import:{ pts: 125, desc: "Trip imported from Gmail" },
+};
+
+// Tier thresholds
+function getTier(balance) {
+  if (balance >= 2000) return "elite";
+  if (balance >= 800)  return "navigator";
+  if (balance >= 300)  return "flyer";
+  return "explorer";
+}
+
+// Award points (idempotent by action key — pass unique key for repeatable actions)
+async function awardPoints(email, action, dedupKey = null) {
+  const rule = POINT_RULES[action];
+  if (!rule) return;
+  const key = dedupKey || action;
+  try {
+    // Check if already awarded this key
+    const existing = await sql`
+      SELECT id FROM wingman_points_events
+      WHERE user_email = ${email} AND action = ${key}
+      LIMIT 1
+    `;
+    if (existing.length > 0) return; // already awarded
+    // Insert event
+    await sql`
+      INSERT INTO wingman_points_events (user_email, action, points, description)
+      VALUES (${email}, ${key}, ${rule.pts}, ${rule.desc})
+    `;
+    // Upsert balance
+    const rows = await sql`
+      INSERT INTO wingman_points (user_email, balance, tier)
+      VALUES (${email}, ${rule.pts}, ${getTier(rule.pts)})
+      ON CONFLICT (user_email) DO UPDATE
+        SET balance = wingman_points.balance + ${rule.pts},
+            tier = CASE
+              WHEN wingman_points.balance + ${rule.pts} >= 2000 THEN 'elite'
+              WHEN wingman_points.balance + ${rule.pts} >= 800  THEN 'navigator'
+              WHEN wingman_points.balance + ${rule.pts} >= 300  THEN 'flyer'
+              ELSE 'explorer'
+            END,
+            updated_at = NOW()
+      RETURNING balance, tier
+    `;
+    return rows[0];
+  } catch (e) {
+    console.error("[points] award error:", e.message);
+  }
+}
+
+// GET /points — current balance, tier, recent events
+app.get("/points", auth, async (req, res) => {
+  try {
+    const email = req.email;
+    const [balRows, events] = await Promise.all([
+      sql`SELECT balance, tier FROM wingman_points WHERE user_email = ${email}`,
+      sql`SELECT action, points, description, created_at FROM wingman_points_events
+          WHERE user_email = ${email} ORDER BY created_at DESC LIMIT 20`,
+    ]);
+    const balance = balRows[0]?.balance || 0;
+    const tier    = balRows[0]?.tier    || getTier(balance);
+    // Compute progress to next tier
+    const TIERS = [
+      { name: "explorer",  min: 0,    max: 299,  next: "flyer",     nextMin: 300  },
+      { name: "flyer",     min: 300,  max: 799,  next: "navigator", nextMin: 800  },
+      { name: "navigator", min: 800,  max: 1999, next: "elite",     nextMin: 2000 },
+      { name: "elite",     min: 2000, max: null, next: null,        nextMin: null },
+    ];
+    const tierInfo = TIERS.find(t => t.name === tier) || TIERS[0];
+    const pct = tierInfo.nextMin
+      ? Math.round(((balance - tierInfo.min) / (tierInfo.nextMin - tierInfo.min)) * 100)
+      : 100;
+    res.json({
+      ok: true,
+      balance,
+      tier,
+      next_tier: tierInfo.next,
+      points_to_next: tierInfo.nextMin ? Math.max(0, tierInfo.nextMin - balance) : 0,
+      progress_pct: Math.min(100, pct),
+      events: events.map(e => ({
+        action: e.action,
+        points: e.points,
+        description: e.description,
+        date: e.created_at,
+      })),
+    });
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
+// POST /points/award — internal endpoint to award points from other flows
+// Also called by the app when user completes an action
+app.post("/points/award", auth, async (req, res) => {
+  try {
+    const email = req.email;
+    const { action, dedup_key } = req.body || {};
+    if (!action || !POINT_RULES[action]) return res.status(400).json({ error: "unknown action" });
+    const result = await awardPoints(email, action, dedup_key);
+    res.json({ ok: true, awarded: !!result, result });
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
 // POST /auth/request — send OTP
 // ---------------------------------------------------------------------------
 app.post("/auth/request", async (req, res) => {
@@ -550,6 +689,8 @@ app.post("/auth/verify", async (req, res) => {
       ON CONFLICT (email) DO NOTHING
     `;
     const token = signAccessToken(email);
+    // Award signup points (idempotent)
+    awardPoints(email, "signup").catch(() => {});
     res.json({ ok: true, token, email });
   } catch (e) {
     console.error("[auth/verify]", e.message);
@@ -1309,6 +1450,8 @@ app.post("/trips", async (req, res) => {
       legCount > 0 ? `${legCount} leg${legCount !== 1 ? "s" : ""} added. Wingman is now monitoring.` : "Wingman is now monitoring.",
       tripId
     );
+    // Award points for adding a trip (idempotent per trip)
+    awardPoints(email, "trip_added", "trip_added_" + tripId).catch(() => {});
     res.json({ ok: true, trip: result[0] });
   } catch (e) {
     console.error("[trips/create]", e.message);
@@ -1471,29 +1614,65 @@ app.post("/concierge", async (req, res) => {
         }).join("\n")
       : null;
 
-    const systemPrompt = `You are Wingman, a world-class AI travel concierge. You have real-time access to the user's trips, live flight statuses, and weather disruption risk scores. You also know this user's personal taste profile and editorial preferences — use them to give recommendations that feel like they came from a trusted friend with impeccable taste, not a generic algorithm.
+    const systemPrompt = `You are Wingman — a world-class AI travel concierge and destination intelligence engine. You combine the knowledge of a seasoned luxury travel editor, a Michelin-starred restaurant scout, a hotel critic, and a local fixer in every city on earth. You have real-time access to the user's trips, live flight statuses, and weather disruption risk scores. You know this user's personal taste profile and editorial preferences — use them to give recommendations that feel like they came from a trusted friend with impeccable taste and deep local knowledge, not a generic algorithm.
+
 Today's date/time: ${today}
 User: ${email}
 ${tasteSection ? `=== USER'S TASTE PROFILE ===\n${tasteSection}\n` : ""}
 ${loyaltySummary ? `=== USER'S LOYALTY ACCOUNTS ===\n${loyaltySummary}\n\nWhen recommending hotels, always factor in which programs the user has status with and suggest properties where their status will be recognized. When advising on flights, factor in their airline status and miles balance — suggest using miles for upgrades when the balance is high.\n` : ""}
 === USER'S TRIPS (with live data) ===
 ${tripsSummary}
-You help with:
-- Explaining live flight status, delays, gate changes
-- Assessing disruption risk based on weather data above
-- Rebooking options and airline policies when flights are cancelled or heavily delayed
-- Hotel, restaurant, and experience recommendations — always filtered through the user's editorial taste profile above
-- Seat selection advice based on the user's preferences above
-- General travel advice and packing tips
-Guidelines:
-- Be concise and direct — the user is likely in a stressful travel situation
-- Always reference the user's actual trip data and live statuses above
-- If a flight shows a delay or high weather risk, proactively mention it
-- For rebooking, mention the airline's app/phone and same-day change policies
-- When recommending hotels or restaurants, reason like an editor from the user's trusted sources above
-- If the user has hotel soft-specs (bathtub, quiet room, etc.), factor them into every hotel recommendation
-- If data is missing or stale, say so honestly
-- Trip modes: [CLIENT TRIP] = prioritize prestige, optics, private dining, car service over Uber; [PARTNER/LEISURE TRIP] = prioritize romance, design-forward boutique hotels, bathtub, no 6am flights, chef's table dinners; no mode label = solo/efficiency mode`;
+
+=== YOUR CAPABILITIES ===
+You are a full recommendations engine. You can answer ANY travel-related question with depth and specificity:
+
+FLIGHT INTELLIGENCE
+- Live status, delays, gate changes, cancellations
+- Disruption risk assessment and rebooking options
+- Seat selection, upgrade strategies, same-day change policies
+- Connection risk and buffer time analysis
+
+DESTINATION INTELLIGENCE
+- Neighbourhood guides: which area to stay in and why
+- Seasonal advice: when to go, what to expect
+- Local customs, tipping culture, transport, safety
+- Hidden gems vs tourist traps — always be honest about both
+
+RESTAURANT RECOMMENDATIONS
+- Specific restaurant names with cuisine, vibe, must-order dishes
+- Reservation strategy (OpenTable, Resy, direct, walk-in timing)
+- Price range and dress code guidance
+- Breakfast/lunch/dinner/late-night options
+- Always filter through the user's food preferences and editorial sources
+
+HOTEL RECOMMENDATIONS
+- Specific hotel names with tier (luxury/boutique/value), location, and why it fits this user
+- Factor in the user's hotel soft-specs (bathtub, quiet room, etc.) for every recommendation
+- Note which properties honour the user's loyalty status
+- Alternatives at different price points
+
+ACTIVITIES & EXPERIENCES
+- Culture: museums, galleries, architecture, performances
+- Outdoor: hikes, beaches, parks, day trips
+- Food & drink: markets, tastings, cooking classes, bars
+- Wellness: spas, yoga, running routes
+- Nightlife: clubs, jazz bars, rooftop bars
+- Family-friendly options when relevant
+
+LOGISTICS & PLANNING
+- Airport transfer options and timing
+- Visa requirements and entry tips
+- Currency, SIM cards, packing lists
+- Day-by-day itinerary building
+
+=== RECOMMENDATION STYLE ===
+- Be specific: name the restaurant, the hotel, the neighbourhood. Never say "there are many great options."
+- Be opinionated: say what you actually recommend and why, like a trusted friend
+- Be concise: 2–4 sentences per recommendation unless the user asks for more detail
+- Reference the user's taste profile in every recommendation — if they trust Hotels Above Par, recommend boutique hotels; if they trust Eater, recommend the hot new openings
+- Trip modes: [CLIENT TRIP] = prioritize prestige, private dining, car service; [PARTNER/LEISURE TRIP] = romance, design-forward boutique hotels, chef's table dinners; no mode = solo/efficiency
+- If the user is in a disruption situation, lead with the rescue options first, then offer destination intel
+- If data is missing or stale, say so honestly`;
 
 
     const messages = [
@@ -1505,14 +1684,15 @@ Guidelines:
     // Claude requires system prompt separate from messages array
     const systemMsg = messages.find(m => m.role === "system")?.content || "";
     const chatMessages = messages.filter(m => m.role !== "system");
-    const claudeResp = await getAnthropic().messages.create({
+        const claudeResp = await getAnthropic().messages.create({
       model: "claude-haiku-4-5",
-      max_tokens: 600,
+      max_tokens: 1000,
       system: systemMsg,
       messages: chatMessages,
     });
-
     const reply = claudeResp.content[0].text;
+    // Award points for first concierge message (idempotent)
+    awardPoints(email, "concierge_first").catch(() => {});
     res.json({ ok: true, reply });
   } catch (e) {
     console.error("[concierge]", e.message);
@@ -1765,6 +1945,61 @@ app.get("/ground-intel", async (req, res) => {
   }
   res.json(result);
 });
+// ---------------------------------------------------------------------------
+// GET /destination/intel — AI-powered destination intelligence card
+// Returns: weather summary, top hotels, restaurants, activities, local tips
+// Public endpoint (no auth) so the home screen tracker can use it too
+// ---------------------------------------------------------------------------
+app.get("/destination/intel", async (req, res) => {
+  const { iata, city, trip_id } = req.query;
+  if (!iata && !city) return res.status(400).json({ error: "iata or city required" });
+  const destination = city || iata;
+  // Optionally fetch trip context if auth provided
+  let tripContext = "";
+  const email = await verifyAccessToken(req).catch(() => null);
+  if (email && trip_id) {
+    try {
+      const trips = await sql`SELECT title, mode FROM trips WHERE id = ${trip_id} AND user_email = ${email} LIMIT 1`;
+      if (trips[0]) tripContext = `\nTrip context: "${trips[0].title}" (mode: ${trips[0].mode || "solo"})`;
+    } catch {}
+  }
+  let tasteSection = "";
+  if (email) {
+    try {
+      const u = await sql`SELECT taste_profile FROM users WHERE email = ${email} LIMIT 1`;
+      if (u[0]?.taste_profile) tasteSection = `\nUser taste profile: ${JSON.stringify(u[0].taste_profile)}`;
+    } catch {}
+  }
+  try {
+    const prompt = `You are a world-class travel editor. Give a destination intelligence briefing for ${destination}.${tripContext}${tasteSection}
+
+Return a JSON object with exactly this structure (no markdown, raw JSON only):
+{
+  "headline": "One evocative sentence about the destination (max 12 words)",
+  "weather": { "summary": "Current season and typical weather in 1 sentence", "best_months": "e.g. April–June, Sept–Oct" },
+  "neighborhoods": [ { "name": "...", "vibe": "one sentence" } ],
+  "hotels": [ { "name": "...", "tier": "luxury|boutique|value", "why": "one sentence" } ],
+  "restaurants": [ { "name": "...", "cuisine": "...", "vibe": "one sentence", "must_order": "..." } ],
+  "activities": [ { "name": "...", "type": "culture|outdoor|food|nightlife|wellness", "why": "one sentence" } ],
+  "local_tips": [ "tip 1", "tip 2", "tip 3" ],
+  "concierge_prompts": [ "Question 1 to ask Wingman about this destination", "Question 2", "Question 3" ]
+}
+Provide 2 neighborhoods, 3 hotels, 4 restaurants, 4 activities, 3 local tips, 3 concierge prompts.
+${tasteSection ? "Filter recommendations through the user taste profile above." : ""}`;
+    const resp = await getAnthropic().messages.create({
+      model: "claude-haiku-4-5",
+      max_tokens: 1200,
+      messages: [{ role: "user", content: prompt }],
+    });
+    let intel;
+    try { intel = JSON.parse(resp.content[0].text.trim()); }
+    catch { intel = { headline: `Discover ${destination}`, weather: {}, hotels: [], restaurants: [], activities: [], local_tips: [], concierge_prompts: [] }; }
+    res.json({ ok: true, destination, intel });
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
 // ---------------------------------------------------------------------------
 // GET /awards/search — award seat search (demo data; live requires Point.me key)
 // ---------------------------------------------------------------------------
