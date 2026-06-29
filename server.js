@@ -103,6 +103,7 @@ async function bootstrapDB() {
     await sql`ALTER TABLE users ADD COLUMN IF NOT EXISTS weather_alerts BOOLEAN DEFAULT true`;
     await sql`ALTER TABLE users ADD COLUMN IF NOT EXISTS price_alerts BOOLEAN DEFAULT true`;
     await sql`ALTER TABLE users ADD COLUMN IF NOT EXISTS quiet_hours BOOLEAN DEFAULT true`;
+    await sql`ALTER TABLE users ADD COLUMN IF NOT EXISTS last_weekly_digest TIMESTAMPTZ`;
     await sql`
       CREATE TABLE IF NOT EXISTS refresh_tokens (
         id SERIAL PRIMARY KEY,
@@ -1637,6 +1638,15 @@ app.get("/flight-status", async (req, res) => {
   res.json({ ident, live: true, ...status });
 });
 
+// GET /flight-status-public — no auth required (used by home screen tracker for new users)
+// ---------------------------------------------------------------------------
+app.get("/flight-status-public", async (req, res) => {
+  const ident = String(req.query.ident || "").toUpperCase().replace(/\s/g, "");
+  if (!ident) return res.status(400).json({ error: "ident required" });
+  const status = await getFlightStatus(ident);
+  if (!status) return res.json({ ident, status: "Unknown", live: false });
+  res.json({ ident, live: true, ...status });
+});
 // GET /flight-status/:ident — path-param alias (app calls this form)
 // ---------------------------------------------------------------------------
 app.get("/flight-status/:ident", async (req, res) => {
@@ -4542,5 +4552,100 @@ app.get("/airports/:iata/ground-transport/:option_id/directions", auth, async (r
   });
 });
 
+
+
+// ─── Weekly digest push cron ─────────────────────────────────────────────────
+// Runs every 15 min; fires logic only on Sundays 8:00–8:15 UTC
+setInterval(async () => {
+  const now = new Date();
+  if (now.getUTCDay() !== 0) return;
+  if (now.getUTCHours() !== 8) return;
+  if (now.getUTCMinutes() > 15) return;
+  try {
+    const users = await sql`
+      SELECT email, first_name, push_token FROM users
+      WHERE push_token IS NOT NULL
+        AND (last_weekly_digest IS NULL OR last_weekly_digest < NOW() - INTERVAL '6 days')
+    `;
+    for (const user of users) {
+      try {
+        const tripRows = await sql`
+          SELECT COUNT(*) as count FROM trips
+          WHERE user_email = ${user.email}
+            AND created_at >= date_trunc('year', NOW())
+        `;
+        const tripCount = parseInt(tripRows[0]?.count || 0);
+        const nextRows = await sql`
+          SELECT t.title, tl.departs_at, tl.origin, tl.destination
+          FROM trips t
+          JOIN trip_legs tl ON tl.trip_id = t.id
+          WHERE t.user_email = ${user.email}
+            AND tl.type = 'flight'
+            AND tl.departs_at > NOW()
+          ORDER BY tl.departs_at ASC LIMIT 1
+        `;
+        const next = nextRows[0];
+        let body;
+        if (next) {
+          const days = Math.round((new Date(next.departs_at) - now) / 86400000);
+          body = `Next up: ${next.origin} → ${next.destination} in ${days} day${days !== 1 ? 's' : ''}. Wingman is watching.`;
+        } else if (tripCount > 0) {
+          body = `${tripCount} trip${tripCount !== 1 ? 's' : ''} tracked this year. Ready for your next adventure?`;
+        } else {
+          body = `Add your first trip and Wingman will watch it around the clock.`;
+        }
+        await sendPushToUser(
+          user.email,
+          `Good morning${user.first_name ? `, ${user.first_name}` : ''} ✈`,
+          body,
+          { screen: 'Home' }
+        );
+        await sql`UPDATE users SET last_weekly_digest = NOW() WHERE email = ${user.email}`;
+      } catch (e) {
+        console.error('[weekly-digest] user error:', e.message);
+      }
+    }
+    console.log(`[weekly-digest] sent to ${users.length} users`);
+  } catch (e) {
+    console.error('[weekly-digest] error:', e.message);
+  }
+}, 15 * 60 * 1000);
+
+// GET /me/next-trip-window — predicts next travel window from past trip patterns
+app.get('/me/next-trip-window', auth, async (req, res) => {
+  try {
+    const email = req.user?.email || req.email;
+    const trips = await sql`
+      SELECT t.id, MIN(tl.departs_at) as first_dep
+      FROM trips t
+      JOIN trip_legs tl ON tl.trip_id = t.id
+      WHERE t.user_email = ${email}
+        AND tl.type = 'flight'
+        AND tl.departs_at < NOW()
+      GROUP BY t.id
+      ORDER BY first_dep DESC
+      LIMIT 6
+    `;
+    if (trips.length < 2) return res.json({ window: null });
+    const dates = trips.map(t => new Date(t.first_dep).getTime()).sort((a, b) => a - b);
+    const gaps = [];
+    for (let i = 1; i < dates.length; i++) gaps.push(dates[i] - dates[i - 1]);
+    const avgGapMs = gaps.reduce((a, b) => a + b, 0) / gaps.length;
+    const avgGapDays = Math.round(avgGapMs / 86400000);
+    const lastTrip = new Date(Math.max(...dates));
+    const predictedNext = new Date(lastTrip.getTime() + avgGapMs);
+    const daysUntil = Math.round((predictedNext - Date.now()) / 86400000);
+    res.json({
+      window: {
+        predicted_date: predictedNext.toISOString(),
+        days_until: daysUntil,
+        avg_gap_days: avgGapDays,
+        last_trip_date: lastTrip.toISOString(),
+      }
+    });
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
 
 app.listen(PORT, () => console.log("Wingman API on http://localhost:" + PORT));
