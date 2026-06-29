@@ -336,6 +336,42 @@ async function bootstrapDB() {
         created_at TIMESTAMPTZ DEFAULT NOW()
       )
     `;
+    // ── Revealed-preference tables ─────────────────────────────────────────
+    await sql`
+      CREATE TABLE IF NOT EXISTS hotel_affinity (
+        id SERIAL PRIMARY KEY,
+        user_email TEXT NOT NULL,
+        property_name TEXT NOT NULL,
+        brand TEXT,
+        city TEXT,
+        country TEXT,
+        tier TEXT,
+        attributes JSONB DEFAULT '{}',
+        stay_count INTEGER DEFAULT 1,
+        last_stayed TIMESTAMPTZ,
+        source TEXT DEFAULT 'booking_import',
+        created_at TIMESTAMPTZ DEFAULT NOW(),
+        UNIQUE(user_email, property_name)
+      )
+    `;
+    await sql`
+      CREATE TABLE IF NOT EXISTS restaurant_affinity (
+        id SERIAL PRIMARY KEY,
+        user_email TEXT NOT NULL,
+        restaurant_name TEXT NOT NULL,
+        cuisine TEXT,
+        city TEXT,
+        country TEXT,
+        tier TEXT,
+        attributes JSONB DEFAULT '{}',
+        visit_count INTEGER DEFAULT 1,
+        last_visited TIMESTAMPTZ,
+        source TEXT DEFAULT 'manual',
+        created_at TIMESTAMPTZ DEFAULT NOW(),
+        UNIQUE(user_email, restaurant_name)
+      )
+    `;
+    await sql`ALTER TABLE users ADD COLUMN IF NOT EXISTS revealed_preferences JSONB DEFAULT '{}'`;
     console.log("[db] tables ready");
   } catch (e) {
     console.error("[db] bootstrap error:", e.message);
@@ -406,6 +442,63 @@ async function lookupHotelContact(hotelName, city) {
   } catch (e) {
     console.error("[hotel-contact] lookup error:", e.message);
     return null;
+  }
+}
+
+// ── Revealed-preference: extract hotel DNA and store affinity ─────────────────
+async function extractAndStoreHotelAffinity(userEmail, parsedBooking) {
+  try {
+    const hotelName = parsedBooking.carrier || parsedBooking.hotel_name;
+    if (!hotelName) return;
+    const city = parsedBooking.destination || null;
+    // Use Claude to extract brand, tier, and attributes from the hotel name
+    const prompt = `You are a hotel intelligence engine. Given this hotel name and city, extract structured data.
+Hotel: "${hotelName}"
+City: "${city || 'unknown'}"
+Return ONLY valid JSON:
+{
+  "brand": "parent brand or chain (e.g. Hoxton, Fontenille, Marriott, Hyatt, independent) or null",
+  "tier": "luxury|upper_upscale|upscale|boutique|budget",
+  "country": "country name or null",
+  "attributes": {
+    "design_forward": true/false,
+    "independent": true/false,
+    "lifestyle_brand": true/false,
+    "historic_property": true/false,
+    "urban": true/false,
+    "resort": true/false,
+    "small_luxury": true/false
+  }
+}`;
+    const resp = await getAnthropic().messages.create({
+      model: "claude-haiku-4-5",
+      max_tokens: 300,
+      messages: [{ role: "user", content: prompt }],
+    });
+    let meta;
+    try {
+      const raw = resp.content[0].text.trim().replace(/^```json\n?/, "").replace(/\n?```$/, "").trim();
+      meta = JSON.parse(raw);
+    } catch { return; }
+    // Upsert into hotel_affinity
+    await sql`
+      INSERT INTO hotel_affinity (user_email, property_name, brand, city, country, tier, attributes, stay_count, last_stayed, source)
+      VALUES (
+        ${userEmail}, ${hotelName}, ${meta.brand || null}, ${city}, ${meta.country || null},
+        ${meta.tier || null}, ${JSON.stringify(meta.attributes || {})}, 1,
+        ${parsedBooking.departs_at || new Date().toISOString()}, 'booking_import'
+      )
+      ON CONFLICT (user_email, property_name)
+      DO UPDATE SET
+        stay_count = hotel_affinity.stay_count + 1,
+        last_stayed = EXCLUDED.last_stayed,
+        brand = COALESCE(EXCLUDED.brand, hotel_affinity.brand),
+        tier = COALESCE(EXCLUDED.tier, hotel_affinity.tier),
+        attributes = hotel_affinity.attributes || EXCLUDED.attributes
+    `;
+    console.log("[hotel-affinity] stored:", hotelName, "for", userEmail);
+  } catch (e) {
+    console.error("[hotel-affinity] error:", e.message);
   }
 }
 
@@ -1265,6 +1358,10 @@ Return this exact JSON structure (null for unknown fields):
       sendHotelPreferenceEmail(userEmail, parsed, tripTitle).catch(e =>
         console.error("[hotel-pref-email]", e.message)
       );
+      // Feature D: Record hotel affinity from booking history
+      extractAndStoreHotelAffinity(userEmail, parsed).catch(e =>
+        console.error("[hotel-affinity]", e.message)
+      );
     }
     console.log("[gmail] stored trip:", tripTitle, "for", userEmail);
   } catch (e) {
@@ -1473,6 +1570,44 @@ app.delete("/trips/:id", async (req, res) => {
   }
 });
 
+// ── Perplexity live search grounding ───────────────────────────────────────────────────────────────────────────────
+async function getPerplexityGrounding(userMessage) {
+  const apiKey = process.env.PERPLEXITY_API_KEY;
+  if (!apiKey) return null;
+  // Only search for destination/hotel/restaurant queries — skip flight ops queries
+  const needsSearch = /hotel|restaurant|where to stay|where to eat|recommend|best|neighbourhood|neighborhood|things to do|activities|bar|cafe|coffee|brunch|dinner|lunch|breakfast|visit|explore|itinerary/i.test(userMessage);
+  if (!needsSearch) return null;
+  try {
+    const resp = await fetch("https://api.perplexity.ai/chat/completions", {
+      method: "POST",
+      headers: {
+        "Authorization": `Bearer ${apiKey}`,
+        "Content-Type": "application/json",
+      },
+      body: JSON.stringify({
+        model: "sonar",
+        messages: [
+          {
+            role: "system",
+            content: "You are a travel research assistant. Given a user's travel question, search the web and return a concise, factual summary of current recommendations. Focus on: specific hotel names with current status (open/closed), restaurant names with current status, neighbourhood descriptions, and any recent openings or closures. Be specific and cite recency where possible. Return plain text, no markdown headers."
+          },
+          { role: "user", content: userMessage }
+        ],
+        max_tokens: 600,
+        search_recency_filter: "month",
+        return_citations: false,
+      }),
+      signal: AbortSignal.timeout(8000),
+    });
+    if (!resp.ok) return null;
+    const data = await resp.json();
+    return data.choices?.[0]?.message?.content || null;
+  } catch (e) {
+    console.error("[perplexity]", e.message);
+    return null;
+  }
+}
+
 // ---------------------------------------------------------------------------
 // POST /concierge — LLM chat with trip context
 // ---------------------------------------------------------------------------
@@ -1482,9 +1617,9 @@ app.post("/concierge", async (req, res) => {
   const { message, history } = req.body || {};
   if (!message) return res.status(400).json({ error: "message required" });
   try {
-    // Fetch user preferences (taste graph), trips, and loyalty accounts in parallel
-    const [userRows, trips, loyaltyAccounts] = await Promise.all([
-      sql`SELECT preferences FROM users WHERE email = ${email}`,
+    // Fetch user preferences (taste graph), trips, loyalty accounts, and hotel affinity in parallel
+    const [userRows, trips, loyaltyAccounts, hotelAffinity] = await Promise.all([
+      sql`SELECT preferences, revealed_preferences FROM users WHERE email = ${email}`,
       sql`
       SELECT t.id, t.title, t.status, t.mode, t.created_at,
         json_agg(tl.* ORDER BY tl.departs_at ASC NULLS LAST) FILTER (WHERE tl.id IS NOT NULL) as legs
@@ -1495,10 +1630,14 @@ app.post("/concierge", async (req, res) => {
       ORDER BY t.created_at DESC
             LIMIT 10
     `,
-      sql`SELECT program, points_balance, elite_status, elite_level_next, points_to_next_level, nights_ytd, segments_ytd FROM loyalty_accounts WHERE user_email = ${email} ORDER BY program ASC`
+      sql`SELECT program, points_balance, elite_status, elite_level_next, points_to_next_level, nights_ytd, segments_ytd FROM loyalty_accounts WHERE user_email = ${email} ORDER BY program ASC`,
+      sql`SELECT property_name, brand, city, country, tier, attributes, stay_count, last_stayed FROM hotel_affinity WHERE user_email = ${email} ORDER BY stay_count DESC, last_stayed DESC LIMIT 20`
     ]);
     const prefs = userRows[0]?.preferences || {};
+    const revealedPrefs = userRows[0]?.revealed_preferences || {};
     const today = new Date().toISOString();
+    // Perplexity live search grounding for destination/hotel/restaurant queries
+    const liveSearchContext = await getPerplexityGrounding(message).catch(() => null);
 
     // Enrich trips with live flight status + weather risk (in parallel, best-effort)
     const enrichedTrips = await Promise.all(trips.map(async (trip) => {
@@ -1583,13 +1722,27 @@ app.post("/concierge", async (req, res) => {
       biz_forward_facing: "Business: forward facing only", first_suite: "First: enclosed suite",
       first_forward: "First: forward facing", first_window: "First: window/wall side",
     };
+    // Build hotel affinity section from revealed preferences (booking history)
+    const hotelAffinitySection = hotelAffinity && hotelAffinity.length > 0
+      ? (() => {
+          const lines = hotelAffinity.map(h => {
+            const attrs = h.attributes || {};
+            const tags = Object.entries(attrs).filter(([,v]) => v).map(([k]) => k.replace(/_/g, ' ')).join(', ');
+            const stays = h.stay_count > 1 ? ` (${h.stay_count} stays)` : '';
+            const loc = [h.city, h.country].filter(Boolean).join(', ');
+            return `  - ${h.property_name}${loc ? ` (${loc})` : ''}${h.brand ? ` · Brand: ${h.brand}` : ''}${h.tier ? ` · Tier: ${h.tier}` : ''}${tags ? ` · ${tags}` : ''}${stays}`;
+          }).join('\n');
+          return `Hotels this user has actually stayed at (REVEALED preferences — weight these heavily):\n${lines}\n\nWhen recommending hotels:\n1. If the user's preferred brand/property exists in the destination city, recommend it FIRST\n2. If it doesn't exist, find the closest DNA match (same tier, same design sensibility, same attributes)\n3. If the user explicitly names a hotel they want, try to book it; if sold out, find the closest alternative and explain why`;
+        })()
+      : null;
     const tasteSection = [
       editorialSources.length > 0
         ? `Editorial sources this user trusts (use these as your recommendation lens):\n${editorialSources.map(s => `  - ${SOURCE_LABELS[s] || s}`).join("\n")}`
         : null,
       hotelPrefs.length > 0
-        ? `Hotel preferences (always mention/prioritize when recommending hotels):\n  ${hotelPrefs.map(p => HOTEL_LABELS[p] || p).join(", ")}`
+        ? `Hotel soft-specs (always apply when recommending hotels):\n  ${hotelPrefs.map(p => HOTEL_LABELS[p] || p).join(", ")}`
         : null,
+      hotelAffinitySection,
       seatPrefs.length > 0
         ? `Seat preferences (use when advising on seat selection or upgrades):\n  ${seatPrefs.map(p => SEAT_LABELS[p] || p).join(", ")}`
         : null,
@@ -1620,6 +1773,7 @@ Today's date/time: ${today}
 User: ${email}
 ${tasteSection ? `=== USER'S TASTE PROFILE ===\n${tasteSection}\n` : ""}
 ${loyaltySummary ? `=== USER'S LOYALTY ACCOUNTS ===\n${loyaltySummary}\n\nWhen recommending hotels, always factor in which programs the user has status with and suggest properties where their status will be recognized. When advising on flights, factor in their airline status and miles balance — suggest using miles for upgrades when the balance is high.\n` : ""}
+${liveSearchContext ? `=== LIVE SEARCH RESULTS (current as of today — use these to ground your recommendations) ===\n${liveSearchContext}\n\nIMPORTANT: Prioritize information from the live search results above your training data when they conflict. If the search results mention a restaurant or hotel is closed, do not recommend it.\n` : ""}
 === USER'S TRIPS (with live data) ===
 ${tripsSummary}
 
@@ -4878,6 +5032,35 @@ app.get('/me/next-trip-window', auth, async (req, res) => {
         last_trip_date: lastTrip.toISOString(),
       }
     });
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
+
+// ── Hotel affinity endpoints ─────────────────────────────────────────────────
+// GET /me/hotel-affinity — returns user's learned hotel preferences from booking history
+app.get('/me/hotel-affinity', auth, async (req, res) => {
+  try {
+    const email = req.user?.email || req.email;
+    const rows = await sql`
+      SELECT property_name, brand, city, country, tier, attributes, stay_count, last_stayed
+      FROM hotel_affinity WHERE user_email = ${email}
+      ORDER BY stay_count DESC, last_stayed DESC
+    `;
+    const revRows = await sql`SELECT revealed_preferences FROM users WHERE email = ${email}`;
+    res.json({ ok: true, hotels: rows, revealed: revRows[0]?.revealed_preferences || {} });
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
+// DELETE /me/hotel-affinity/:id — remove a hotel from affinity (user correction)
+app.delete('/me/hotel-affinity/:propertyName', auth, async (req, res) => {
+  try {
+    const email = req.user?.email || req.email;
+    await sql`DELETE FROM hotel_affinity WHERE user_email = ${email} AND property_name = ${req.params.propertyName}`;
+    res.json({ ok: true });
   } catch (e) {
     res.status(500).json({ error: e.message });
   }
