@@ -1768,7 +1768,7 @@ async function getPerplexityGrounding(userMessage) {
 app.post("/concierge", async (req, res) => {
   const email = await verifyAccessToken(req);
   if (!email) return res.status(401).json({ error: "unauthorized" });
-  const { message, history } = req.body || {};
+  const { message, history, location } = req.body || {};
   if (!message) return res.status(400).json({ error: "message required" });
   try {
     // Fetch user preferences (taste graph), trips, loyalty accounts, and hotel affinity in parallel
@@ -1789,6 +1789,11 @@ app.post("/concierge", async (req, res) => {
     const prefs = userRows[0]?.preferences || {};
     const revealedPrefs = userRows[0]?.revealed_preferences || {};
     const today = new Date().toISOString();
+    const locationContext = location?.city
+      ? `User's current location: ${location.city}${location.country ? ', ' + location.country : ''}${location.lat ? ` (${location.lat.toFixed(3)}, ${location.lon?.toFixed(3) || location.lng?.toFixed(3)})` : ''}`
+      : location?.lat
+      ? `User's current coordinates: ${location.lat.toFixed(4)}, ${(location.lon || location.lng || 0).toFixed(4)}`
+      : null;
     // Perplexity live search grounding for destination/hotel/restaurant queries
     const liveSearchContext = await getPerplexityGrounding(message).catch(() => null);
 
@@ -1926,6 +1931,7 @@ Today's date/time: ${today}
 User: ${email}
 ${tasteSection ? `=== USER'S TASTE PROFILE ===\n${tasteSection}\n` : ""}
 ${loyaltySummary ? `=== USER'S LOYALTY ACCOUNTS ===\n${loyaltySummary}\n\nWhen recommending hotels, always factor in which programs the user has status with and suggest properties where their status will be recognized. When advising on flights, factor in their airline status and miles balance — suggest using miles for upgrades when the balance is high.\n` : ""}
+${locationContext ? `=== USER'S CURRENT LOCATION ===\n${locationContext}\nUse this to give hyper-local recommendations. If the user asks "what should I do" or "where should I eat" without specifying a city, assume they mean right now, right here.\n` : ""}
 ${liveSearchContext ? `=== LIVE SEARCH RESULTS (current as of today — use these to ground your recommendations) ===\n${liveSearchContext}\n\nIMPORTANT: Prioritize information from the live search results above your training data when they conflict. If the search results mention a restaurant or hotel is closed, do not recommend it.\n` : ""}
 === USER'S TRIPS (with live data) ===
 ${tripsSummary}
@@ -1972,13 +1978,21 @@ LOGISTICS & PLANNING
 - Currency, SIM cards, packing lists
 - Day-by-day itinerary building
 
+=== RESPONSE FORMAT — CRITICAL ===
+- NEVER use markdown: no #, ##, **, *, -, bullet points, or any other markdown syntax
+- Write in plain conversational prose only — like a text message from a knowledgeable friend
+- Keep opening responses to 2-3 sentences maximum unless the user explicitly asks for a full breakdown
+- If the user asks a broad question, give ONE specific recommendation first, then ask a clarifying question
+- Do not list capabilities or introduce yourself unless directly asked
+- Never start a response with "I" or "As your"
+
 === RECOMMENDATION STYLE ===
 - Be specific: name the restaurant, the hotel, the neighbourhood. Never say "there are many great options."
 - Be opinionated: say what you actually recommend and why, like a trusted friend
-- Be concise: 2–4 sentences per recommendation unless the user asks for more detail
-- Reference the user's taste profile in every recommendation — if they trust Hotels Above Par, recommend boutique hotels; if they trust Eater, recommend the hot new openings
+- One recommendation at a time — give the best option, not a list of five
+- Reference the user's taste profile in every recommendation
 - Trip modes: [CLIENT TRIP] = prioritize prestige, private dining, car service; [PARTNER/LEISURE TRIP] = romance, design-forward boutique hotels, chef's table dinners; no mode = solo/efficiency
-- If the user is in a disruption situation, lead with the rescue options first, then offer destination intel
+- If the user is in a disruption situation, lead with the rescue options first
 - If data is missing or stale, say so honestly`;
 
 
@@ -1997,7 +2011,15 @@ LOGISTICS & PLANNING
       system: systemMsg,
       messages: chatMessages,
     });
-    const reply = claudeResp.content[0].text;
+    // Strip any markdown that slips through — render as plain text on mobile
+    const rawReply = claudeResp.content[0].text;
+    const reply = rawReply
+      .replace(/^#{1,6}\s+/gm, '')          // remove # headings
+      .replace(/\*\*([^*]+)\*\*/g, '$1')    // remove **bold**
+      .replace(/\*([^*]+)\*/g, '$1')        // remove *italic*
+      .replace(/^[\-\*]\s+/gm, '\u2022 ')  // convert bullet - to bullet point
+      .replace(/\n{3,}/g, '\n\n')           // collapse triple newlines
+      .trim();
     // Award points for first concierge message (idempotent)
     awardPoints(email, "concierge_first").catch(() => {});
     res.json({ ok: true, reply });
@@ -2507,7 +2529,7 @@ app.get("/debug/concierge", async (req, res) => {
   res.json(results);
 });
 
-app.get("/health", (_req, res) => res.json({ ok: true, ts: Date.now(), version: "2.7.4" }));
+app.get("/health", (_req, res) => res.json({ ok: true, ts: Date.now(), version: "2.7.5" }));
 
 // ---------------------------------------------------------------------------
 // Disruption polling cron — runs every 15 min
