@@ -1764,7 +1764,7 @@ app.post("/concierge", async (req, res) => {
   try {
     // Fetch user preferences (taste graph), trips, loyalty accounts, and hotel affinity in parallel
     const [userRows, trips, loyaltyAccounts, hotelAffinity] = await Promise.all([
-      sql`SELECT preferences, revealed_preferences FROM users WHERE email = ${email}`,
+      sql`SELECT preferences, COALESCE(revealed_preferences, '{}') as revealed_preferences FROM users WHERE email = ${email}`,
       sql`
       SELECT t.id, t.title, t.status, t.mode, t.created_at,
         json_agg(tl.* ORDER BY tl.departs_at ASC NULLS LAST) FILTER (WHERE tl.id IS NOT NULL) as legs
@@ -2470,7 +2470,7 @@ app.get("/insights/roi", auth, async (req, res) => {
   }
 });
 
-app.get("/health", (_req, res) => res.json({ ok: true, ts: Date.now(), version: "2.7.0" }));
+app.get("/health", (_req, res) => res.json({ ok: true, ts: Date.now(), version: "2.7.1" }));
 
 // ---------------------------------------------------------------------------
 // Disruption polling cron — runs every 15 min
@@ -5380,7 +5380,7 @@ app.get('/me/hotel-affinity', auth, async (req, res) => {
       FROM hotel_affinity WHERE user_email = ${email}
       ORDER BY stay_count DESC, last_stayed DESC
     `;
-    const revRows = await sql`SELECT revealed_preferences FROM users WHERE email = ${email}`;
+    const revRows = await sql`SELECT COALESCE(revealed_preferences, '{}') as revealed_preferences FROM users WHERE email = ${email}`;
     res.json({ ok: true, hotels: rows, revealed: revRows[0]?.revealed_preferences || {} });
   } catch (e) {
     res.status(500).json({ error: e.message });
