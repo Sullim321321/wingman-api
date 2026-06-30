@@ -2470,7 +2470,36 @@ app.get("/insights/roi", auth, async (req, res) => {
   }
 });
 
-app.get("/health", (_req, res) => res.json({ ok: true, ts: Date.now(), version: "2.7.1" }));
+// ---------------------------------------------------------------------------
+// GET /debug/concierge — temporary diagnostic: test each concierge query individually
+// ---------------------------------------------------------------------------
+app.get("/debug/concierge", async (req, res) => {
+  const h = req.headers.authorization || "";
+  const t = h.startsWith("Bearer ") ? h.slice(7) : null;
+  if (!t) return res.status(401).json({ error: "no token" });
+  let email;
+  try { email = jwt.verify(t, JWT_SECRET).email; } catch(e) { return res.status(401).json({ error: "bad token" }); }
+  const results = {};
+  try {
+    await sql`SELECT preferences, COALESCE(revealed_preferences, '{}') as revealed_preferences FROM users WHERE email = ${email}`;
+    results.q1_users = "OK";
+  } catch(e) { results.q1_users = "FAIL: " + e.message; }
+  try {
+    await sql`SELECT t.id, t.title, t.status, t.mode, t.created_at, json_agg(tl.* ORDER BY tl.departs_at ASC NULLS LAST) FILTER (WHERE tl.id IS NOT NULL) as legs FROM trips t LEFT JOIN trip_legs tl ON tl.trip_id = t.id WHERE t.user_email = ${email} GROUP BY t.id ORDER BY t.created_at DESC LIMIT 10`;
+    results.q2_trips = "OK";
+  } catch(e) { results.q2_trips = "FAIL: " + e.message; }
+  try {
+    await sql`SELECT program, points_balance, elite_status FROM loyalty_accounts WHERE user_email = ${email} ORDER BY program ASC`;
+    results.q3_loyalty = "OK";
+  } catch(e) { results.q3_loyalty = "FAIL: " + e.message; }
+  try {
+    await sql`SELECT property_name, brand, city, country, tier, attributes, stay_count, last_stayed FROM hotel_affinity WHERE user_email = ${email} ORDER BY stay_count DESC, last_stayed DESC LIMIT 20`;
+    results.q4_hotels = "OK";
+  } catch(e) { results.q4_hotels = "FAIL: " + e.message; }
+  res.json(results);
+});
+
+app.get("/health", (_req, res) => res.json({ ok: true, ts: Date.now(), version: "2.7.2" }));
 
 // ---------------------------------------------------------------------------
 // Disruption polling cron — runs every 15 min
