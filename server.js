@@ -1763,21 +1763,20 @@ app.post("/concierge", async (req, res) => {
   if (!message) return res.status(400).json({ error: "message required" });
   try {
     // Fetch user preferences (taste graph), trips, loyalty accounts, and hotel affinity in parallel
-    const [userRows, trips, loyaltyAccounts, hotelAffinity] = await Promise.all([
+    const [userRows, rawTrips, rawLegs, loyaltyAccounts, hotelAffinity] = await Promise.all([
       sql`SELECT preferences, COALESCE(revealed_preferences, '{}') as revealed_preferences FROM users WHERE email = ${email}`,
-      sql`
-      SELECT t.id, t.title, t.status, t.mode, t.created_at,
-        json_agg(tl.* ORDER BY tl.departs_at ASC NULLS LAST) FILTER (WHERE tl.id IS NOT NULL) as legs
-      FROM trips t
-      LEFT JOIN trip_legs tl ON tl.trip_id = t.id
-      WHERE t.user_email = ${email}
-      GROUP BY t.id
-      ORDER BY t.created_at DESC
-            LIMIT 10
-    `,
+      sql`SELECT id, title, status, mode, created_at FROM trips WHERE user_email = ${email} ORDER BY created_at DESC LIMIT 10`,
+      sql`SELECT tl.* FROM trip_legs tl INNER JOIN trips t ON tl.trip_id = t.id WHERE t.user_email = ${email} ORDER BY tl.departs_at ASC NULLS LAST`,
       sql`SELECT program, points_balance, elite_status, elite_level_next, points_to_next_level, nights_ytd, segments_ytd FROM loyalty_accounts WHERE user_email = ${email} ORDER BY program ASC`,
       sql`SELECT property_name, brand, city, country, tier, attributes, stay_count, last_stayed FROM hotel_affinity WHERE user_email = ${email} ORDER BY stay_count DESC, last_stayed DESC LIMIT 20`
     ]);
+    // Assemble trips with legs (avoids json_agg ORDER BY Neon compatibility issue)
+    const legsByTrip = {};
+    for (const leg of rawLegs) {
+      if (!legsByTrip[leg.trip_id]) legsByTrip[leg.trip_id] = [];
+      legsByTrip[leg.trip_id].push(leg);
+    }
+    const trips = rawTrips.map(t => ({ ...t, legs: legsByTrip[t.id] || [] }));
     const prefs = userRows[0]?.preferences || {};
     const revealedPrefs = userRows[0]?.revealed_preferences || {};
     const today = new Date().toISOString();
@@ -2499,7 +2498,7 @@ app.get("/debug/concierge", async (req, res) => {
   res.json(results);
 });
 
-app.get("/health", (_req, res) => res.json({ ok: true, ts: Date.now(), version: "2.7.2" }));
+app.get("/health", (_req, res) => res.json({ ok: true, ts: Date.now(), version: "2.7.3" }));
 
 // ---------------------------------------------------------------------------
 // Disruption polling cron — runs every 15 min
