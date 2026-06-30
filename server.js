@@ -378,6 +378,15 @@ async function bootstrapDB() {
     await sql`ALTER TABLE users ADD COLUMN IF NOT EXISTS apple_sub TEXT`;
     await sql`ALTER TABLE users ADD COLUMN IF NOT EXISTS phone TEXT`;
     await sql`ALTER TABLE users ADD COLUMN IF NOT EXISTS display_name TEXT`;
+    // ── Ensure all trips columns exist (safe for older production schemas) ──
+    await sql`ALTER TABLE trips ADD COLUMN IF NOT EXISTS status TEXT DEFAULT 'upcoming'`;
+    await sql`ALTER TABLE trips ADD COLUMN IF NOT EXISTS source TEXT DEFAULT 'manual'`;
+    await sql`ALTER TABLE trips ADD COLUMN IF NOT EXISTS mode TEXT DEFAULT 'solo'`;
+    await sql`ALTER TABLE trips ADD COLUMN IF NOT EXISTS raw_email_id TEXT`;
+    await sql`ALTER TABLE trips ADD COLUMN IF NOT EXISTS updated_at TIMESTAMPTZ DEFAULT NOW()`;
+    // ── Ensure all trip_legs columns exist ──
+    await sql`ALTER TABLE trip_legs ADD COLUMN IF NOT EXISTS status TEXT DEFAULT 'upcoming'`;
+    await sql`ALTER TABLE trip_legs ADD COLUMN IF NOT EXISTS raw_data JSONB`;
     console.log("[db] tables ready");
   } catch (e) {
     console.error("[db] bootstrap error:", e.message);
@@ -2484,7 +2493,7 @@ app.get("/debug/concierge", async (req, res) => {
     results.q1_users = "OK";
   } catch(e) { results.q1_users = "FAIL: " + e.message; }
   try {
-    await sql`SELECT t.id, t.title, t.status, t.mode, t.created_at, json_agg(tl.* ORDER BY tl.departs_at ASC NULLS LAST) FILTER (WHERE tl.id IS NOT NULL) as legs FROM trips t LEFT JOIN trip_legs tl ON tl.trip_id = t.id WHERE t.user_email = ${email} GROUP BY t.id ORDER BY t.created_at DESC LIMIT 10`;
+    await sql`SELECT id, title, status, mode, created_at FROM trips WHERE user_email = ${email} ORDER BY created_at DESC LIMIT 10`;
     results.q2_trips = "OK";
   } catch(e) { results.q2_trips = "FAIL: " + e.message; }
   try {
@@ -2498,7 +2507,7 @@ app.get("/debug/concierge", async (req, res) => {
   res.json(results);
 });
 
-app.get("/health", (_req, res) => res.json({ ok: true, ts: Date.now(), version: "2.7.3" }));
+app.get("/health", (_req, res) => res.json({ ok: true, ts: Date.now(), version: "2.7.4" }));
 
 // ---------------------------------------------------------------------------
 // Disruption polling cron — runs every 15 min
