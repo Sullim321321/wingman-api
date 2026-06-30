@@ -93,7 +93,10 @@ async function bootstrapDB() {
       )
     `;
     // Add columns to existing users tables (idempotent)
+    // ── Ensure all users columns exist (safe for older production schemas) ──
+    await sql`ALTER TABLE users ADD COLUMN IF NOT EXISTS preferences JSONB DEFAULT '{}'`;
     await sql`ALTER TABLE users ADD COLUMN IF NOT EXISTS first_name TEXT`;
+    await sql`ALTER TABLE users ADD COLUMN IF NOT EXISTS taste_profile JSONB DEFAULT '{}'`;
     await sql`ALTER TABLE users ADD COLUMN IF NOT EXISTS subscription_tier TEXT DEFAULT 'free'`;
     await sql`ALTER TABLE users ADD COLUMN IF NOT EXISTS subscription_status TEXT DEFAULT 'inactive'`;
     await sql`ALTER TABLE users ADD COLUMN IF NOT EXISTS stripe_customer_id TEXT`;
