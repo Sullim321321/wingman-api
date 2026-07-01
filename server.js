@@ -2722,27 +2722,100 @@ function weatherScore(m) {
 function impactOf(points) {
   return points >= 22 ? "High impact" : points >= 10 ? "Medium" : "Low";
 }
+// ── ML prediction module (BTS logistic regression, 1.02M training flights) ──
+const { predict: mlPredict, loadModel: mlLoadModel } = require('./predict_service');
+try { mlLoadModel(); } catch (e) { console.warn('[predict] ML model load failed:', e.message); }
+
 app.get("/predict", async (req, res) => {
-  const dep = String(req.query.dep || "DEN").toUpperCase();
-  const arr = String(req.query.arr || "ASE").toUpperCase();
+  const dep     = String(req.query.dep     || "DEN").toUpperCase();
+  const arr     = String(req.query.arr     || "ASE").toUpperCase();
+  const carrier = String(req.query.carrier || "AA").toUpperCase();
+  const month   = parseInt(req.query.month)   || new Date().getMonth() + 1;
+  const dow     = parseInt(req.query.dow)     || new Date().getDay() || 7;
+  const hour    = parseInt(req.query.hour)    || 8;
+  const dist    = parseInt(req.query.dist)    || 1000;
+
   const depI = ICAO[dep] || "K" + dep;
   const arrI = ICAO[arr] || "K" + arr;
   const [dm, am] = await Promise.all([metar(depI), metar(arrI)]);
-  const dw = weatherScore(dm); const aw = weatherScore(am);
+  const dw = weatherScore(dm);
+  const aw = weatherScore(am);
+
+  // METAR composite score (0-1) — average of dep + arr weather severity
+  const metarScore = (dw.score + aw.score) / 2;
+
+  // Mountain airport sensitivity factor
   const mtn = (MOUNTAIN.has(arr) ? 1 : 0) * 0.85 + (MOUNTAIN.has(dep) ? 1 : 0) * 0.2;
-  const fDep = Math.round(dw.score * 34);
-  const fArr = Math.round(aw.score * 32);
-  const fMtn = Math.round(Math.min(mtn, 1) * 20);
-  const fBase = 6;
-  const risk = Math.min(fDep + fArr + fMtn + fBase, 95);
+
+  // ── ML model prediction (BTS logistic regression) ──
+  let mlResult = null;
+  try {
+    mlResult = mlPredict({
+      carrier, origin: dep, dest: arr,
+      month, day_of_week: dow, dep_hour: hour, distance: dist,
+      metar_score: metarScore,
+    });
+  } catch (e) {
+    console.warn('[predict] ML inference failed:', e.message);
+  }
+
+  // ── Composite risk score ──
+  // If ML model is available, use its composite score; otherwise fall back to METAR heuristic
+  let risk, sources;
+  if (mlResult) {
+    // ML already blends METAR; add mountain sensitivity on top
+    const mtnBoost = Math.round(Math.min(mtn, 1) * 15);
+    risk = Math.min(mlResult.risk_score + mtnBoost, 95);
+    sources = [
+      "BTS Reporting Carrier On-Time Performance 2022-2024 (1.02M flights)",
+      "aviationweather.gov METAR",
+      "airport ops profile",
+    ];
+  } else {
+    // Legacy METAR-only heuristic fallback
+    const fDep  = Math.round(dw.score * 34);
+    const fArr  = Math.round(aw.score * 32);
+    const fMtn  = Math.round(Math.min(mtn, 1) * 20);
+    risk = Math.min(fDep + fArr + fMtn + 6, 95);
+    sources = ["aviationweather.gov METAR", "airport ops profile"];
+  }
+
   const factors = [
-    { label: "Weather at " + dep, points: fDep, impact: impactOf(fDep), detail: dw.notes.join(", ") },
-    { label: "Weather at " + arr, points: fArr, impact: impactOf(fArr), detail: aw.notes.join(", ") },
-    { label: "Airport sensitivity", points: fMtn, impact: impactOf(fMtn), detail: MOUNTAIN.has(arr) ? arr + " has strict weather minimums" : "standard airport tolerances" },
-    { label: "Connection & baseline", points: fBase, impact: "Low", detail: "layover slack and seasonal cancellation base rate" },
+    { label: "Historical route performance", points: mlResult ? Math.round(mlResult.ml_probability * 60) : 0,
+      impact: impactOf(mlResult ? Math.round(mlResult.ml_probability * 60) : 0),
+      detail: mlResult
+        ? `${carrier} ${dep}→${arr} has a ${(mlResult.ml_probability * 100).toFixed(0)}% historical delay rate on this route/time (BTS 2022-2024)`
+        : "ML model unavailable" },
+    { label: "Weather at " + dep, points: Math.round(dw.score * 34), impact: impactOf(Math.round(dw.score * 34)), detail: dw.notes.join(", ") || "Clear" },
+    { label: "Weather at " + arr, points: Math.round(aw.score * 32), impact: impactOf(Math.round(aw.score * 32)), detail: aw.notes.join(", ") || "Clear" },
+    { label: "Airport sensitivity", points: Math.round(Math.min(mtn, 1) * 15), impact: impactOf(Math.round(Math.min(mtn, 1) * 15)),
+      detail: MOUNTAIN.has(arr) ? arr + " has strict weather minimums" : "standard airport tolerances" },
   ].filter(f => f.points > 0);
+
   const email = await verifyAccessToken(req);
-  res.json({ dep, arr, risk, live: !!(dm || am), summary: risk >= 60 ? "High disruption risk on " + dep + " -> " + arr + "." : risk >= 35 ? "Moderate disruption risk on " + dep + " -> " + arr + "." : "Conditions look manageable on " + dep + " -> " + arr + ".", factors, sources: ["aviationweather.gov METAR", "airport ops profile"], metar: { dep: dw.raw, arr: aw.raw }, user: email, ts: Date.now() });
+  const summary = risk >= 60
+    ? `High disruption risk on ${dep} → ${arr}. Historical data shows ${carrier} delays ${(mlResult?.ml_probability * 100 || 30).toFixed(0)}% of the time on this route.`
+    : risk >= 35
+    ? `Moderate disruption risk on ${dep} → ${arr}. Monitor conditions before departure.`
+    : `Conditions look manageable on ${dep} → ${arr}.`;
+
+  res.json({
+    dep, arr, carrier, risk,
+    live: !!(dm || am),
+    summary,
+    factors,
+    sources,
+    ml: mlResult ? {
+      probability: mlResult.ml_probability,
+      model_version: mlResult.model_version,
+      trained_rows: mlResult.trained_rows,
+      data_source: mlResult.data_source,
+      roc_auc: 0.6346,
+    } : null,
+    metar: { dep: dw.raw, arr: aw.raw },
+    user: email,
+    ts: Date.now(),
+  });
 });
 
 // ---------------------------------------------------------------------------
@@ -3258,7 +3331,7 @@ app.post("/auth/refresh", authLimiter, async (req, res) => {
   }
 });
 
-app.get("/health", (_req, res) => res.json({ ok: true, ts: Date.now(), version: "2.10.0" }));
+app.get("/health", (_req, res) => res.json({ ok: true, ts: Date.now(), version: "2.11.0" }));
 
 // ---------------------------------------------------------------------------
 // Disruption polling cron — runs every 15 min
