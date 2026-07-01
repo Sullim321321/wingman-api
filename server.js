@@ -105,7 +105,8 @@ if (!JWT_SECRET) {
   console.error("FATAL: JWT_SECRET env var not set. Refusing to start.");
   process.exit(1);
 }
-const JWT_EXPIRES_IN = "30d";
+const JWT_EXPIRES_IN = "15m";   // Short-lived access token
+const REFRESH_TOKEN_TTL_DAYS = 30; // Rotating refresh token TTL
 
 // ── Field-level encryption for OAuth tokens stored in DB ─────────────────────
 // ENCRYPTION_KEY must be a 64-char hex string (32 bytes) set in env
@@ -152,6 +153,32 @@ function sanitiseEmail(e) {
 function sanitiseStr(s, maxLen = 500) {
   if (!s || typeof s !== "string") return "";
   return s.trim().slice(0, maxLen);
+}
+
+// ── PII scrubber — strips sensitive patterns before sending to Anthropic ────────
+// Patterns: credit/debit card numbers, passport numbers, SSNs, IBAN, sort codes
+const PII_PATTERNS = [
+  // Credit/debit card numbers (13-19 digits, optionally space/dash separated)
+  { pattern: /(?:\d[ -]?){13,19}/g,                          replacement: "[card number removed]" },
+  // US Social Security Numbers
+  { pattern: /\d{3}[- ]?\d{2}[- ]?\d{4}/g,                  replacement: "[SSN removed]" },
+  // Passport numbers (common formats: letter(s) + 6-9 digits)
+  { pattern: /[A-Z]{1,2}\d{6,9}/g,                           replacement: "[passport number removed]" },
+  // IBAN (2 letters + 2 digits + up to 30 alphanumeric)
+  { pattern: /[A-Z]{2}\d{2}[A-Z0-9]{4,30}/g,                 replacement: "[IBAN removed]" },
+  // UK sort codes
+  { pattern: /\d{2}[- ]?\d{2}[- ]?\d{2}/g,                   replacement: "[sort code removed]" },
+  // CVV / CVC (3-4 digits preceded by cvv/cvc/security code label)
+  { pattern: /(?:cvv|cvc|security code)[:\s]*\d{3,4}/gi,     replacement: "[CVV removed]" },
+];
+
+function scrubPII(text) {
+  if (!text || typeof text !== "string") return text;
+  let scrubbed = text;
+  for (const { pattern, replacement } of PII_PATTERNS) {
+    scrubbed = scrubbed.replace(pattern, replacement);
+  }
+  return scrubbed;
 }
 
 function auth(req, res, next) {
@@ -748,6 +775,34 @@ async function logActivity(userEmail, type, title, body, tripId = null, legId = 
 function signAccessToken(email) {
   return jwt.sign({ email, type: "access" }, JWT_SECRET, { expiresIn: JWT_EXPIRES_IN });
 }
+
+// Generate a cryptographically random refresh token, store its SHA-256 hash in DB
+async function issueRefreshToken(email) {
+  const raw = crypto.randomBytes(40).toString("hex"); // 80-char hex string
+  const hash = crypto.createHash("sha256").update(raw).digest("hex");
+  const expiresAt = new Date(Date.now() + REFRESH_TOKEN_TTL_DAYS * 86400 * 1000);
+  // Invalidate all previous refresh tokens for this user (single active session per user)
+  await sql`DELETE FROM refresh_tokens WHERE user_email = ${email}`;
+  await sql`
+    INSERT INTO refresh_tokens (user_email, token_hash, expires_at)
+    VALUES (${email}, ${hash}, ${expiresAt.toISOString()})
+  `;
+  return raw; // Return the raw token to send to the client (never stored)
+}
+
+// Verify a raw refresh token — returns email or null
+async function consumeRefreshToken(raw) {
+  if (!raw || typeof raw !== "string") return null;
+  const hash = crypto.createHash("sha256").update(raw).digest("hex");
+  const rows = await sql`
+    SELECT user_email, expires_at FROM refresh_tokens
+    WHERE token_hash = ${hash} AND expires_at > NOW()
+  `;
+  if (!rows.length) return null;
+  // Rotate: delete the used token immediately (prevents replay)
+  await sql`DELETE FROM refresh_tokens WHERE token_hash = ${hash}`;
+  return rows[0].user_email;
+}
 async function verifyAccessToken(req) {
   const h = req.headers.authorization || "";
   const t = h.startsWith("Bearer ") ? h.slice(7) : null;
@@ -971,9 +1026,10 @@ app.post("/auth/verify", authLimiter, async (req, res) => {
       ON CONFLICT (email) DO NOTHING
     `;
     const token = signAccessToken(email);
+    const refreshToken = await issueRefreshToken(email);
     // Award signup points (idempotent)
     awardPoints(email, "signup").catch(() => {});
-    res.json({ ok: true, token, email });
+    res.json({ ok: true, token, refreshToken, email });
   } catch (e) {
     console.error("[auth/verify]", e.message);
     res.status(500).json({ error: "verification failed" });
@@ -2064,8 +2120,10 @@ async function getPerplexityGrounding(userMessage) {
 app.post("/concierge", conciergeLimiter, async (req, res) => {
   const email = await verifyAccessToken(req);
   if (!email) return res.status(401).json({ error: "unauthorized" });
-  const { message, history, location } = req.body || {};
-  if (!message) return res.status(400).json({ error: "message required" });
+  const { message: rawMessage, history, location } = req.body || {};
+  if (!rawMessage) return res.status(400).json({ error: "message required" });
+  // Scrub PII from user message before it reaches Anthropic
+  const message = scrubPII(rawMessage);
   try {
     // Fetch user preferences (taste graph), trips, loyalty accounts, and hotel affinity in parallel
     const [userRows, rawTrips, rawLegs, loyaltyAccounts, hotelAffinity] = await Promise.all([
@@ -2316,9 +2374,13 @@ LOGISTICS & PLANNING
 - If no direct URL is available, say so honestly and suggest the best alternative (phone number, walk-in timing, etc.)`;
 
 
+    // Scrub PII from history messages too
+    const safeHistory = Array.isArray(history)
+      ? history.slice(-10).map(m => ({ ...m, content: scrubPII(m.content) }))
+      : [];
     const messages = [
       { role: "system", content: systemPrompt },
-      ...(Array.isArray(history) ? history.slice(-10) : []),
+      ...safeHistory,
       { role: "user", content: message },
     ];
 
@@ -2871,7 +2933,23 @@ app.get("/weather", async (req, res) => {
   }
 });
 
-app.get("/health", (_req, res) => res.json({ ok: true, ts: Date.now(), version: "2.8.0" }));
+// POST /auth/refresh — exchange a valid refresh token for a new access + refresh token pair
+app.post("/auth/refresh", authLimiter, async (req, res) => {
+  const { refreshToken } = req.body || {};
+  if (!refreshToken) return res.status(400).json({ error: "refreshToken required" });
+  try {
+    const email = await consumeRefreshToken(refreshToken);
+    if (!email) return res.status(401).json({ error: "invalid or expired refresh token" });
+    const token = signAccessToken(email);
+    const newRefreshToken = await issueRefreshToken(email);
+    res.json({ ok: true, token, refreshToken: newRefreshToken, email });
+  } catch (e) {
+    console.error("[auth/refresh]", e.message);
+    res.status(500).json({ error: "refresh failed" });
+  }
+});
+
+app.get("/health", (_req, res) => res.json({ ok: true, ts: Date.now(), version: "2.9.1" }));
 
 // ---------------------------------------------------------------------------
 // Disruption polling cron — runs every 15 min
