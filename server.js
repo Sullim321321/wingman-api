@@ -2054,19 +2054,29 @@ LOGISTICS & PLANNING
 === RESPONSE FORMAT — CRITICAL ===
 - NEVER use markdown: no #, ##, **, *, -, bullet points, or any other markdown syntax
 - Write in plain conversational prose only — like a text message from a knowledgeable friend
-- Keep opening responses to 2-3 sentences maximum unless the user explicitly asks for a full breakdown
-- If the user asks a broad question, give ONE specific recommendation first, then ask a clarifying question
+- Keep responses concise: 1-3 sentences unless the user explicitly asks for more detail
 - Do not list capabilities or introduce yourself unless directly asked
 - Never start a response with "I" or "As your"
+- NEVER volunteer unsolicited recommendations or itineraries — only give them when the user explicitly asks
+- NEVER tell the user how to spend their time or what they should do unprompted
+- If the user asks a question, answer it directly and concisely. Ask a clarifying question only if genuinely needed.
 
 === RECOMMENDATION STYLE ===
-- Be specific: name the restaurant, the hotel, the neighbourhood. Never say "there are many great options."
-- Be opinionated: say what you actually recommend and why, like a trusted friend
-- One recommendation at a time — give the best option, not a list of five
-- Reference the user's taste profile in every recommendation
+- Only make recommendations when the user explicitly asks for them
+- When asked, be specific: name the actual place from the verified Places list. Never say "there are many great options."
+- Follow the user's lead — if they say they want to visit somewhere, help them do it, don't redirect them
+- Reference the user's taste profile only when it's directly relevant to what they asked
 - Trip modes: [CLIENT TRIP] = prioritize prestige, private dining, car service; [PARTNER/LEISURE TRIP] = romance, design-forward boutique hotels, chef's table dinners; no mode = solo/efficiency
 - If the user is in a disruption situation, lead with the rescue options first
-- If data is missing or stale, say so honestly`;
+- If data is missing or stale, say so honestly
+
+=== BOOKING & TICKETING ===
+- When the user asks about tickets, booking, or reservations for an attraction, restaurant, or experience, ALWAYS include a direct booking link or action — never just say "you can buy tickets online"
+- For attractions: search the Places results for a website URL; if present, tell the user you can open the booking page directly
+- For restaurants: if the user wants to book, offer to open OpenTable, Resy, or the restaurant's direct site
+- For flights: offer to open the Wingman flight booking flow
+- End your response with: ACTION:{"type":"book","label":"<button label>","url":"<url>"} on its own line when a direct booking link is available — the app will render this as a tappable button. Only include one ACTION per response.
+- If no direct URL is available, say so honestly and suggest the best alternative (phone number, walk-in timing, etc.)`;
 
 
     const messages = [
@@ -2086,16 +2096,23 @@ LOGISTICS & PLANNING
     });
     // Strip any markdown that slips through — render as plain text on mobile
     const rawReply = claudeResp.content[0].text;
+    // Extract ACTION tag before stripping
+    let bookingAction = null;
+    const actionMatch = rawReply.match(/ACTION:(\{[^\n]+\})/m);
+    if (actionMatch) {
+      try { bookingAction = JSON.parse(actionMatch[1]); } catch {}
+    }
     const reply = rawReply
-      .replace(/^#{1,6}\s+/gm, '')          // remove # headings
-      .replace(/\*\*([^*]+)\*\*/g, '$1')    // remove **bold**
-      .replace(/\*([^*]+)\*/g, '$1')        // remove *italic*
-      .replace(/^[\-\*]\s+/gm, '\u2022 ')  // convert bullet - to bullet point
-      .replace(/\n{3,}/g, '\n\n')           // collapse triple newlines
+      .replace(/^ACTION:\{[^\n]+\}\s*$/gm, '') // remove ACTION line
+      .replace(/^#{1,6}\s+/gm, '')              // remove # headings
+      .replace(/\*\*([^*]+)\*\*/g, '$1')        // remove **bold**
+      .replace(/\*([^*]+)\*/g, '$1')            // remove *italic*
+      .replace(/^[\-\*]\s+/gm, '\u2022 ')      // convert bullet - to bullet point
+      .replace(/\n{3,}/g, '\n\n')               // collapse triple newlines
       .trim();
     // Award points for first concierge message (idempotent)
     awardPoints(email, "concierge_first").catch(() => {});
-    res.json({ ok: true, reply, places: placesResults.length > 0 ? placesResults : undefined, weather: liveWeather || undefined });
+    res.json({ ok: true, reply, places: placesResults.length > 0 ? placesResults : undefined, weather: liveWeather || undefined, action: bookingAction || undefined });
   } catch (e) {
     console.error("[concierge]", e.message);
     res.status(500).json({ error: "concierge error: " + e.message });
@@ -2602,7 +2619,22 @@ app.get("/debug/concierge", async (req, res) => {
   res.json(results);
 });
 
-app.get("/health", (_req, res) => res.json({ ok: true, ts: Date.now(), version: "2.7.6" }));
+// ---------------------------------------------------------------------------
+// Weather — geolocated current conditions for HomeScreen widget
+// ---------------------------------------------------------------------------
+app.get("/weather", async (req, res) => {
+  const { lat, lng } = req.query;
+  if (!lat || !lng) return res.status(400).json({ error: "lat and lng required" });
+  try {
+    const w = await getLiveWeather({ lat: parseFloat(lat), lng: parseFloat(lng) });
+    if (!w) return res.status(503).json({ error: "weather unavailable" });
+    res.json({ ok: true, ...w });
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
+app.get("/health", (_req, res) => res.json({ ok: true, ts: Date.now(), version: "2.7.7" }));
 
 // ---------------------------------------------------------------------------
 // Disruption polling cron — runs every 15 min
