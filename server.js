@@ -1281,26 +1281,41 @@ app.post("/loyalty/connect", async (req, res) => {
     await logActivity(email, "loyalty", `${prog.name} connected`,
       `${prog.name}${statusMsg} added to your profile.`);
 
-    // If credentials also provided, attempt AwardWallet sync in background (optional)
+    // If credentials provided, store them encrypted and kick off AwardWallet sync
     if (login && password) {
       const awUser = process.env.AWARDWALLET_API_USER;
       const awPass = process.env.AWARDWALLET_API_PASS;
       if (awUser && awPass) {
-        awRequest("/accounts", {
+        // Store encrypted credentials in metadata JSONB for future re-syncs
+        const credsMetadata = JSON.stringify({
+          login_enc: encryptField(login),
+          pass_enc: encryptField(password),
+          login2: login2 || null,
+        });
+        sql`UPDATE loyalty_accounts SET metadata = ${credsMetadata}::jsonb WHERE user_email = ${email} AND program = ${program}`
+          .catch(e => console.error("[loyalty-creds-store]", e.message));
+        // POST /account/check — correct AwardWallet v2 endpoint
+        awRequest("/account/check", {
           method: "POST",
           body: JSON.stringify({
-            provider: prog.code, login, password,
+            provider: prog.code,
+            login,
+            password,
             ...(login2 ? { login2 } : {}),
             userId: email,
             userData: JSON.stringify({ userEmail: email, program }),
+            priority: 9,
+            timeout: 300,
+            retries: 2,
           }),
         }).then(awResp => {
-          const awAccountId = awResp.accountId || awResp.id || null;
-          if (awAccountId) {
-            sql`UPDATE loyalty_accounts SET aw_account_id = ${awAccountId} WHERE user_email = ${email} AND program = ${program}`
+          const requestId = awResp.requestId || awResp.id || null;
+          if (requestId) {
+            sql`UPDATE loyalty_accounts SET aw_account_id = ${requestId} WHERE user_email = ${email} AND program = ${program}`
               .catch(e => console.error("[loyalty-aw-update]", e.message));
+            // Poll for results — will update elite_status, balance, etc. when done
+            pollAwardWalletResult(email, program, requestId).catch(e => console.error("[loyalty-poll]", e.message));
           }
-          syncLoyaltyAccount(email, program).catch(e => console.error("[loyalty-sync]", e.message));
         }).catch(e => console.error("[loyalty-aw]", e.message));
       }
     }
@@ -1391,30 +1406,53 @@ async function syncLoyaltyAccount(userEmail, program) {
       console.log("[loyalty-sync] AwardWallet not configured — skipping");
       return;
     }
-    // Request account update from AwardWallet
-    if (acct.aw_account_id) {
-      await awRequest(`/accounts/${acct.aw_account_id}/update`, { method: "POST" });
-      // Poll for completion (AwardWallet is async — wait up to 30s)
+    // Re-submit account credentials to AwardWallet for a fresh sync
+    const meta = acct.metadata || {};
+    const loginEnc = meta.login_enc;
+    const passEnc  = meta.pass_enc;
+    if (!loginEnc || !passEnc) {
+      console.log(`[loyalty-sync] ${userEmail} ${program}: no credentials in metadata, skipping AW sync`);
+      return;
+    }
+    const syncLogin    = decryptField(loginEnc);
+    const syncPassword = decryptField(passEnc);
+    const syncLogin2   = meta.login2 || null;
+    // POST /account/check — submit to AwardWallet queue
+    const submitResp = await awRequest("/account/check", {
+      method: "POST",
+      body: JSON.stringify({
+        provider: prog.code,
+        login: syncLogin,
+        password: syncPassword,
+        ...(syncLogin2 ? { login2: syncLogin2 } : {}),
+        userId: userEmail,
+        userData: JSON.stringify({ userEmail, program }),
+        priority: 1,   // background = low priority
+        timeout: 300,
+        retries: 2,
+      }),
+    });
+    const requestId = submitResp.requestId || submitResp.id || null;
+    if (!requestId) {
+      console.log(`[loyalty-sync] ${userEmail} ${program}: no requestId returned from AW`);
+      return;
+    }
+    await sql`UPDATE loyalty_accounts SET aw_account_id = ${requestId} WHERE user_email = ${userEmail} AND program = ${program}`;
+    // Delegate to pollAwardWalletResult for polling + DB update
+    await pollAwardWalletResult(userEmail, program, requestId);
+    return;
+    // (Legacy dead code below — kept for reference)
+    if (false) {
       let data = null;
-      for (let i = 0; i < 6; i++) {
-        await new Promise(r => setTimeout(r, 5000));
-        const status = await awRequest(`/accounts/${acct.aw_account_id}`);
-        if (status.status === "done" || status.balance !== undefined) {
-          data = status;
-          break;
-        }
-      }
-      if (!data) return; // timed out
-      // Parse AwardWallet response into our schema
-      const balance = parseInt(data.balance || data.PointsValue || 0);
-      const eliteStatus = data.Level || data.eliteLevel || null;
-      const eliteNext = data.NextLevel || null;
-      const pointsToNext = parseInt(data.PointsToNextLevel || 0) || null;
-      const nightsYtd = parseInt(data.Nights || 0) || null;
-      const segmentsYtd = parseInt(data.Segments || 0) || null;
-      const memberName = data.Name || null;
-      const accountNumber = data.Number || null;
-      const expirationDate = data.Expiration ? new Date(data.Expiration) : null;
+      const balance = 0;
+      const eliteStatus = null;
+      const eliteNext = null;
+      const pointsToNext = null;
+      const nightsYtd = null;
+      const segmentsYtd = null;
+      const memberName = null;
+      const accountNumber = null;
+      const expirationDate = null;
       // Detect status changes for activity logging
       const prevBalance = acct.points_balance || 0;
       const prevStatus = acct.elite_status;
@@ -1452,6 +1490,84 @@ async function syncLoyaltyAccount(userEmail, program) {
   } catch (e) {
     console.error(`[loyalty-sync] ${userEmail} ${program}:`, e.message);
   }
+}
+
+// Poll AwardWallet /account/check/{id} until state===1 (complete) then update DB
+async function pollAwardWalletResult(userEmail, program, requestId, maxAttempts = 12, intervalMs = 5000) {
+  const prog = LOYALTY_PROGRAMS[program];
+  if (!prog) return;
+  for (let i = 0; i < maxAttempts; i++) {
+    await new Promise(r => setTimeout(r, intervalMs));
+    try {
+      const data = await awRequest(`/account/check/${requestId}`);
+      // state: 1 = complete, 0 = pending/processing, -1 = error
+      if (data.state === -1) {
+        console.error(`[loyalty-poll] ${userEmail} ${program}: AW error — ${data.errorReason || data.message}`);
+        return;
+      }
+      if (data.state !== 1) {
+        console.log(`[loyalty-poll] ${userEmail} ${program}: still processing (attempt ${i + 1})`);
+        continue;
+      }
+      // Parse properties array — elite status, member name, account number live here
+      const props = Array.isArray(data.properties) ? data.properties : [];
+      const getProp = (...codes) => {
+        for (const code of codes) {
+          const p = props.find(p => p.code === code || p.name === code);
+          if (p && p.value) return p.value;
+        }
+        return null;
+      };
+      const balance        = parseInt(data.balance || 0) || 0;
+      const eliteStatus    = getProp("Level", "Membership_Level", "EliteLevel", "Elite_Level") || null;
+      const eliteNext      = getProp("NextLevel", "Next_Level", "NextEliteLevel") || null;
+      const pointsToNext   = parseInt(getProp("PointsToNextLevel", "Points_To_Next_Level") || 0) || null;
+      const nightsYtd      = parseInt(getProp("Nights", "NightsYTD", "Nights_YTD") || 0) || null;
+      const segmentsYtd    = parseInt(getProp("Segments", "SegmentsYTD", "Segments_YTD") || 0) || null;
+      const memberName     = getProp("Name", "MemberName", "Member_Name") || null;
+      const accountNumber  = getProp("Number", "MemberNumber", "Member_Number", "RewardsNumber") || data.login || null;
+      const expirationDate = data.expirationDate ? new Date(data.expirationDate) : null;
+      // Fetch current values for change detection
+      const rows = await sql`SELECT * FROM loyalty_accounts WHERE user_email = ${userEmail} AND program = ${program}`;
+      const acct = rows[0];
+      const prevBalance = acct?.points_balance || 0;
+      const prevStatus  = acct?.elite_status;
+      await sql`
+        UPDATE loyalty_accounts SET
+          points_balance       = ${balance},
+          elite_status         = COALESCE(${eliteStatus}, elite_status),
+          elite_level_next     = ${eliteNext},
+          points_to_next_level = ${pointsToNext},
+          nights_ytd           = ${nightsYtd},
+          segments_ytd         = ${segmentsYtd},
+          member_name          = COALESCE(${memberName}, member_name),
+          account_number       = COALESCE(${accountNumber}, account_number),
+          expiration_date      = ${expirationDate},
+          last_synced          = NOW()
+        WHERE user_email = ${userEmail} AND program = ${program}
+      `;
+      // Log notable changes
+      if (prevStatus && eliteStatus && prevStatus !== eliteStatus) {
+        await logActivity(userEmail, "loyalty",
+          `${prog.name} status updated: ${eliteStatus}`,
+          `Your ${prog.name} elite status is now ${eliteStatus}.`);
+        await sendPushToUser(userEmail,
+          `${prog.icon} ${prog.name} status update`,
+          `Your status is now ${eliteStatus}!`,
+          { route: "Loyalty" });
+      } else if (balance > prevBalance) {
+        const earned = (balance - prevBalance).toLocaleString();
+        await logActivity(userEmail, "loyalty",
+          `${prog.name} +${earned} ${prog.kind === "airline" ? "miles" : "points"}`,
+          `Your ${prog.name} balance increased by ${earned}. New balance: ${balance.toLocaleString()}.`);
+      }
+      console.log(`[loyalty-poll] ${userEmail} ${program}: ${balance} pts, status: ${eliteStatus}`);
+      return; // success
+    } catch (e) {
+      console.error(`[loyalty-poll] attempt ${i + 1}:`, e.message);
+    }
+  }
+  console.log(`[loyalty-poll] ${userEmail} ${program}: timed out after ${maxAttempts} attempts`);
 }
 
 // Loyalty sync cron — runs every 6 hours
@@ -3031,7 +3147,7 @@ app.post("/auth/refresh", authLimiter, async (req, res) => {
   }
 });
 
-app.get("/health", (_req, res) => res.json({ ok: true, ts: Date.now(), version: "2.9.3" }));
+app.get("/health", (_req, res) => res.json({ ok: true, ts: Date.now(), version: "2.9.4" }));
 
 // ---------------------------------------------------------------------------
 // Disruption polling cron — runs every 15 min
