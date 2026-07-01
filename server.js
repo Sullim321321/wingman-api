@@ -6235,8 +6235,9 @@ app.get("/me/home-state", async (req, res) => {
     // Build context-aware suggestions based on state
     const suggestions = [];
     if (state === "at_airport" && activeLeg) {
-      suggestions.push({ label: "Lounge access", icon: "🛋", route: "Lounge", prefill: `Lounge access at ${activeLeg.origin}` });
+      suggestions.push({ label: "Lounge access", icon: "🛋", route: "LoungeCards", prefill: null });
       suggestions.push({ label: "Security wait", icon: "🔒", route: "Concierge", prefill: `Security wait at ${activeLeg.origin} Terminal ${liveStatus?.terminal || activeLeg.terminal || ""}` });
+      suggestions.push({ label: "Journey timing", icon: "⏱", route: "JourneySimulator", prefill: null, params: { tripId: activeTrip?.id, legId: activeLeg.id, flightIdent: (activeLeg.carrier || "") + (activeLeg.flight_number || "") } });
       if (liveStatus?.gate) suggestions.push({ label: `Gate ${liveStatus.gate}`, icon: "🚪", route: "Concierge", prefill: `Directions to gate ${liveStatus.gate} at ${activeLeg.origin}` });
     } else if (state === "at_destination" && activeTrip) {
       suggestions.push({ label: "Get around", icon: "🚇", route: "Concierge", prefill: `How do I get around ${activeTrip.destination_city || "here"}?` });
@@ -6245,6 +6246,7 @@ app.get("/me/home-state", async (req, res) => {
     } else if (state === "pre_departure" && activeLeg) {
       const hoursStr = hoursToDepart > 24 ? `${Math.round(hoursToDepart / 24)}d` : `${Math.round(hoursToDepart)}h`;
       suggestions.push({ label: "Pack list", icon: "🧳", route: "Concierge", prefill: `Pack list for my ${activeLeg.destination} trip` });
+      suggestions.push({ label: "Journey timing", icon: "⏱", route: "JourneySimulator", prefill: null, params: { tripId: activeTrip?.id, legId: activeLeg.id, flightIdent: (activeLeg.carrier || "") + (activeLeg.flight_number || "") } });
       suggestions.push({ label: "Entry requirements", icon: "📋", route: "Concierge", prefill: `Entry requirements for ${activeLeg.destination}` });
       suggestions.push({ label: "Currency tips", icon: "💳", route: "Concierge", prefill: `Currency and payment tips for ${activeLeg.destination}` });
     } else if (state === "no_trip") {
