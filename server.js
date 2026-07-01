@@ -1936,6 +1936,30 @@ app.post("/trips/reparse-unknown", async (req, res) => {
   }
 });
 
+
+// DELETE /auth/gmail — disconnect Gmail (revoke token and delete from DB)
+app.delete("/auth/gmail", auth, async (req, res) => {
+  const email = req.email;
+  try {
+    // Revoke the token with Google if we have a refresh token
+    const rows = await sql`SELECT refresh_token, access_token FROM gmail_tokens WHERE user_email = ${email}`;
+    if (rows.length > 0) {
+      const token = rows[0].refresh_token || rows[0].access_token;
+      if (token) {
+        try {
+          await fetch(`https://oauth2.googleapis.com/revoke?token=${encodeURIComponent(token)}`, { method: "POST" });
+        } catch {} // best-effort revoke
+      }
+    }
+    await sql`DELETE FROM gmail_tokens WHERE user_email = ${email}`;
+    await logActivity(email, "gmail_disconnected", "Gmail disconnected", "Your Gmail connection has been removed. Wingman will no longer scan your inbox.", null, null, {});
+    res.json({ ok: true });
+  } catch (e) {
+    console.error("[DELETE /auth/gmail]", e.message);
+    res.status(500).json({ error: e.message });
+  }
+});
+
 // POST /auth/gmail/scan — manually trigger a re-scan
 // ---------------------------------------------------------------------------
 app.post("/auth/gmail/scan", async (req, res) => {
@@ -2390,8 +2414,9 @@ app.post("/concierge", conciergeLimiter, async (req, res) => {
       (isTransitQuery && transitDest) ? getTransitRoute(transitOrigin, transitDest, location).catch(() => null) : Promise.resolve(null),
     ]);
 
-    // Enrich trips with live flight status + weather risk (in parallel, best-effort)
-    const enrichedTrips = await Promise.all(trips.map(async (trip) => {
+    // Enrich trips with live flight status + weather risk (in parallel, best-effort, 5s max)
+    const enrichedTrips = await Promise.race([
+      Promise.all(trips.map(async (trip) => {
       const legs = trip.legs || [];
       const enrichedLegs = await Promise.all(legs.map(async (leg) => {
         if (leg.type !== "flight" || !leg.flight_number) return leg;
@@ -2420,9 +2445,10 @@ app.post("/concierge", conciergeLimiter, async (req, res) => {
           weather_risk: weatherData.status === "fulfilled" ? weatherData.value : null,
         };
       }));
-      return { ...trip, legs: enrichedLegs };
-    }));
-
+            return { ...trip, legs: enrichedLegs };
+    })),
+      new Promise(resolve => setTimeout(() => resolve(trips), 5000)),
+    ]);
     // Build a concise human-readable summary for the system prompt
     const tripsSummary = enrichedTrips.length === 0
       ? "No trips found yet."
@@ -3177,7 +3203,7 @@ app.post("/auth/refresh", authLimiter, async (req, res) => {
   }
 });
 
-app.get("/health", (_req, res) => res.json({ ok: true, ts: Date.now(), version: "2.9.5" }));
+app.get("/health", (_req, res) => res.json({ ok: true, ts: Date.now(), version: "2.9.6" }));
 
 // ---------------------------------------------------------------------------
 // Disruption polling cron — runs every 15 min
@@ -4472,10 +4498,94 @@ app.post("/trips/:tripId/rescue", auth, async (req, res) => {
 });
 
 // POST /trips/:tripId/rescue/accept — user accepts a rescue option
+// If option has a duffel_offer_id and passengers are provided, executes the booking via Duffel.
 app.post("/trips/:tripId/rescue/accept", auth, async (req, res) => {
   const { tripId } = req.params;
-  const { option_id, disrupted_leg_id, value_saved } = req.body || {};
+  const { option_id, disrupted_leg_id, value_saved, duffel_offer_id, passengers } = req.body || {};
   try {
+    let bookingResult = null;
+
+    // ── Execute Duffel booking if offer_id and passenger data are present ──
+    if (duffel_offer_id && passengers?.length && process.env.DUFFEL_API_KEY) {
+      try {
+        const duffel = getDuffel();
+        const offerData = await duffel.offers.get(duffel_offer_id);
+        const offer = offerData.data;
+        const offerPassengerIds = offer.passengers.map(p => p.id);
+        const mappedPassengers = passengers.map((p, i) => ({
+          id: offerPassengerIds[i],
+          given_name: p.given_name,
+          family_name: p.family_name,
+          born_on: p.born_on,
+          gender: p.gender,
+          email: p.email || req.user.email,
+          phone_number: p.phone || "+10000000000",
+          ...(p.passport_number ? {
+            identity_documents: [{
+              type: "passport",
+              unique_identifier: p.passport_number,
+              expires_on: p.passport_expiry,
+              issuing_country_code: p.passport_country || "US",
+            }]
+          } : {}),
+        }));
+        const order = await duffel.orders.create({
+          selected_offers: [duffel_offer_id],
+          passengers: mappedPassengers,
+          payments: [{
+            type: "balance",
+            currency: offer.total_currency,
+            amount: offer.total_amount,
+          }],
+          metadata: { wingman_user: req.user.email, rescue_for_trip: tripId },
+        });
+        const orderData = order.data;
+        bookingResult = {
+          duffel_order_id: orderData.id,
+          booking_reference: orderData.booking_reference,
+          total_amount: offer.total_amount,
+          total_currency: offer.total_currency,
+        };
+        // Insert the new leg into the original trip
+        const firstSlice = offer.slices?.[0];
+        for (const seg of (firstSlice?.segments || [])) {
+          await sql`
+            INSERT INTO trip_legs (trip_id, type, carrier, flight_number, origin, destination, departs_at, arrives_at, confirmation, raw_data)
+            VALUES (
+              ${tripId}, 'flight',
+              ${seg.marketing_carrier?.name || null},
+              ${(seg.marketing_carrier?.iata_code || "") + (seg.marketing_carrier_flight_number || "")},
+              ${seg.origin?.iata_code || null},
+              ${seg.destination?.iata_code || null},
+              ${seg.departing_at || null},
+              ${seg.arriving_at || null},
+              ${orderData.booking_reference || null},
+              ${JSON.stringify({ duffel_order_id: orderData.id, segment_id: seg.id, rescue: true })}
+            )
+          `;
+        }
+        // Mark the disrupted leg as rescued
+        if (disrupted_leg_id) {
+          await sql`
+            UPDATE trip_legs SET raw_data = raw_data || '{"rescued":true}'::jsonb
+            WHERE id = ${disrupted_leg_id}
+          `;
+        }
+        await logActivity(
+          req.user.email, "disruption_resolved",
+          "Rescue booked",
+          `New flight booked. Booking reference: ${orderData.booking_reference}. Rescue option: ${option_id}.`,
+          tripId, disrupted_leg_id,
+          { option_id, rescue_accepted: true, value_saved: value_saved || 0, ...bookingResult }
+        );
+        return res.json({ ok: true, booked: true, ...bookingResult });
+      } catch (bookErr) {
+        console.error("[rescue-book]", bookErr.message);
+        // Fall through to log-only accept if booking fails
+      }
+    }
+
+    // ── Log-only accept (no Duffel offer, or booking failed) ──
     await logActivity(
       req.user.email, "disruption_resolved",
       "Rescue accepted",
@@ -4483,7 +4593,7 @@ app.post("/trips/:tripId/rescue/accept", auth, async (req, res) => {
       tripId, disrupted_leg_id,
       { option_id, rescue_accepted: true, value_saved: value_saved || 0 }
     );
-    res.json({ ok: true });
+    res.json({ ok: true, booked: false });
   } catch (e) {
     res.status(500).json({ error: e.message });
   }
