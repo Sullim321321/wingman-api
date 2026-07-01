@@ -1724,6 +1724,73 @@ app.delete("/trips/:id", async (req, res) => {
   }
 });
 
+// ── Google Places grounding — fetch REAL business names near user's location ──────────────────────────────────────
+// Returns array of { name, address, rating, open_now, place_id, maps_url } or []
+async function getPlacesGrounding(userMessage, location) {
+  const apiKey = process.env.GOOGLE_PLACES_API_KEY;
+  if (!apiKey || !location?.lat) return [];
+  const msg = userMessage.toLowerCase();
+  let placeType = null;
+  let keyword = null;
+  if (/bakery|croissant|pastry|bread/.test(msg))              { placeType = 'bakery'; keyword = 'bakery'; }
+  else if (/coffee|cafe|caf\u00e9|flat white|espresso/.test(msg)) { placeType = 'cafe'; keyword = 'cafe'; }
+  else if (/restaurant|dinner|lunch|eat|food|cuisine/.test(msg))  { placeType = 'restaurant'; }
+  else if (/bar|cocktail|drink|pub|whisky|wine/.test(msg))        { placeType = 'bar'; }
+  else if (/hotel|stay|accommodation|room/.test(msg))            { placeType = 'lodging'; }
+  else if (/brunch|breakfast/.test(msg))                         { placeType = 'restaurant'; keyword = 'brunch'; }
+  else return [];
+  try {
+    const lat = location.lat;
+    const lng = location.lng || location.lon || 0;
+    const keywordParam = keyword ? `&keyword=${encodeURIComponent(keyword)}` : '';
+    const url = `https://maps.googleapis.com/maps/api/place/nearbysearch/json?location=${lat},${lng}&radius=2000&type=${placeType}${keywordParam}&rankby=prominence&key=${apiKey}`;
+    const resp = await fetch(url, { signal: AbortSignal.timeout(6000) });
+    if (!resp.ok) return [];
+    const data = await resp.json();
+    if (data.status !== 'OK' && data.status !== 'ZERO_RESULTS') {
+      console.error('[places]', data.status, data.error_message);
+      return [];
+    }
+    return (data.results || []).slice(0, 5).map(p => ({
+      name: p.name,
+      address: p.vicinity || p.formatted_address || null,
+      rating: p.rating || null,
+      user_ratings_total: p.user_ratings_total || 0,
+      open_now: p.opening_hours?.open_now ?? null,
+      place_id: p.place_id,
+      maps_url: `https://www.google.com/maps/place/?q=place_id:${p.place_id}`,
+      price_level: p.price_level ?? null,
+    }));
+  } catch (e) {
+    console.error('[places]', e.message);
+    return [];
+  }
+}
+
+// ── OpenWeatherMap — live current weather for user's location ─────────────────────────────────────────────────────
+async function getLiveWeather(location) {
+  const apiKey = process.env.OPENWEATHER_API_KEY;
+  if (!apiKey || !location?.lat) return null;
+  try {
+    const lat = location.lat;
+    const lng = location.lng || location.lon || 0;
+    const url = `https://api.openweathermap.org/data/2.5/weather?lat=${lat}&lon=${lng}&appid=${apiKey}&units=metric`;
+    const resp = await fetch(url, { signal: AbortSignal.timeout(5000) });
+    if (!resp.ok) return null;
+    const d = await resp.json();
+    const temp = Math.round(d.main?.temp);
+    const feels = Math.round(d.main?.feels_like);
+    const desc = d.weather?.[0]?.description || 'clear';
+    const city = d.name || null;
+    const humidity = d.main?.humidity;
+    const windKph = d.wind?.speed ? Math.round(d.wind.speed * 3.6) : null;
+    return { temp, feels, desc, city, humidity, windKph };
+  } catch (e) {
+    console.error('[weather]', e.message);
+    return null;
+  }
+}
+
 // ── Perplexity live search grounding ───────────────────────────────────────────────────────────────────────────────
 async function getPerplexityGrounding(userMessage) {
   const apiKey = process.env.PERPLEXITY_API_KEY;
@@ -1794,8 +1861,12 @@ app.post("/concierge", async (req, res) => {
       : location?.lat
       ? `User's current coordinates: ${location.lat.toFixed(4)}, ${(location.lon || location.lng || 0).toFixed(4)}`
       : null;
-    // Perplexity live search grounding for destination/hotel/restaurant queries
-    const liveSearchContext = await getPerplexityGrounding(message).catch(() => null);
+    // Grounding: run Places, Weather, and Perplexity in parallel (all best-effort)
+    const [placesResults, liveWeather, liveSearchContext] = await Promise.all([
+      getPlacesGrounding(message, location).catch(() => []),
+      getLiveWeather(location).catch(() => null),
+      getPerplexityGrounding(message).catch(() => null),
+    ]);
 
     // Enrich trips with live flight status + weather risk (in parallel, best-effort)
     const enrichedTrips = await Promise.all(trips.map(async (trip) => {
@@ -1932,6 +2003,8 @@ User: ${email}
 ${tasteSection ? `=== USER'S TASTE PROFILE ===\n${tasteSection}\n` : ""}
 ${loyaltySummary ? `=== USER'S LOYALTY ACCOUNTS ===\n${loyaltySummary}\n\nWhen recommending hotels, always factor in which programs the user has status with and suggest properties where their status will be recognized. When advising on flights, factor in their airline status and miles balance — suggest using miles for upgrades when the balance is high.\n` : ""}
 ${locationContext ? `=== USER'S CURRENT LOCATION ===\n${locationContext}\nUse this to give hyper-local recommendations. If the user asks "what should I do" or "where should I eat" without specifying a city, assume they mean right now, right here.\n` : ""}
+${liveWeather ? `=== LIVE WEATHER AT USER'S LOCATION ===\nCurrently ${liveWeather.temp}\u00b0C (feels like ${liveWeather.feels}\u00b0C), ${liveWeather.desc}${liveWeather.windKph ? `, wind ${liveWeather.windKph} km/h` : ''}${liveWeather.humidity ? `, humidity ${liveWeather.humidity}%` : ''}.\nUse this when the user asks about weather, what to wear, or whether to go outside.\n` : ""}
+${placesResults.length > 0 ? `=== NEARBY PLACES (REAL — from Google Maps, verified) ===\nThe following businesses actually exist near the user right now. ONLY recommend places from this list when asked for local recommendations. NEVER invent or hallucinate business names.\n${placesResults.map((p, i) => `${i+1}. ${p.name} — ${p.address || 'nearby'}${p.rating ? ` · ${p.rating}★ (${p.user_ratings_total} reviews)` : ''}${p.open_now === true ? ' · Open now' : p.open_now === false ? ' · Currently closed' : ''}${p.price_level !== null ? ' · ' + ['Free','Inexpensive','Moderate','Expensive','Very expensive'][p.price_level] || '' : ''}\n   Maps: ${p.maps_url}`).join('\n')}\n\nCRITICAL: You MUST only name businesses from the list above. If none match what the user is asking for, say so honestly and describe the type of neighbourhood to look in instead.\n` : ""}
 ${liveSearchContext ? `=== LIVE SEARCH RESULTS (current as of today — use these to ground your recommendations) ===\n${liveSearchContext}\n\nIMPORTANT: Prioritize information from the live search results above your training data when they conflict. If the search results mention a restaurant or hotel is closed, do not recommend it.\n` : ""}
 === USER'S TRIPS (with live data) ===
 ${tripsSummary}
@@ -2022,7 +2095,7 @@ LOGISTICS & PLANNING
       .trim();
     // Award points for first concierge message (idempotent)
     awardPoints(email, "concierge_first").catch(() => {});
-    res.json({ ok: true, reply });
+    res.json({ ok: true, reply, places: placesResults.length > 0 ? placesResults : undefined, weather: liveWeather || undefined });
   } catch (e) {
     console.error("[concierge]", e.message);
     res.status(500).json({ error: "concierge error: " + e.message });
@@ -2529,7 +2602,7 @@ app.get("/debug/concierge", async (req, res) => {
   res.json(results);
 });
 
-app.get("/health", (_req, res) => res.json({ ok: true, ts: Date.now(), version: "2.7.5" }));
+app.get("/health", (_req, res) => res.json({ ok: true, ts: Date.now(), version: "2.7.6" }));
 
 // ---------------------------------------------------------------------------
 // Disruption polling cron — runs every 15 min
