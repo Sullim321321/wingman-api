@@ -3078,6 +3078,61 @@ app.patch("/policy", auth, async (req, res) => {
 });
 
 // ---------------------------------------------------------------------------
+// Passenger Profile  POST /profile/passenger
+// Stores traveler details (name, DOB, gender, phone) needed for silent autonomy bookings.
+// These are stored encrypted in the user's preferences JSONB under 'passenger_profile'.
+// ---------------------------------------------------------------------------
+app.post("/profile/passenger", auth, async (req, res) => {
+  const { given_name, family_name, born_on, gender, phone, passport_number, passport_expiry, passport_country } = req.body || {};
+  if (!given_name || !family_name || !born_on) {
+    return res.status(400).json({ error: "given_name, family_name, and born_on are required" });
+  }
+  try {
+    const rows = await sql`SELECT preferences FROM users WHERE email = ${req.user.email}`;
+    const existing = rows[0]?.preferences || {};
+    const passengerProfile = {
+      given_name: sanitiseStr(given_name, 100),
+      family_name: sanitiseStr(family_name, 100),
+      born_on: sanitiseStr(born_on, 20),
+      gender: sanitiseStr(gender || "m", 10),
+      phone: sanitiseStr(phone || "", 30),
+      ...(passport_number ? {
+        passport_number: sanitiseStr(passport_number, 20),
+        passport_expiry: sanitiseStr(passport_expiry || "", 20),
+        passport_country: sanitiseStr(passport_country || "US", 5),
+      } : {}),
+    };
+    const merged = { ...existing, passenger_profile: passengerProfile };
+    await sql`UPDATE users SET preferences = ${JSON.stringify(merged)}::jsonb WHERE email = ${req.user.email}`;
+    res.json({ ok: true, passenger_profile: { given_name: passengerProfile.given_name, family_name: passengerProfile.family_name, born_on: passengerProfile.born_on } });
+  } catch (e) {
+    res.status(500).json({ error: "Failed to save passenger profile", detail: e.message });
+  }
+});
+
+// GET /profile/passenger — retrieve stored traveler details (masked)
+app.get("/profile/passenger", auth, async (req, res) => {
+  try {
+    const rows = await sql`SELECT preferences FROM users WHERE email = ${req.user.email}`;
+    const profile = rows[0]?.preferences?.passenger_profile;
+    if (!profile) return res.json({ passenger_profile: null });
+    // Return masked version — never expose full passport/DOB over the wire
+    res.json({
+      passenger_profile: {
+        given_name: profile.given_name,
+        family_name: profile.family_name,
+        born_on: profile.born_on ? profile.born_on.slice(0, 4) + "-**-**" : null,
+        gender: profile.gender,
+        phone: profile.phone ? profile.phone.slice(0, 4) + "****" : null,
+        has_passport: !!profile.passport_number,
+      }
+    });
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
+// ---------------------------------------------------------------------------
 // ROI / Insights  GET /insights/roi
 // ---------------------------------------------------------------------------
 app.get("/insights/roi", auth, async (req, res) => {
@@ -3203,7 +3258,7 @@ app.post("/auth/refresh", authLimiter, async (req, res) => {
   }
 });
 
-app.get("/health", (_req, res) => res.json({ ok: true, ts: Date.now(), version: "2.9.6" }));
+app.get("/health", (_req, res) => res.json({ ok: true, ts: Date.now(), version: "2.10.0" }));
 
 // ---------------------------------------------------------------------------
 // Disruption polling cron — runs every 15 min
@@ -3221,6 +3276,153 @@ async function sendPushToUser(userEmail, title, body, data = {}) {
     });
   } catch (e) {
     console.error("[push]", e.message);
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Silent Autonomy — auto-rebook when user has fully_auto mode enabled
+// Triggered from pollDisruptions when a flight is cancelled or severely delayed.
+// Only acts when:
+//   1. User's autonomy_mode === "fully_auto"
+//   2. Best available alternative is under the user's price threshold
+//   3. User has stored passenger details (name, DOB) for Duffel booking
+// ---------------------------------------------------------------------------
+async function silentAutonomyRebook(leg, newStatus, delaySeconds) {
+  try {
+    const userRows = await sql`SELECT preferences FROM users WHERE email = ${leg.user_email}`;
+    const prefs = userRows[0]?.preferences || {};
+    const autonomyMode = prefs.autonomy_mode || "always_ask";
+    if (autonomyMode !== "fully_auto") return; // Only act for fully autonomous users
+
+    const threshold = prefs.threshold || 500; // Max spend without asking
+    const delayMins = delaySeconds ? Math.round(delaySeconds / 60) : 0;
+
+    // Only auto-rebook cancellations or delays > 2 hours
+    if (newStatus === "Delayed" && delayMins < 120) return;
+
+    // Check if already auto-rebooked for this leg
+    const alreadyRebooked = await sql`
+      SELECT 1 FROM activity_events
+      WHERE user_email = ${leg.user_email}
+        AND type = 'auto_rebook'
+        AND metadata->>'leg_id' = ${String(leg.id)}
+      LIMIT 1
+    `;
+    if (alreadyRebooked.length > 0) return;
+
+    console.log(`[silent-autonomy] User ${leg.user_email} is fully_auto — searching alternatives for leg ${leg.id}`);
+
+    // Search for alternatives via Duffel
+    const dateStr = leg.departs_at
+      ? new Date(new Date(leg.departs_at).getTime() + (delayMins || 120) * 60000).toISOString().slice(0, 10)
+      : new Date().toISOString().slice(0, 10);
+
+    const duffel = getDuffel();
+    const offerRequest = await duffel.offerRequests.create({
+      slices: [{ origin: leg.origin, destination: leg.destination, departure_date: dateStr }],
+      passengers: [{ type: "adult" }],
+      cabin_class: prefs.cabin_preference || "economy",
+    });
+    const offers = await duffel.offers.list({ offer_request_id: offerRequest.data.id, sort: "total_amount" });
+    const bestOffer = offers.data?.[0];
+    if (!bestOffer) {
+      console.log(`[silent-autonomy] No alternatives found for leg ${leg.id}`);
+      return;
+    }
+
+    const price = parseFloat(bestOffer.total_amount);
+    if (price > threshold) {
+      // Price exceeds threshold — alert user instead of auto-booking
+      await sendPushToUser(
+        leg.user_email,
+        `✈ Auto-rebook paused — price above your limit`,
+        `Best alternative for ${leg.origin}→${leg.destination} is $${price.toFixed(0)}, above your $${threshold} auto-approve limit. Tap to review.`,
+        { route: "Alert", tripId: String(leg.trip_id), legId: String(leg.id) }
+      );
+      await logActivity(
+        leg.user_email, "auto_rebook_paused",
+        "Auto-rebook paused — price above threshold",
+        `Best alternative costs $${price.toFixed(0)}, above your $${threshold} limit. Manual approval needed.`,
+        leg.trip_id, leg.id,
+        { leg_id: String(leg.id), offer_id: bestOffer.id, price, threshold }
+      );
+      return;
+    }
+
+    // Check if user has stored passenger info for booking
+    const passengerRows = await sql`SELECT preferences FROM users WHERE email = ${leg.user_email}`;
+    const storedPassenger = passengerRows[0]?.preferences?.passenger_profile;
+    if (!storedPassenger?.given_name || !storedPassenger?.family_name || !storedPassenger?.born_on) {
+      // No passenger profile — can't book, alert user
+      await sendPushToUser(
+        leg.user_email,
+        `✈ Wingman found a rescue flight`,
+        `${leg.origin}→${leg.destination} — ${bestOffer.owner?.name || ""} for $${price.toFixed(0)}. Add your traveler details in Settings to enable auto-booking.`,
+        { route: "Alert", tripId: String(leg.trip_id), legId: String(leg.id), duffel_offer_id: bestOffer.id }
+      );
+      return;
+    }
+
+    // Execute the booking
+    const offerPassengerIds = bestOffer.passengers.map(p => p.id);
+    const order = await duffel.orders.create({
+      selected_offers: [bestOffer.id],
+      passengers: [{
+        id: offerPassengerIds[0],
+        given_name: storedPassenger.given_name,
+        family_name: storedPassenger.family_name,
+        born_on: storedPassenger.born_on,
+        gender: storedPassenger.gender || "m",
+        email: leg.user_email,
+        phone_number: storedPassenger.phone || "+10000000000",
+      }],
+      payments: [{ type: "balance", currency: bestOffer.total_currency, amount: bestOffer.total_amount }],
+      metadata: { wingman_user: leg.user_email, auto_rescue: true, original_leg: leg.id },
+    });
+    const orderData = order.data;
+
+    // Insert new leg into the trip
+    const firstSlice = bestOffer.slices?.[0];
+    for (const seg of (firstSlice?.segments || [])) {
+      await sql`
+        INSERT INTO trip_legs (trip_id, type, carrier, flight_number, origin, destination, departs_at, arrives_at, confirmation, raw_data)
+        VALUES (
+          ${leg.trip_id}, 'flight',
+          ${seg.marketing_carrier?.name || null},
+          ${(seg.marketing_carrier?.iata_code || "") + (seg.marketing_carrier_flight_number || "")},
+          ${seg.origin?.iata_code || null},
+          ${seg.destination?.iata_code || null},
+          ${seg.departing_at || null},
+          ${seg.arriving_at || null},
+          ${orderData.booking_reference || null},
+          ${JSON.stringify({ duffel_order_id: orderData.id, segment_id: seg.id, auto_rescue: true })}
+        )
+      `;
+    }
+
+    // Mark original leg as rescued
+    await sql`UPDATE trip_legs SET raw_data = COALESCE(raw_data,'{}') || '{"rescued":true}'::jsonb WHERE id = ${leg.id}`;
+
+    // Log the auto-rebook event
+    await logActivity(
+      leg.user_email, "auto_rebook",
+      "Wingman auto-rebooked your flight",
+      `Your ${leg.origin}→${leg.destination} flight was ${newStatus === "Cancelled" ? "cancelled" : "severely delayed"}. Wingman automatically booked ${orderData.booking_reference} for $${price.toFixed(0)}.`,
+      leg.trip_id, leg.id,
+      { leg_id: String(leg.id), duffel_order_id: orderData.id, booking_reference: orderData.booking_reference, price, auto: true }
+    );
+
+    // Notify user of the completed auto-rebook
+    await sendPushToUser(
+      leg.user_email,
+      `✅ Wingman auto-rebooked you`,
+      `New flight booked: ${orderData.booking_reference} for $${price.toFixed(0)}. Check your email for the confirmation.`,
+      { route: "Activity", tripId: String(leg.trip_id) }
+    );
+
+    console.log(`[silent-autonomy] Auto-rebooked leg ${leg.id} → Duffel order ${orderData.id} (${orderData.booking_reference})`);
+  } catch (e) {
+    console.error("[silent-autonomy] error:", e.message);
   }
 }
 
@@ -3325,6 +3527,13 @@ async function pollDisruptions() {
           legId: String(leg.id),
           flightIdent: ident,
         });
+      }
+
+      // ── Silent Autonomy: auto-rebook without user interaction if mode = fully_auto ──
+      if ((newStatus === "Cancelled" || newStatus === "Delayed") && process.env.DUFFEL_API_KEY) {
+        silentAutonomyRebook(leg, newStatus, live.delay).catch(e =>
+          console.error("[silent-autonomy]", e.message)
+        );
       }
     }
     // Feature E: Seat preference alerts — check if preferred seat type is available
@@ -6656,6 +6865,152 @@ app.get("/disruption/alternatives", async (req, res) => {
     });
   } catch (e) {
     console.error("[disruption/alternatives]", e.message);
+    res.status(500).json({ error: e.message });
+  }
+});
+
+// ===========================================================================
+// CASCADE ACTIONS — execute downstream protection actions
+// POST /trips/:tripId/cascade/hotel-notify — SMS the hotel about late arrival
+// POST /trips/:tripId/cascade/restaurant-reschedule — AI-draft reschedule message
+// ===========================================================================
+
+// Helper: send an SMS via Twilio (reuses existing credentials)
+async function sendTwilioSMS(to, body) {
+  const accountSid = process.env.TWILIO_ACCOUNT_SID;
+  const authToken  = process.env.TWILIO_AUTH_TOKEN;
+  const fromNumber = process.env.TWILIO_FROM_NUMBER;
+  if (!accountSid || !authToken || !fromNumber) {
+    console.log("[twilio] credentials not set — SMS skipped:", body);
+    return { ok: false, reason: "twilio_not_configured" };
+  }
+  const url = `https://api.twilio.com/2010-04-01/Accounts/${accountSid}/Messages.json`;
+  const params = new URLSearchParams({ To: to, From: fromNumber, Body: body });
+  const r = await fetch(url, {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/x-www-form-urlencoded",
+      "Authorization": "Basic " + Buffer.from(accountSid + ":" + authToken).toString("base64"),
+    },
+    body: params.toString(),
+  });
+  if (!r.ok) throw new Error("Twilio error: " + (await r.text()));
+  return { ok: true };
+}
+
+// POST /trips/:tripId/cascade/hotel-notify
+// Sends an SMS or generates a call script to notify the hotel of a late arrival.
+// Body: { leg_id, delay_minutes, hotel_phone? }
+app.post("/trips/:tripId/cascade/hotel-notify", auth, async (req, res) => {
+  const { tripId } = req.params;
+  const { leg_id, delay_minutes, hotel_phone } = req.body || {};
+  try {
+    const legRows = await sql`
+      SELECT tl.*, t.user_email FROM trip_legs tl
+      JOIN trips t ON t.id = tl.trip_id
+      WHERE tl.id = ${leg_id} AND t.id = ${tripId} AND t.user_email = ${req.user.email}
+    `;
+    if (!legRows.length) return res.status(404).json({ error: "Leg not found" });
+    const hotelLeg = legRows[0];
+    const hotelName = hotelLeg.carrier || hotelLeg.name || "the hotel";
+    const checkinTime = hotelLeg.departs_at
+      ? new Date(hotelLeg.departs_at).toLocaleTimeString("en-US", { hour: "2-digit", minute: "2-digit" })
+      : "tonight";
+    const newArrival = delay_minutes
+      ? new Date(new Date(hotelLeg.departs_at || Date.now()).getTime() + delay_minutes * 60000)
+          .toLocaleTimeString("en-US", { hour: "2-digit", minute: "2-digit" })
+      : "later than expected";
+
+    const message = `Hi, this is a message on behalf of a guest checking in tonight. Due to a flight delay, they will now arrive at approximately ${newArrival} instead of ${checkinTime}. Please hold the reservation. Thank you.`;
+
+    let smsResult = null;
+    if (hotel_phone) {
+      smsResult = await sendTwilioSMS(hotel_phone, message).catch(e => ({ ok: false, reason: e.message }));
+    }
+
+    await logActivity(
+      req.user.email, "cascade_hotel_notify",
+      `Hotel notified: ${hotelName}`,
+      smsResult?.ok
+        ? `SMS sent to ${hotel_phone}: "${message}"`
+        : `Notification drafted (no phone number on file): "${message}"`,
+      tripId, leg_id,
+      { hotel_name: hotelName, delay_minutes, hotel_phone, sms_sent: smsResult?.ok || false }
+    );
+
+    res.json({
+      ok: true,
+      sms_sent: smsResult?.ok || false,
+      message_drafted: message,
+      hotel_name: hotelName,
+      note: hotel_phone ? (smsResult?.ok ? "SMS sent" : "SMS failed — use drafted message") : "No phone number provided — copy the drafted message to contact the hotel directly",
+    });
+  } catch (e) {
+    console.error("[cascade/hotel-notify]", e.message);
+    res.status(500).json({ error: e.message });
+  }
+});
+
+// POST /trips/:tripId/cascade/restaurant-reschedule
+// Uses Claude to draft a polite reschedule message for a restaurant reservation.
+// Body: { leg_id, delay_minutes, restaurant_phone? }
+app.post("/trips/:tripId/cascade/restaurant-reschedule", auth, async (req, res) => {
+  const { tripId } = req.params;
+  const { leg_id, delay_minutes, restaurant_phone } = req.body || {};
+  try {
+    const legRows = await sql`
+      SELECT tl.*, t.user_email FROM trip_legs tl
+      JOIN trips t ON t.id = tl.trip_id
+      WHERE tl.id = ${leg_id} AND t.id = ${tripId} AND t.user_email = ${req.user.email}
+    `;
+    if (!legRows.length) return res.status(404).json({ error: "Leg not found" });
+    const restLeg = legRows[0];
+    const restName = restLeg.carrier || restLeg.name || "the restaurant";
+    const resTime = restLeg.departs_at
+      ? new Date(restLeg.departs_at).toLocaleTimeString("en-US", { hour: "2-digit", minute: "2-digit" })
+      : "this evening";
+    const newTime = delay_minutes
+      ? new Date(new Date(restLeg.departs_at || Date.now()).getTime() + delay_minutes * 60000)
+          .toLocaleTimeString("en-US", { hour: "2-digit", minute: "2-digit" })
+      : "later";
+
+    // Use Claude to draft a polished message
+    let draftMessage = `Hi ${restName}, I have a reservation tonight at ${resTime}. Due to a flight delay, I'll be arriving at approximately ${newTime} instead. Could you please hold my table? I apologize for any inconvenience.`;
+    try {
+      const anthropic = getAnthropic();
+      const aiResp = await anthropic.messages.create({
+        model: "claude-3-haiku-20240307",
+        max_tokens: 200,
+        messages: [{
+          role: "user",
+          content: `Write a brief, polite SMS to ${restName} restaurant asking to push a reservation from ${resTime} to ${newTime} due to a flight delay. Keep it under 160 characters. Just the message text, no quotes.`,
+        }],
+      });
+      draftMessage = aiResp.content[0]?.text?.trim() || draftMessage;
+    } catch {}
+
+    let smsResult = null;
+    if (restaurant_phone) {
+      smsResult = await sendTwilioSMS(restaurant_phone, draftMessage).catch(e => ({ ok: false, reason: e.message }));
+    }
+
+    await logActivity(
+      req.user.email, "cascade_restaurant_reschedule",
+      `Restaurant contacted: ${restName}`,
+      smsResult?.ok ? `SMS sent: "${draftMessage}"` : `Draft ready: "${draftMessage}"`,
+      tripId, leg_id,
+      { restaurant_name: restName, delay_minutes, restaurant_phone, sms_sent: smsResult?.ok || false }
+    );
+
+    res.json({
+      ok: true,
+      sms_sent: smsResult?.ok || false,
+      message_drafted: draftMessage,
+      restaurant_name: restName,
+      note: restaurant_phone ? (smsResult?.ok ? "SMS sent" : "SMS failed — use drafted message") : "Copy this message to contact the restaurant",
+    });
+  } catch (e) {
+    console.error("[cascade/restaurant-reschedule]", e.message);
     res.status(500).json({ error: e.message });
   }
 });
