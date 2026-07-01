@@ -106,6 +106,12 @@ async function bootstrapDB() {
     await sql`ALTER TABLE users ADD COLUMN IF NOT EXISTS weather_alerts BOOLEAN DEFAULT true`;
     await sql`ALTER TABLE users ADD COLUMN IF NOT EXISTS price_alerts BOOLEAN DEFAULT true`;
     await sql`ALTER TABLE users ADD COLUMN IF NOT EXISTS quiet_hours BOOLEAN DEFAULT true`;
+    await sql`ALTER TABLE users ADD COLUMN IF NOT EXISTS travel_pace TEXT DEFAULT 'comfortable'`;
+    await sql`ALTER TABLE users ADD COLUMN IF NOT EXISTS home_airports JSONB DEFAULT '[]'`;
+    await sql`ALTER TABLE users ADD COLUMN IF NOT EXISTS seat_preference TEXT`;
+    await sql`ALTER TABLE users ADD COLUMN IF NOT EXISTS cabin_preference TEXT DEFAULT 'economy'`;
+    await sql`ALTER TABLE users ADD COLUMN IF NOT EXISTS min_connection_mins INTEGER DEFAULT 60`;
+    await sql`ALTER TABLE users ADD COLUMN IF NOT EXISTS notify_journey BOOLEAN DEFAULT true`;
     await sql`ALTER TABLE users ADD COLUMN IF NOT EXISTS last_weekly_digest TIMESTAMPTZ`;
     // ── Wingman Points ────────────────────────────────────────────────────────
     await sql`
@@ -2743,7 +2749,7 @@ app.get("/weather", async (req, res) => {
   }
 });
 
-app.get("/health", (_req, res) => res.json({ ok: true, ts: Date.now(), version: "2.7.8" }));
+app.get("/health", (_req, res) => res.json({ ok: true, ts: Date.now(), version: "2.8.0" }));
 
 // ---------------------------------------------------------------------------
 // Disruption polling cron — runs every 15 min
@@ -5719,5 +5725,685 @@ app.post("/email/inbound", async (req, res) => {
     res.status(500).json({ error: e.message });
   }
 });
+
+
+// ===========================================================================
+// TRAVEL PROFILE — GET /me/travel-profile & PATCH /me/travel-profile
+// Stores: home_airports, seat_preference, travel_pace, payment_methods,
+//         dietary_preferences, loyalty_numbers (summary), cabin_preference
+// ===========================================================================
+app.get("/me/travel-profile", async (req, res) => {
+  const email = await verifyAccessToken(req);
+  if (!email) return res.status(401).json({ error: "unauthorized" });
+  try {
+    const rows = await sql`SELECT preferences, taste_profile FROM users WHERE email = ${email}`;
+    if (!rows[0]) return res.status(404).json({ error: "not found" });
+    const prefs = rows[0].preferences || {};
+    const taste = rows[0].taste_profile || {};
+    const profile = {
+      home_airports:       prefs.home_airports       || [],
+      seat_preference:     prefs.seat_preference     || null,   // "aisle" | "window" | "middle"
+      cabin_preference:    prefs.cabin_preference    || "economy",
+      travel_pace:         prefs.travel_pace         || "comfortable", // "tight" | "comfortable" | "generous"
+      payment_methods:     prefs.payment_methods     || ["apple_pay", "contactless"],
+      dietary:             taste.dietary             || prefs.dietary || [],
+      currency:            prefs.currency            || "USD",
+      display_name:        prefs.display_name        || null,
+      min_connection_mins: prefs.min_connection_mins || 60,     // personal minimum connection time
+      auto_checkin:        prefs.auto_checkin        !== false, // default true
+      notify_gate_change:  prefs.notify_gate_change  !== false,
+      notify_delay:        prefs.notify_delay        !== false,
+      notify_journey:      prefs.notify_journey      !== false, // traffic/buffer alerts
+    };
+    res.json({ ok: true, profile });
+  } catch (e) {
+    console.error("[travel-profile GET]", e.message);
+    res.status(500).json({ error: e.message });
+  }
+});
+
+app.patch("/me/travel-profile", async (req, res) => {
+  const email = await verifyAccessToken(req);
+  if (!email) return res.status(401).json({ error: "unauthorized" });
+  try {
+    const allowed = [
+      "home_airports", "seat_preference", "cabin_preference", "travel_pace",
+      "payment_methods", "dietary", "currency", "display_name",
+      "min_connection_mins", "auto_checkin", "notify_gate_change",
+      "notify_delay", "notify_journey",
+    ];
+    const updates = {};
+    for (const k of allowed) {
+      if (req.body[k] !== undefined) updates[k] = req.body[k];
+    }
+    if (Object.keys(updates).length === 0) {
+      return res.status(400).json({ error: "no valid fields" });
+    }
+    await sql`
+      UPDATE users
+      SET preferences = COALESCE(preferences, '{}'::jsonb) || ${JSON.stringify(updates)}::jsonb
+      WHERE email = ${email}
+    `;
+    // If dietary updated, also sync to taste_profile for concierge context
+    if (updates.dietary) {
+      await sql`
+        UPDATE users
+        SET taste_profile = COALESCE(taste_profile, '{}'::jsonb) || ${JSON.stringify({ dietary: updates.dietary })}::jsonb
+        WHERE email = ${email}
+      `;
+    }
+    await logActivity(email, "profile", "Travel profile updated", "Travel preferences saved.", null, null, updates);
+    res.json({ ok: true, updated: Object.keys(updates) });
+  } catch (e) {
+    console.error("[travel-profile PATCH]", e.message);
+    res.status(500).json({ error: e.message });
+  }
+});
+
+// ===========================================================================
+// JOURNEY SIMULATION ENGINE
+// GET /journey/simulate?tripId=&legId=&lat=&lng=
+// Combines: traffic ETA to airport, security wait, gate walk time, flight buffer
+// Returns: buffer_minutes, verdict, timeline, at_risk, push_threshold_crossed
+// ===========================================================================
+async function getSecurityWait(iata) {
+  // Try FlightAware AeroAPI for security wait data; fall back to heuristic
+  try {
+    const FA_KEY = process.env.FLIGHTAWARE_API_KEY;
+    if (FA_KEY) {
+      const r = await fetch(`https://aeroapi.flightaware.com/aeroapi/airports/${iata}/delays`, {
+        headers: { "x-apikey": FA_KEY },
+      });
+      if (r.ok) {
+        const d = await r.json();
+        // AeroAPI returns delay categories; map to estimated security minutes
+        const cat = d.delays?.[0]?.category;
+        if (cat === "security") return Math.round((d.delays[0].delay_secs || 900) / 60);
+      }
+    }
+  } catch {}
+  // Heuristic fallback: busy hours = 20-30 min, off-peak = 10-15 min
+  const h = new Date().getHours();
+  if ((h >= 5 && h <= 9) || (h >= 15 && h <= 19)) return 22; // peak
+  return 12; // off-peak
+}
+
+async function getTrafficETA(originLat, originLng, destIata) {
+  // Use Google Directions API in driving mode
+  try {
+    const GMAPS_KEY = process.env.GOOGLE_MAPS_API_KEY;
+    if (!GMAPS_KEY) return null;
+    // Approximate airport coordinates by IATA — use a small lookup for common airports
+    const AIRPORT_COORDS = {
+      DUB: { lat: 53.4264, lng: -6.2499 }, LHR: { lat: 51.4700, lng: -0.4543 },
+      JFK: { lat: 40.6413, lng: -73.7781 }, LAX: { lat: 33.9425, lng: -118.4081 },
+      ARN: { lat: 59.6519, lng: 17.9186 }, CDG: { lat: 49.0097, lng: 2.5479 },
+      SIN: { lat: 1.3644, lng: 103.9915 }, HKG: { lat: 22.3080, lng: 113.9185 },
+      SYD: { lat: -33.9399, lng: 151.1753 }, NRT: { lat: 35.7720, lng: 140.3929 },
+      ORD: { lat: 41.9742, lng: -87.9073 }, MIA: { lat: 25.7959, lng: -80.2870 },
+      AMS: { lat: 52.3105, lng: 4.7683 },  FRA: { lat: 50.0379, lng: 8.5622 },
+      MAN: { lat: 53.3537, lng: -2.2750 }, BOS: { lat: 42.3656, lng: -71.0096 },
+      EWR: { lat: 40.6895, lng: -74.1745 }, SFO: { lat: 37.6213, lng: -122.3790 },
+      YYZ: { lat: 43.6777, lng: -79.6248 }, MEX: { lat: 19.4363, lng: -99.0721 },
+      DXB: { lat: 25.2532, lng: 55.3657 }, IST: { lat: 41.2753, lng: 28.7519 },
+    };
+    const dest = AIRPORT_COORDS[destIata?.toUpperCase()];
+    if (!dest) return null;
+    const url = `https://maps.googleapis.com/maps/api/directions/json?origin=${originLat},${originLng}&destination=${dest.lat},${dest.lng}&mode=driving&departure_time=now&key=${GMAPS_KEY}`;
+    const r = await fetch(url);
+    const d = await r.json();
+    if (d.status !== "OK") return null;
+    const route = d.routes?.[0]?.legs?.[0];
+    if (!route) return null;
+    return {
+      duration_mins: Math.round(route.duration_in_traffic?.value / 60 || route.duration?.value / 60),
+      distance_km:   Math.round((route.distance?.value || 0) / 1000),
+      summary:       route.duration_in_traffic ? "with current traffic" : "estimated",
+      traffic_model: route.duration_in_traffic ? "live" : "typical",
+    };
+  } catch (e) {
+    console.error("[traffic-eta]", e.message);
+    return null;
+  }
+}
+
+app.get("/journey/simulate", async (req, res) => {
+  const email = await verifyAccessToken(req);
+  if (!email) return res.status(401).json({ error: "unauthorized" });
+  try {
+    const { tripId, legId, lat, lng } = req.query;
+    if (!tripId || !legId) return res.status(400).json({ error: "tripId and legId required" });
+
+    // Fetch the flight leg
+    const legs = await sql`
+      SELECT tl.*, t.user_email FROM trip_legs tl
+      JOIN trips t ON t.id = tl.trip_id
+      WHERE tl.id = ${legId} AND tl.trip_id = ${tripId} AND t.user_email = ${email}
+    `;
+    if (!legs[0]) return res.status(404).json({ error: "leg not found" });
+    const leg = legs[0];
+
+    if (!leg.departs_at) return res.status(400).json({ error: "leg has no departure time" });
+    const departureMs = new Date(leg.departs_at).getTime();
+    const nowMs = Date.now();
+    const minsToDepart = Math.round((departureMs - nowMs) / 60000);
+
+    // Fetch user travel profile for pace preference
+    const userRows = await sql`SELECT preferences FROM users WHERE email = ${email}`;
+    const prefs = userRows[0]?.preferences || {};
+    const travelPace = prefs.travel_pace || "comfortable";
+    const minConnection = prefs.min_connection_mins || 60;
+
+    // Pace-based airport arrival buffer (mins before departure)
+    const paceBuffer = { tight: 45, comfortable: 75, generous: 120 }[travelPace] || 75;
+    const requiredArrivalMs = departureMs - (paceBuffer * 60000);
+    const minsUntilRequired = Math.round((requiredArrivalMs - nowMs) / 60000);
+
+    // Security wait at origin airport
+    const securityMins = await getSecurityWait(leg.origin);
+
+    // Gate walk time (heuristic: 8-12 mins depending on airport size)
+    const largeAirports = ["LHR","JFK","LAX","CDG","FRA","AMS","DXB","ORD","SIN","NRT","IST"];
+    const gateWalkMins = largeAirports.includes(leg.origin?.toUpperCase()) ? 12 : 8;
+
+    // Traffic ETA (if location provided)
+    let trafficETA = null;
+    if (lat && lng) {
+      trafficETA = await getTrafficETA(parseFloat(lat), parseFloat(lng), leg.origin);
+    }
+
+    // Build timeline
+    const timeline = [];
+    let runningMins = 0;
+
+    if (trafficETA) {
+      timeline.push({ icon: "🚗", label: `Drive to ${leg.origin}`, minutes: runningMins, duration: trafficETA.duration_mins, note: trafficETA.summary });
+      runningMins += trafficETA.duration_mins;
+    }
+    timeline.push({ icon: "🔒", label: `Security at ${leg.origin}`, minutes: runningMins, duration: securityMins, note: `~${securityMins} min wait` });
+    runningMins += securityMins;
+    timeline.push({ icon: "🚶", label: `Walk to gate`, minutes: runningMins, duration: gateWalkMins, note: leg.gate ? `Gate ${leg.gate}` : "Gate TBC" });
+    runningMins += gateWalkMins;
+    timeline.push({ icon: "✈️", label: `Board ${leg.carrier || ""}${leg.flight_number || ""}`, minutes: runningMins, duration: 0, note: `Departs ${new Date(leg.departs_at).toLocaleTimeString("en-US", { hour: "numeric", minute: "2-digit" })}` });
+
+    // Buffer = time to departure minus all steps
+    const totalStepMins = runningMins;
+    const bufferMinutes = minsToDepart - totalStepMins;
+
+    // Verdict
+    let verdict, atRisk;
+    if (bufferMinutes < 0) {
+      verdict = "will_miss"; atRisk = true;
+    } else if (bufferMinutes < 15) {
+      verdict = "tight"; atRisk = true;
+    } else if (bufferMinutes < 30) {
+      verdict = "on_track"; atRisk = false;
+    } else {
+      verdict = "comfortable"; atRisk = false;
+    }
+
+    // Required arrival time string
+    const requiredArrivalStr = new Date(requiredArrivalMs).toLocaleTimeString("en-US", { hour: "numeric", minute: "2-digit" });
+    const currentETA = trafficETA
+      ? new Date(nowMs + trafficETA.duration_mins * 60000).toLocaleTimeString("en-US", { hour: "numeric", minute: "2-digit" })
+      : null;
+
+    res.json({
+      ok: true,
+      flight: { ident: (leg.carrier || "") + (leg.flight_number || ""), origin: leg.origin, destination: leg.destination, departs_at: leg.departs_at, gate: leg.gate },
+      buffer_minutes: bufferMinutes,
+      mins_to_depart: minsToDepart,
+      verdict,
+      at_risk: atRisk,
+      timeline,
+      traffic_eta: trafficETA,
+      security_mins: securityMins,
+      gate_walk_mins: gateWalkMins,
+      required_arrival: requiredArrivalStr,
+      current_eta: currentETA,
+      pace_buffer_mins: paceBuffer,
+    });
+  } catch (e) {
+    console.error("[journey/simulate]", e.message);
+    res.status(500).json({ error: e.message });
+  }
+});
+
+// ===========================================================================
+// DISRUPTION RESPONSE — GET /disruption/alternatives?legId=&tripId=
+// Finds rebooking options when a flight is cancelled/severely delayed
+// Also calculates EC261 compensation entitlement
+// ===========================================================================
+function calcEC261(originIata, destIata, delayMins, cancelled) {
+  // EC261 applies to: EU departures OR EU carrier arrivals
+  const EU_AIRPORTS = new Set([
+    "LHR","LGW","MAN","EDI","BHX","BRS","LPL","NCL","ABZ","GLA","STN","LTN","LCY",
+    "DUB","ORK","SNN","BFS","CDG","ORY","NCE","LYS","MRS","TLS","BOD","NTE","LIL",
+    "AMS","RTM","EIN","FRA","MUC","BER","DUS","HAM","CGN","STR","NUE","HAJ",
+    "MAD","BCN","AGP","PMI","LPA","TFN","ALC","VLC","BIO","SVQ",
+    "FCO","MXP","LIN","VCE","NAP","CAT","PMO","BLQ","PSA",
+    "ATH","SKG","HER","RHO","CFU","CHQ",
+    "LIS","OPO","FAO","FNC",
+    "VIE","ZRH","GVA","BSL","CPH","ARN","OSL","HEL","RVN","TMP",
+    "WAW","KRK","WRO","GDN","POZ","BUD","PRG","BTS","LJU","ZAG",
+    "BRU","CRL","LUX","TLL","RIX","VNO","REK",
+    "ARN","GOT","MMX",
+  ]);
+  const isEURoute = EU_AIRPORTS.has(originIata?.toUpperCase()) || EU_AIRPORTS.has(destIata?.toUpperCase());
+  if (!isEURoute) return null;
+
+  // Distance-based compensation
+  // Under 1500km: €250 | 1500-3500km: €400 | Over 3500km: €600
+  // Simplified: use origin/dest pair heuristic
+  const longHaul = ["JFK","LAX","SIN","HKG","NRT","SYD","DXB","ORD","YYZ","BKK","PEK","PVG","GRU","EZE","CPT","NBO"];
+  const medHaul  = ["IST","CAI","TLV","AMM","BEY","DOH","AUH","KWI","BAH","MCT","TBS","EVN","LED","SVO","DME","OTP","SOF","SKP","TIA","PRN","TGD","INI"];
+
+  let compensation = 250;
+  const dest = destIata?.toUpperCase();
+  const orig = originIata?.toUpperCase();
+  if (longHaul.includes(dest) || longHaul.includes(orig)) compensation = 600;
+  else if (medHaul.includes(dest) || medHaul.includes(orig)) compensation = 400;
+
+  // Delay threshold: cancelled = full; delay > 3h = full; delay 2-3h = 50%
+  if (!cancelled && delayMins < 120) return null;
+  if (!cancelled && delayMins < 180) compensation = Math.round(compensation * 0.5);
+
+  return {
+    eligible: true,
+    amount_eur: compensation,
+    regulation: "EC 261/2004",
+    basis: cancelled ? "Flight cancelled" : `Delay of ${Math.round(delayMins / 60)}h ${delayMins % 60}m`,
+    how_to_claim: "Contact the airline directly or use a claims service. Keep your boarding pass and booking confirmation.",
+    claim_deadline: "3 years from the flight date (varies by country)",
+  };
+}
+
+app.get("/disruption/alternatives", async (req, res) => {
+  const email = await verifyAccessToken(req);
+  if (!email) return res.status(401).json({ error: "unauthorized" });
+  try {
+    const { legId, tripId } = req.query;
+    if (!legId || !tripId) return res.status(400).json({ error: "legId and tripId required" });
+
+    const legs = await sql`
+      SELECT tl.*, t.user_email, t.title as trip_title FROM trip_legs tl
+      JOIN trips t ON t.id = tl.trip_id
+      WHERE tl.id = ${legId} AND tl.trip_id = ${tripId} AND t.user_email = ${email}
+    `;
+    if (!legs[0]) return res.status(404).json({ error: "leg not found" });
+    const leg = legs[0];
+
+    const isCancelled = leg.status === "Cancelled";
+    const delayMins = leg.delay_minutes || 0;
+
+    // EC261 entitlement
+    const ec261 = calcEC261(leg.origin, leg.destination, delayMins, isCancelled);
+
+    // Search for alternative flights using existing searchRescueOptions logic
+    let alternatives = [];
+    try {
+      const dateStr = leg.departs_at ? new Date(leg.departs_at).toISOString().split("T")[0] : new Date().toISOString().split("T")[0];
+      const searchResult = await fetch(`${process.env.BASE_URL || "http://localhost:" + PORT}/rescue/options`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json", "Authorization": req.headers.authorization },
+        body: JSON.stringify({ tripId, origin: leg.origin, destination: leg.destination, date: dateStr }),
+      });
+      if (searchResult.ok) {
+        const d = await searchResult.json();
+        alternatives = (d.options || []).slice(0, 3);
+      }
+    } catch {}
+
+    // Build cascade actions — what else is affected
+    const cascadeActions = [];
+
+    // Check for hotel check-in tonight
+    const hotelLegs = await sql`
+      SELECT * FROM trip_legs WHERE trip_id = ${tripId} AND type = 'hotel'
+      AND DATE(check_in) = DATE(${leg.departs_at || new Date().toISOString()})
+    `;
+    if (hotelLegs.length > 0) {
+      cascadeActions.push({
+        type: "hotel_delay",
+        label: `Notify ${hotelLegs[0].name || "hotel"} of late arrival`,
+        description: "Your hotel check-in may be affected. Wingman can notify them.",
+        actionable: true,
+        data: { legId: hotelLegs[0].id, hotelName: hotelLegs[0].name },
+      });
+    }
+
+    // Check for restaurant reservations
+    const restLegs = await sql`
+      SELECT * FROM trip_legs WHERE trip_id = ${tripId} AND type = 'restaurant'
+      AND DATE(booking_time) = DATE(${leg.departs_at || new Date().toISOString()})
+    `;
+    if (restLegs.length > 0) {
+      cascadeActions.push({
+        type: "restaurant_delay",
+        label: `Reschedule dinner at ${restLegs[0].name || "restaurant"}`,
+        description: "Your dinner reservation may need to be pushed back.",
+        actionable: true,
+        data: { legId: restLegs[0].id, restaurantName: restLegs[0].name },
+      });
+    }
+
+    // Lounge access while waiting
+    if (isCancelled || delayMins >= 60) {
+      cascadeActions.push({
+        type: "lounge_access",
+        label: "Find lounge access while you wait",
+        description: "Check your card benefits for complimentary lounge access.",
+        actionable: true,
+        data: { iata: leg.origin },
+      });
+    }
+
+    // Rights info
+    const rightsInfo = isCancelled ? {
+      title: "Your rights",
+      body: "Under EU/UK law, the airline must offer you a full refund or rebooking at no extra cost. You are also entitled to meals and refreshments if the delay is over 2 hours.",
+    } : delayMins >= 120 ? {
+      title: "Your rights",
+      body: `Your flight is delayed by over 2 hours. The airline must provide meals and refreshments. If the delay exceeds 3 hours on arrival, you may be entitled to compensation.`,
+    } : null;
+
+    res.json({
+      ok: true,
+      flight: { ident: (leg.carrier || "") + (leg.flight_number || ""), origin: leg.origin, destination: leg.destination, status: leg.status, delay_minutes: delayMins },
+      is_cancelled: isCancelled,
+      alternatives,
+      ec261,
+      cascade_actions: cascadeActions,
+      rights_info: rightsInfo,
+    });
+  } catch (e) {
+    console.error("[disruption/alternatives]", e.message);
+    res.status(500).json({ error: e.message });
+  }
+});
+
+// ===========================================================================
+// HOME STATE — GET /me/home-state
+// Returns the user's current travel state for the contextual home screen
+// States: no_trip | pre_departure | at_airport | in_transit | at_destination
+// ===========================================================================
+app.get("/me/home-state", async (req, res) => {
+  const email = await verifyAccessToken(req);
+  if (!email) return res.status(401).json({ error: "unauthorized" });
+  try {
+    const { lat, lng } = req.query;
+    const now = new Date();
+    const in48h = new Date(now.getTime() + 48 * 3600000);
+    const in7d  = new Date(now.getTime() + 7 * 24 * 3600000);
+
+    // Get all upcoming trips and legs
+    const trips = await sql`
+      SELECT t.id, t.title, t.destination_city, t.destination_country,
+             json_agg(tl ORDER BY tl.departs_at NULLS LAST) as legs
+      FROM trips t
+      LEFT JOIN trip_legs tl ON tl.trip_id = t.id
+      WHERE t.user_email = ${email}
+        AND t.archived = false
+      GROUP BY t.id
+      ORDER BY t.created_at DESC
+      LIMIT 10
+    `;
+
+    // Find the most relevant flight leg
+    let activeLeg = null, activeTrip = null, state = "no_trip";
+    let hoursToDepart = null;
+
+    for (const trip of trips) {
+      for (const leg of (trip.legs || [])) {
+        if (leg?.type !== "flight" || !leg.departs_at) continue;
+        const depMs = new Date(leg.departs_at).getTime();
+        const nowMs = now.getTime();
+        const diffH = (depMs - nowMs) / 3600000;
+
+        // In air: departed up to 18h ago and not yet landed
+        if (diffH < 0 && diffH > -18 && leg.status !== "Landed") {
+          activeLeg = leg; activeTrip = trip; state = "in_transit"; hoursToDepart = diffH; break;
+        }
+        // At airport: departing in next 4 hours
+        if (diffH >= 0 && diffH <= 4) {
+          activeLeg = leg; activeTrip = trip; state = "at_airport"; hoursToDepart = diffH; break;
+        }
+        // Pre-departure: departing in 4-48 hours
+        if (diffH > 4 && diffH <= 48) {
+          if (!activeLeg || diffH < hoursToDepart) {
+            activeLeg = leg; activeTrip = trip; state = "pre_departure"; hoursToDepart = diffH;
+          }
+        }
+        // Next trip within 7 days
+        if (diffH > 48 && diffH <= 168) {
+          if (!activeLeg) {
+            activeLeg = leg; activeTrip = trip; state = "pre_departure"; hoursToDepart = diffH;
+          }
+        }
+      }
+      if (state === "in_transit" || state === "at_airport") break;
+    }
+
+    // Check if user just landed (at destination): last leg landed in past 24h
+    if (state === "no_trip" || state === "pre_departure") {
+      const recentLanded = await sql`
+        SELECT tl.*, t.destination_city, t.destination_country, t.id as trip_id, t.title as trip_title
+        FROM trip_legs tl JOIN trips t ON t.id = tl.trip_id
+        WHERE t.user_email = ${email}
+          AND tl.type = 'flight'
+          AND tl.status = 'Landed'
+          AND tl.departs_at > ${new Date(now.getTime() - 24 * 3600000).toISOString()}
+        ORDER BY tl.departs_at DESC LIMIT 1
+      `;
+      if (recentLanded[0]) {
+        state = "at_destination";
+        activeLeg = recentLanded[0];
+        activeTrip = { id: recentLanded[0].trip_id, title: recentLanded[0].trip_title, destination_city: recentLanded[0].destination_city, destination_country: recentLanded[0].destination_country };
+      }
+    }
+
+    // Get live flight status if we have an active leg
+    let liveStatus = null;
+    if (activeLeg?.flight_number) {
+      try {
+        const ident = (activeLeg.carrier || "") + activeLeg.flight_number;
+        liveStatus = await getFlightStatus(ident);
+      } catch {}
+    }
+
+    // Get weather at relevant location
+    let weatherData = null;
+    if (lat && lng) {
+      try {
+        const OWM_KEY = process.env.OPENWEATHER_API_KEY;
+        if (OWM_KEY) {
+          const wr = await fetch(`https://api.openweathermap.org/data/2.5/weather?lat=${lat}&lon=${lng}&appid=${OWM_KEY}&units=metric`);
+          if (wr.ok) {
+            const wd = await wr.json();
+            weatherData = {
+              temp: Math.round(wd.main?.temp),
+              feels_like: Math.round(wd.main?.feels_like),
+              description: wd.weather?.[0]?.description,
+              icon: wd.weather?.[0]?.main,
+              city: wd.name,
+            };
+          }
+        }
+      } catch {}
+    }
+
+    // Build context-aware suggestions based on state
+    const suggestions = [];
+    if (state === "at_airport" && activeLeg) {
+      suggestions.push({ label: "Lounge access", icon: "🛋", route: "Lounge", prefill: `Lounge access at ${activeLeg.origin}` });
+      suggestions.push({ label: "Security wait", icon: "🔒", route: "Concierge", prefill: `Security wait at ${activeLeg.origin} Terminal ${liveStatus?.terminal || activeLeg.terminal || ""}` });
+      if (liveStatus?.gate) suggestions.push({ label: `Gate ${liveStatus.gate}`, icon: "🚪", route: "Concierge", prefill: `Directions to gate ${liveStatus.gate} at ${activeLeg.origin}` });
+    } else if (state === "at_destination" && activeTrip) {
+      suggestions.push({ label: "Get around", icon: "🚇", route: "Concierge", prefill: `How do I get around ${activeTrip.destination_city || "here"}?` });
+      suggestions.push({ label: "Find lunch", icon: "🍽", route: "Concierge", prefill: `Find me lunch nearby` });
+      suggestions.push({ label: "What to do", icon: "🗺", route: "Concierge", prefill: `What should I do in ${activeTrip.destination_city || "here"} today?` });
+    } else if (state === "pre_departure" && activeLeg) {
+      const hoursStr = hoursToDepart > 24 ? `${Math.round(hoursToDepart / 24)}d` : `${Math.round(hoursToDepart)}h`;
+      suggestions.push({ label: "Pack list", icon: "🧳", route: "Concierge", prefill: `Pack list for my ${activeLeg.destination} trip` });
+      suggestions.push({ label: "Entry requirements", icon: "📋", route: "Concierge", prefill: `Entry requirements for ${activeLeg.destination}` });
+      suggestions.push({ label: "Currency tips", icon: "💳", route: "Concierge", prefill: `Currency and payment tips for ${activeLeg.destination}` });
+    } else if (state === "no_trip") {
+      suggestions.push({ label: "Plan a trip", icon: "✈️", route: "AddTrip", prefill: null });
+      suggestions.push({ label: "I'm somewhere new", icon: "📍", route: "Concierge", prefill: "I'm somewhere new — what should I know?" });
+    }
+
+    res.json({
+      ok: true,
+      state,
+      active_leg: activeLeg ? {
+        id: activeLeg.id,
+        trip_id: activeTrip?.id,
+        ident: (activeLeg.carrier || "") + (activeLeg.flight_number || ""),
+        origin: activeLeg.origin,
+        destination: activeLeg.destination,
+        departs_at: activeLeg.departs_at,
+        arrives_at: activeLeg.arrives_at,
+        status: liveStatus?.status || activeLeg.status || "Scheduled",
+        gate: liveStatus?.gate || activeLeg.gate,
+        terminal: liveStatus?.terminal || activeLeg.terminal,
+        delay_minutes: liveStatus?.delay ? Math.round(liveStatus.delay / 60) : 0,
+        trip_title: activeTrip?.title,
+      } : null,
+      active_trip: activeTrip ? {
+        id: activeTrip.id,
+        title: activeTrip.title,
+        destination_city: activeTrip.destination_city,
+        destination_country: activeTrip.destination_country,
+      } : null,
+      hours_to_depart: hoursToDepart,
+      weather: weatherData,
+      suggestions,
+    });
+  } catch (e) {
+    console.error("[home-state]", e.message);
+    res.status(500).json({ error: e.message });
+  }
+});
+
+// ===========================================================================
+// JOURNEY BUFFER PUSH CRON — runs every 5 minutes
+// Monitors users en route to airport; fires push when buffer drops below threshold
+// ===========================================================================
+async function runJourneyBufferCron() {
+  try {
+    // Find users with flights in next 3 hours who have journey monitoring enabled
+    const now = new Date();
+    const in3h = new Date(now.getTime() + 3 * 3600000);
+    const legs = await sql`
+      SELECT tl.id, tl.trip_id, tl.origin, tl.destination, tl.carrier, tl.flight_number,
+             tl.departs_at, tl.gate, tl.terminal, tl.status,
+             t.user_email
+      FROM trip_legs tl JOIN trips t ON t.id = tl.trip_id
+      WHERE tl.type = 'flight'
+        AND tl.departs_at BETWEEN ${now.toISOString()} AND ${in3h.toISOString()}
+        AND tl.status NOT IN ('Cancelled', 'Landed')
+    `;
+
+    for (const leg of legs) {
+      try {
+        // Check if user has journey notifications enabled
+        const userRows = await sql`SELECT preferences, push_token FROM users WHERE email = ${leg.user_email}`;
+        const prefs = userRows[0]?.preferences || {};
+        if (prefs.notify_journey === false) continue;
+        if (!userRows[0]?.push_token) continue;
+
+        const depMs = new Date(leg.departs_at).getTime();
+        const minsToDepart = Math.round((depMs - now.getTime()) / 60000);
+
+        // Only simulate if departure is 30-180 mins away (in the critical window)
+        if (minsToDepart < 30 || minsToDepart > 180) continue;
+
+        // Check if we already sent a journey alert for this leg in the last 30 min
+        const recentAlert = await sql`
+          SELECT id FROM departure_push_log
+          WHERE user_email = ${leg.user_email} AND leg_id = ${leg.id} AND push_type = 'journey_buffer'
+            AND created_at > ${new Date(now.getTime() - 30 * 60000).toISOString()}
+        `;
+        if (recentAlert.length > 0) continue;
+
+        // Get security wait
+        const securityMins = await getSecurityWait(leg.origin);
+        const gateWalkMins = 10;
+        const totalNeeded = securityMins + gateWalkMins + 15; // 15 min boarding buffer
+        const bufferMins = minsToDepart - totalNeeded;
+
+        if (bufferMins < 20) {
+          // At risk — send push
+          const ident = (leg.carrier || "") + (leg.flight_number || "");
+          const urgency = bufferMins < 0 ? "⚠️ You may miss" : bufferMins < 10 ? "⚠️ Very tight —" : "⏱ Heads up —";
+          const pushTitle = `${urgency} ${ident}`;
+          const pushBody = bufferMins < 0
+            ? `${ident} departs in ${minsToDepart} min. Security is ~${securityMins} min. You need to leave now.`
+            : `${ident} departs in ${minsToDepart} min. Security ~${securityMins} min + ${gateWalkMins} min to gate = ${bufferMins} min buffer. Leave soon.`;
+
+          await sendPushToUser(leg.user_email, pushTitle, pushBody, {
+            route: "Home",
+            tripId: String(leg.trip_id),
+            legId: String(leg.id),
+            type: "journey_buffer",
+          });
+          await sql`
+            INSERT INTO departure_push_log (user_email, leg_id, push_type)
+            VALUES (${leg.user_email}, ${leg.id}, 'journey_buffer')
+            ON CONFLICT DO NOTHING
+          `;
+          await logActivity(leg.user_email, "journey_alert", `Buffer alert for ${ident}`, pushBody, leg.trip_id, leg.id, { bufferMins, securityMins });
+        }
+      } catch (e) { console.error("[journey-buffer-cron leg]", e.message); }
+    }
+  } catch (e) { console.error("[journey-buffer-cron]", e.message); }
+}
+setInterval(runJourneyBufferCron, 5 * 60 * 1000);
+
+// ===========================================================================
+// PROACTIVE TRANSIT PAYMENT PUSH
+// Fires when user is at destination and about to use local transit
+// Uses existing TRANSIT_PAYMENT_DB from earlier build
+// ===========================================================================
+app.post("/journey/transit-check", async (req, res) => {
+  const email = await verifyAccessToken(req);
+  if (!email) return res.status(401).json({ error: "unauthorized" });
+  try {
+    const { city, lat, lng } = req.body || {};
+    if (!city) return res.status(400).json({ error: "city required" });
+
+    const info = getTransitPaymentInfo ? getTransitPaymentInfo(city) : null;
+    if (!info) return res.json({ ok: true, has_warning: false });
+
+    // Check if user's preferred payment methods work here
+    const userRows = await sql`SELECT preferences FROM users WHERE email = ${email}`;
+    const prefs = userRows[0]?.preferences || {};
+    const userPayments = prefs.payment_methods || ["apple_pay", "contactless"];
+
+    const warnings = [];
+    if (userPayments.includes("apple_pay") && !info.apple_pay) {
+      warnings.push(`Apple Pay is not accepted on ${info.network || "local transit"} in ${city}. ${info.fallback}`);
+    }
+    if (userPayments.includes("contactless") && !info.contactless) {
+      warnings.push(`Contactless cards are not accepted on ${info.network || "local transit"} in ${city}. ${info.fallback}`);
+    }
+
+    if (warnings.length > 0) {
+      // Send proactive push
+      await sendPushToUser(email,
+        `⚠️ Payment heads-up for ${city}`,
+        warnings[0],
+        { route: "Concierge", prefill: `How do I pay for transit in ${city}?` }
+      );
+      await logActivity(email, "transit_warning", `Transit payment warning: ${city}`, warnings[0]);
+    }
+
+    res.json({ ok: true, has_warning: warnings.length > 0, warnings, transit_info: info });
+  } catch (e) {
+    console.error("[transit-check]", e.message);
+    res.status(500).json({ error: e.message });
+  }
+});
+
 
 app.listen(PORT, () => console.log("Wingman API on http://localhost:" + PORT));
