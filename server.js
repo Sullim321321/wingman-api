@@ -1724,6 +1724,107 @@ app.delete("/trips/:id", async (req, res) => {
   }
 });
 
+// ── Local transit payment knowledge database ─────────────────────────────────
+// Curated data on how to pay for transit in major cities worldwide
+const TRANSIT_PAYMENT_DB = {
+  // UK
+  london:    { card: 'Oyster or contactless bank card (tap in/out)', app: 'TfL Oyster app', cash: 'Not accepted on buses or Tube', ticket_url: 'https://tfl.gov.uk/fares', tip: 'Contactless bank cards and Apple Pay work on all TfL services.' },
+  edinburgh: { card: 'Contactless bank card or Ridacard', app: 'Lothian Buses app', cash: 'Exact change only on buses — no change given', ticket_url: 'https://www.lothianbuses.com/tickets/', tip: 'Buy a day ticket on the app before boarding. Cash accepted but exact change only.' },
+  manchester:{ card: 'Contactless or Get Me There card', app: 'Get Me There app', cash: 'Exact change on buses', ticket_url: 'https://tfgm.com/tickets', tip: 'Trams (Metrolink) require a ticket before boarding — buy at platform machines.' },
+  // Ireland
+  dublin:    { card: 'Leap Card (tap on/off)', app: 'TFI Live app', cash: 'Exact change only — Apple Pay NOT accepted on Dublin Bus', ticket_url: 'https://www.leapcard.ie', tip: 'Apple Pay is not accepted on Dublin Bus. Buy a Leap Card at any newsagent or Spar. Top up in the TFI app. Exact coins only if paying cash.' },
+  // Sweden
+  stockholm: { card: 'SL Access card or contactless bank card', app: 'SL app', cash: 'Not accepted — card or app only', ticket_url: 'https://sl.se/en/in-english/fares--tickets/', tip: 'Buy a 24h or 72h ticket in the SL app before boarding. Contactless bank cards and Apple Pay work at most validators.' },
+  gothenburg:{ card: 'Västtrafik To Go app or contactless', app: 'Västtrafik To Go', cash: 'Not accepted', ticket_url: 'https://www.vasttrafik.se/en/tickets/', tip: 'Buy in the app — no cash or ticket machines on trams.' },
+  // Denmark
+  copenhagen:{ card: 'Rejsekort or contactless bank card', app: 'DOT Tickets app', cash: 'Not accepted on Metro; exact change on some buses', ticket_url: 'https://www.rejsekort.dk', tip: 'Contactless and Apple Pay work on the Metro. Buy a City Pass in the DOT app for unlimited travel.' },
+  // Norway
+  oslo:      { card: 'Ruter card or contactless', app: 'Ruter app', cash: 'Not accepted', ticket_url: 'https://ruter.no/en/', tip: 'Buy in the Ruter app. Contactless and Apple Pay work at validators.' },
+  // Netherlands
+  amsterdam: { card: 'OV-chipkaart or contactless bank card', app: 'NS app or 9292 app', cash: 'Not accepted on most services', ticket_url: 'https://www.ov-chipkaart.nl/en/', tip: 'Contactless bank cards and Apple Pay work on GVB trams and metro. Always tap in AND out or you will be charged the maximum fare.' },
+  // Germany
+  berlin:    { card: 'BVG ticket or contactless', app: 'BVG Fahrinfo app', cash: 'Accepted at machines, not on board', ticket_url: 'https://www.bvg.de/en/tickets', tip: 'Buy a day ticket (Tageskarte) in the BVG app. Validate paper tickets before boarding — inspectors are frequent.' },
+  munich:    { card: 'MVV ticket or contactless', app: 'MVV app', cash: 'Accepted at machines', ticket_url: 'https://www.mvv-muenchen.de/en/tickets-and-fares/', tip: 'Validate paper tickets immediately — fines are €60+. Contactless works on most U-Bahn and S-Bahn.' },
+  // France
+  paris:     { card: 'Navigo card or contactless bank card', app: 'Bonjour RATP app', cash: 'Not accepted on buses; accepted at Metro machines', ticket_url: 'https://www.ratp.fr/en/titres-et-tarifs', tip: 'Contactless bank cards and Apple Pay work on all Metro, RER, and buses. t+ tickets still work but Navigo Liberté+ is cheaper for short stays.' },
+  // Spain
+  madrid:    { card: 'Multi card or contactless', app: 'CRTM app', cash: 'Accepted at machines', ticket_url: 'https://www.crtm.es/billetes-y-tarifs/', tip: 'Buy a 10-trip Metrobus card at any Metro station — much cheaper than single tickets.' },
+  barcelona: { card: 'T-Casual card or contactless', app: 'TMB app', cash: 'Accepted at machines', ticket_url: 'https://www.tmb.cat/en/barcelona-fares-metro-bus', tip: 'T-Casual (10 trips) is the best value. Contactless works on Metro and buses.' },
+  // Italy
+  rome:      { card: 'ATAC ticket or contactless', app: 'MaCheStaFer app', cash: 'Accepted at tabacchi shops and machines', ticket_url: 'https://www.atac.roma.it/en/page/tickets-and-passes', tip: 'Buy tickets at tabacchi (newsagents) or machines before boarding. Validate immediately on the bus.' },
+  milan:     { card: 'ATM card or contactless', app: 'ATM Milano app', cash: 'Accepted at machines', ticket_url: 'https://www.atm.it/en/ViaggiaConNoi/Pagine/Biglietti.aspx', tip: 'Contactless and Apple Pay work on Metro. Buy a 24h or 48h pass in the ATM app.' },
+  // USA
+  'new york':{ card: 'OMNY contactless or MetroCard', app: 'MTA app', cash: 'Not accepted on buses (MetroCard or OMNY only)', ticket_url: 'https://new.mta.info/fares', tip: 'Tap your contactless card or Apple Pay directly at the turnstile — no MetroCard needed.' },
+  chicago:   { card: 'Ventra card or contactless', app: 'Ventra app', cash: 'Not accepted on L trains or buses', ticket_url: 'https://www.ventrachicago.com', tip: 'Load the Ventra app and tap your phone. Contactless bank cards work at most readers.' },
+  // Singapore
+  singapore: { card: 'EZ-Link or contactless bank card', app: 'SimplyGo app', cash: 'Not accepted', ticket_url: 'https://www.transitlink.com.sg/', tip: 'Contactless bank cards and Apple Pay work on all MRT and buses via SimplyGo. Always tap in AND out.' },
+  // Japan
+  tokyo:     { card: 'Suica or Pasmo IC card', app: 'Suica app (iPhone wallet)', cash: 'Accepted at machines, not on board', ticket_url: 'https://www.jreast.co.jp/e/pass/suica.html', tip: 'Add Suica to your iPhone Wallet — tap in and out everywhere. Apple Pay works natively. Cash machines at every station if you need to top up.' },
+  // Australia
+  sydney:    { card: 'Opal card or contactless bank card', app: 'Opal Travel app', cash: 'Not accepted', ticket_url: 'https://www.opal.com.au', tip: 'Contactless bank cards and Apple Pay work on all Sydney trains, buses, and ferries. Tap on AND off.' },
+  // UAE
+  dubai:     { card: 'Nol card or contactless', app: 'RTA Dubai app', cash: 'Accepted at machines', ticket_url: 'https://www.rta.ae/wps/portal/rta/ae/public-transport', tip: 'Buy a Nol card at any Metro station. Contactless works on Metro. Taxis are metered and very affordable.' },
+};
+
+function getTransitPaymentInfo(cityOrCountry) {
+  if (!cityOrCountry) return null;
+  const key = cityOrCountry.toLowerCase().trim();
+  if (TRANSIT_PAYMENT_DB[key]) return TRANSIT_PAYMENT_DB[key];
+  for (const [city, info] of Object.entries(TRANSIT_PAYMENT_DB)) {
+    if (key.includes(city) || city.includes(key)) return info;
+  }
+  return null;
+}
+
+// ── Google Directions Transit routing ────────────────────────────────────────
+// Returns structured transit route with steps, times, and payment info
+async function getTransitRoute(origin, destination, location) {
+  const apiKey = process.env.GOOGLE_PLACES_API_KEY;
+  if (!apiKey) return null;
+  try {
+    const originStr = origin || (location?.lat ? `${location.lat},${location.lng || location.lon}` : null);
+    if (!originStr || !destination) return null;
+    const url = `https://maps.googleapis.com/maps/api/directions/json?origin=${encodeURIComponent(originStr)}&destination=${encodeURIComponent(destination)}&mode=transit&alternatives=false&key=${apiKey}`;
+    const r = await fetch(url);
+    const data = await r.json();
+    if (data.status !== 'OK' || !data.routes?.length) return null;
+    const route = data.routes[0];
+    const leg = route.legs[0];
+    const steps = (leg.steps || []).map(step => ({
+      instruction: step.html_instructions?.replace(/<[^>]+>/g, '') || '',
+      mode: step.travel_mode,
+      duration: step.duration?.text,
+      distance: step.distance?.text,
+      transit: step.transit_details ? {
+        line: step.transit_details.line?.short_name || step.transit_details.line?.name,
+        vehicle: step.transit_details.line?.vehicle?.name,
+        departure_stop: step.transit_details.departure_stop?.name,
+        arrival_stop: step.transit_details.arrival_stop?.name,
+        departure_time: step.transit_details.departure_time?.text,
+        num_stops: step.transit_details.num_stops,
+      } : null,
+    }));
+    const city = location?.city || leg.start_address?.split(',').slice(-2).join(',').trim();
+    const paymentInfo = getTransitPaymentInfo(city);
+    return {
+      summary: route.summary,
+      total_duration: leg.duration?.text,
+      total_distance: leg.distance?.text,
+      departure_time: leg.departure_time?.text,
+      arrival_time: leg.arrival_time?.text,
+      start_address: leg.start_address,
+      end_address: leg.end_address,
+      steps,
+      payment: paymentInfo,
+      maps_url: `https://www.google.com/maps/dir/?api=1&origin=${encodeURIComponent(originStr)}&destination=${encodeURIComponent(destination)}&travelmode=transit`,
+    };
+  } catch (e) {
+    console.error('[transit-route]', e.message);
+    return null;
+  }
+}
+
+
 // ── Google Places grounding — fetch REAL business names near user's location ──────────────────────────────────────
 // Returns array of { name, address, rating, open_now, place_id, maps_url } or []
 async function getPlacesGrounding(userMessage, location) {
@@ -1861,11 +1962,18 @@ app.post("/concierge", async (req, res) => {
       : location?.lat
       ? `User's current coordinates: ${location.lat.toFixed(4)}, ${(location.lon || location.lng || 0).toFixed(4)}`
       : null;
-    // Grounding: run Places, Weather, and Perplexity in parallel (all best-effort)
-    const [placesResults, liveWeather, liveSearchContext] = await Promise.all([
+    // Detect transit/navigation intent for route lookup
+    const transitIntentRegex = /how (do i|can i|to) (get|go|travel|commute|take|reach)|directions? (to|from)|transit|bus|metro|subway|train|tram|tube|underground|from .+ to .+|get (from|to) .+|route (to|from)/i;
+    const transitMatch = message.match(/(?:from|get to|go to|travel to|directions? to|how (?:do i|can i) get to)\s+(.+?)(?:\s+from\s+(.+?))?(?:\?|$)/i);
+    const isTransitQuery = transitIntentRegex.test(message);
+    const transitDest = transitMatch ? transitMatch[1]?.trim() : null;
+    const transitOrigin = transitMatch ? transitMatch[2]?.trim() : null;
+    // Grounding: run Places, Weather, Perplexity, and Transit in parallel (all best-effort)
+    const [placesResults, liveWeather, liveSearchContext, transitRoute] = await Promise.all([
       getPlacesGrounding(message, location).catch(() => []),
       getLiveWeather(location).catch(() => null),
       getPerplexityGrounding(message).catch(() => null),
+      (isTransitQuery && transitDest) ? getTransitRoute(transitOrigin, transitDest, location).catch(() => null) : Promise.resolve(null),
     ]);
 
     // Enrich trips with live flight status + weather risk (in parallel, best-effort)
@@ -2006,6 +2114,7 @@ ${locationContext ? `=== USER'S CURRENT LOCATION ===\n${locationContext}\nUse th
 ${liveWeather ? `=== LIVE WEATHER AT USER'S LOCATION ===\nCurrently ${liveWeather.temp}\u00b0C (feels like ${liveWeather.feels}\u00b0C), ${liveWeather.desc}${liveWeather.windKph ? `, wind ${liveWeather.windKph} km/h` : ''}${liveWeather.humidity ? `, humidity ${liveWeather.humidity}%` : ''}.\nUse this when the user asks about weather, what to wear, or whether to go outside.\n` : ""}
 ${placesResults.length > 0 ? `=== NEARBY PLACES (REAL — from Google Maps, verified) ===\nThe following businesses actually exist near the user right now. ONLY recommend places from this list when asked for local recommendations. NEVER invent or hallucinate business names.\n${placesResults.map((p, i) => `${i+1}. ${p.name} — ${p.address || 'nearby'}${p.rating ? ` · ${p.rating}★ (${p.user_ratings_total} reviews)` : ''}${p.open_now === true ? ' · Open now' : p.open_now === false ? ' · Currently closed' : ''}${p.price_level !== null ? ' · ' + ['Free','Inexpensive','Moderate','Expensive','Very expensive'][p.price_level] || '' : ''}\n   Maps: ${p.maps_url}`).join('\n')}\n\nCRITICAL: You MUST only name businesses from the list above. If none match what the user is asking for, say so honestly and describe the type of neighbourhood to look in instead.\n` : ""}
 ${liveSearchContext ? `=== LIVE SEARCH RESULTS (current as of today — use these to ground your recommendations) ===\n${liveSearchContext}\n\nIMPORTANT: Prioritize information from the live search results above your training data when they conflict. If the search results mention a restaurant or hotel is closed, do not recommend it.\n` : ""}
+${transitRoute ? `=== TRANSIT ROUTE (from Google Directions API — verified) ===\nRoute: ${transitRoute.start_address} → ${transitRoute.end_address}\nTotal journey: ${transitRoute.total_duration}${transitRoute.total_distance ? ` · ${transitRoute.total_distance}` : ''}${transitRoute.departure_time ? ` · Departs ${transitRoute.departure_time}` : ''}${transitRoute.arrival_time ? ` · Arrives ${transitRoute.arrival_time}` : ''}\n\nSTEPS:\n${transitRoute.steps.map((s, i) => `${i+1}. [${s.mode}] ${s.instruction}${s.duration ? ` (${s.duration})` : ''}${s.transit ? ` — ${s.transit.vehicle || 'Transit'} ${s.transit.line || ''}, board at ${s.transit.departure_stop || ''}, alight at ${s.transit.arrival_stop || ''}${s.transit.departure_time ? ` (departs ${s.transit.departure_time})` : ''}${s.transit.num_stops ? `, ${s.transit.num_stops} stops` : ''}` : ''}`).join('\n')}\n\n${transitRoute.payment ? `PAYMENT IN THIS CITY:\n- Card: ${transitRoute.payment.card}\n- App: ${transitRoute.payment.app}\n- Cash: ${transitRoute.payment.cash}\n- TIP: ${transitRoute.payment.tip}\n- Buy tickets: ${transitRoute.payment.ticket_url}` : ''}\n\nOpen in Maps: ${transitRoute.maps_url}\n\nCRITICAL TRANSIT INSTRUCTIONS: When presenting this route, always include: (1) the specific transit line/bus number, (2) exactly how to pay in this city (especially whether Apple Pay works), (3) whether to tap in AND out or just tap in, (4) the direct ticket purchase link. End your response with: ACTION:{"type":"maps","label":"Open in Maps","url":"${transitRoute.maps_url}"} on its own line.\n` : ""}
 === USER'S TRIPS (with live data) ===
 ${tripsSummary}
 
@@ -2112,7 +2221,7 @@ LOGISTICS & PLANNING
       .trim();
     // Award points for first concierge message (idempotent)
     awardPoints(email, "concierge_first").catch(() => {});
-    res.json({ ok: true, reply, places: placesResults.length > 0 ? placesResults : undefined, weather: liveWeather || undefined, action: bookingAction || undefined });
+    res.json({ ok: true, reply, places: placesResults.length > 0 ? placesResults : undefined, weather: liveWeather || undefined, action: bookingAction || undefined, transit: transitRoute || undefined });
   } catch (e) {
     console.error("[concierge]", e.message);
     res.status(500).json({ error: "concierge error: " + e.message });
@@ -2634,7 +2743,7 @@ app.get("/weather", async (req, res) => {
   }
 });
 
-app.get("/health", (_req, res) => res.json({ ok: true, ts: Date.now(), version: "2.7.7" }));
+app.get("/health", (_req, res) => res.json({ ok: true, ts: Date.now(), version: "2.7.8" }));
 
 // ---------------------------------------------------------------------------
 // Disruption polling cron — runs every 15 min
@@ -4113,6 +4222,21 @@ app.post("/concierge/thread", auth, async (req, res) => {
     res.json({ ok: true });
   } catch (e) {
     console.error("[concierge/thread]", e.message);
+    res.status(500).json({ error: e.message });
+  }
+});
+// DELETE /concierge/thread — clear conversation history
+app.delete("/concierge/thread", auth, async (req, res) => {
+  try {
+    const tripId = req.query.trip_id ? Number(req.query.trip_id) : null;
+    if (tripId) {
+      await sql`DELETE FROM concierge_threads WHERE user_email = ${req.user.email} AND trip_id = ${tripId}`;
+    } else {
+      await sql`DELETE FROM concierge_threads WHERE user_email = ${req.user.email} AND trip_id IS NULL`;
+    }
+    res.json({ ok: true });
+  } catch (e) {
+    console.error("[concierge/thread DELETE]", e.message);
     res.status(500).json({ error: e.message });
   }
 });
