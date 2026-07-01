@@ -641,7 +641,7 @@ Return ONLY valid JSON:
   }
 }`;
     const resp = await getAnthropic().messages.create({
-      model: "claude-haiku-4-5",
+      model: "claude-3-5-haiku-20241022",
       max_tokens: 300,
       messages: [{ role: "user", content: prompt }],
     });
@@ -1838,18 +1838,25 @@ Return this exact JSON structure (null for unknown fields):
   "is_travel_booking": true or false
 }`;
 
-    const claudeResp = await getAnthropic().messages.create({
-      model: "claude-haiku-4-5",
-      max_tokens: 400,
-      messages: [{ role: "user", content: prompt }],
-    });
+    let claudeResp;
+    try {
+      claudeResp = await getAnthropic().messages.create({
+        model: "claude-3-5-haiku-20241022",
+        max_tokens: 400,
+        messages: [{ role: "user", content: prompt }],
+      });
+    } catch (llmErr) {
+      console.error("[gmail parse] LLM call failed:", llmErr.message, "Subject:", subject);
+      return;
+    }
 
     let parsed;
     try {
       const raw = claudeResp.content[0].text.trim();
       const jsonStr = raw.replace(/^```json\n?/, "").replace(/\n?```$/, "").trim();
       parsed = JSON.parse(jsonStr);
-    } catch {
+    } catch (parseErr) {
+      console.error("[gmail parse] JSON parse failed:", parseErr.message, "Raw:", claudeResp.content[0]?.text?.slice(0, 200));
       return;
     }
 
@@ -1906,6 +1913,29 @@ Return this exact JSON structure (null for unknown fields):
 }
 
 // ---------------------------------------------------------------------------
+// POST /trips/reparse-unknown — delete Unknown Trip records and re-trigger Gmail scan
+// ---------------------------------------------------------------------------
+app.post("/trips/reparse-unknown", async (req, res) => {
+  const email = await verifyAccessToken(req);
+  if (!email) return res.status(401).json({ error: "unauthorized" });
+  try {
+    // Delete trips with "Unknown Trip" title so they can be re-parsed
+    const deleted = await sql`
+      DELETE FROM trips
+      WHERE user_email = ${email}
+        AND (title = 'Unknown Trip' OR title = 'Unknown' OR title LIKE 'Unknown%Trip')
+      RETURNING id
+    `;
+    console.log(`[reparse] Deleted ${deleted.length} unknown trips for ${email}`);
+    // Re-trigger Gmail scan in background
+    scanGmailForTrips(email).catch(e => console.error("[reparse scan]", e.message));
+    res.json({ ok: true, deleted: deleted.length, message: "Unknown trips cleared, re-scanning Gmail now" });
+  } catch (e) {
+    console.error("[reparse-unknown]", e.message);
+    res.status(500).json({ error: e.message });
+  }
+});
+
 // POST /auth/gmail/scan — manually trigger a re-scan
 // ---------------------------------------------------------------------------
 app.post("/auth/gmail/scan", async (req, res) => {
@@ -2586,7 +2616,7 @@ LOGISTICS & PLANNING
     const systemMsg = messages.find(m => m.role === "system")?.content || "";
     const chatMessages = messages.filter(m => m.role !== "system");
         const claudeResp = await getAnthropic().messages.create({
-      model: "claude-haiku-4-5",
+      model: "claude-3-5-haiku-20241022",
       max_tokens: 1000,
       system: systemMsg,
       messages: chatMessages,
@@ -2903,7 +2933,7 @@ Return a JSON object with exactly this structure (no markdown, raw JSON only):
 Provide 2 neighborhoods, 3 hotels, 4 restaurants, 4 activities, 3 local tips, 3 concierge prompts.
 ${tasteSection ? "Filter recommendations through the user taste profile above." : ""}`;
     const resp = await getAnthropic().messages.create({
-      model: "claude-haiku-4-5",
+      model: "claude-3-5-haiku-20241022",
       max_tokens: 1200,
       messages: [{ role: "user", content: prompt }],
     });
@@ -3147,7 +3177,7 @@ app.post("/auth/refresh", authLimiter, async (req, res) => {
   }
 });
 
-app.get("/health", (_req, res) => res.json({ ok: true, ts: Date.now(), version: "2.9.4" }));
+app.get("/health", (_req, res) => res.json({ ok: true, ts: Date.now(), version: "2.9.5" }));
 
 // ---------------------------------------------------------------------------
 // Disruption polling cron — runs every 15 min
@@ -5802,7 +5832,7 @@ Return JSON: { "terminal_overview": "1-2 sentence summary", "picks": [ { "name":
 Include 6-8 picks. Prioritize quality sit-down options over fast food. Include at least one bar/lounge if available.`;
     const ai = getAnthropic();
     const msg = await ai.messages.create({
-      model: "claude-haiku-20240307",
+      model: "claude-3-haiku-20240307",
       max_tokens: 1200,
       messages: [{ role: "user", content: prompt }],
     });
@@ -5939,7 +5969,7 @@ app.get("/airports/:iata/city-transport", auth, async (req, res) => {
   try {
     const ai = getAnthropic();
     const msg = await ai.messages.create({
-      model: "claude-haiku-20240307",
+      model: "claude-3-haiku-20240307",
       max_tokens: 900,
       messages: [{ role: "user", content: `For a traveler arriving at ${iata} (${city}), what are the best ways to get around the city during their stay?
 Return JSON: { "city": string, "overview": string, "options": [ { "mode": string, "name": string, "description": string, "cost_per_trip": string, "app": string|null, "deep_link_ios": string|null, "tip": string } ] }
