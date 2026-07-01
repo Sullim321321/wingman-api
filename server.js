@@ -1487,11 +1487,20 @@ app.get("/profile", async (req, res) => {
 app.get("/auth/gmail/connect", async (req, res) => {
   const email = await verifyAccessToken(req);
   if (!email) return res.status(401).json({ error: "unauthorized" });
+  if (!process.env.GOOGLE_CLIENT_ID || !process.env.GOOGLE_CLIENT_SECRET) {
+    return res.status(503).json({
+      error: "Google OAuth not configured",
+      hint: "Set GOOGLE_CLIENT_ID and GOOGLE_CLIENT_SECRET in the Render dashboard environment variables."
+    });
+  }
   const oauth2 = makeOAuth2Client();
   const url = oauth2.generateAuthUrl({
     access_type: "offline",
     prompt: "consent",
-    scope: ["https://www.googleapis.com/auth/gmail.readonly"],
+    scope: [
+      "https://www.googleapis.com/auth/gmail.readonly",
+      "https://www.googleapis.com/auth/calendar.readonly"
+    ],
     state: Buffer.from(email).toString("base64"),
   });
   res.json({ url });
@@ -1523,11 +1532,35 @@ app.get("/auth/gmail/callback", async (req, res) => {
     `;
     // Trigger initial email scan in background
     scanGmailForTrips(userEmail, tokens).catch(e => console.error("[gmail scan]", e.message));
-    res.send(`<html><body style="font-family:sans-serif;text-align:center;padding:60px">
-      <h2 style="color:#5B8CFF">✈ Gmail connected!</h2>
-      <p>Wingman is scanning your inbox for travel bookings.</p>
-      <p style="color:#666;font-size:13px">You can close this tab and return to the app.</p>
-    </body></html>`);
+    // Deep-link back to the app — Expo scheme
+    const deepLink = "wingman://connections?gmail=connected";
+    res.send(`<html>
+      <head>
+        <meta charset="utf-8">
+        <meta name="viewport" content="width=device-width,initial-scale=1">
+        <title>Gmail Connected — Wingman</title>
+        <style>
+          body { font-family: -apple-system, sans-serif; background: #0E0C0A; color: #F5F0E8;
+                 text-align: center; padding: 60px 24px; margin: 0; }
+          h2 { color: #C9A96E; font-size: 22px; margin-bottom: 12px; }
+          p  { color: #9E9589; font-size: 15px; line-height: 1.6; }
+          a  { display: inline-block; margin-top: 24px; background: #C9A96E; color: #0E0C0A;
+               text-decoration: none; border-radius: 12px; padding: 14px 28px;
+               font-size: 15px; font-weight: 600; }
+        </style>
+        <script>
+          // Auto-redirect back to app after 1s
+          setTimeout(function() {
+            window.location.href = "${deepLink}";
+          }, 1000);
+        </script>
+      </head>
+      <body>
+        <h2>✈ Gmail connected</h2>
+        <p>Wingman is scanning your inbox for travel bookings.<br>Returning you to the app…</p>
+        <a href="${deepLink}">Return to Wingman</a>
+      </body>
+    </html>`);
   } catch (e) {
     console.error("[gmail/callback]", e.message);
     res.status(500).send("OAuth error: " + e.message);
@@ -2949,7 +2982,7 @@ app.post("/auth/refresh", authLimiter, async (req, res) => {
   }
 });
 
-app.get("/health", (_req, res) => res.json({ ok: true, ts: Date.now(), version: "2.9.1" }));
+app.get("/health", (_req, res) => res.json({ ok: true, ts: Date.now(), version: "2.9.2" }));
 
 // ---------------------------------------------------------------------------
 // Disruption polling cron — runs every 15 min
