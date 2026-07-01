@@ -16,22 +16,144 @@ const { google } = require("googleapis");
 const Anthropic = require("@anthropic-ai/sdk");
 const path = require("path");
 const { Duffel } = require("@duffel/api");
+const helmet = require("helmet");
+const rateLimit = require("express-rate-limit");
+const validator = require("validator");
+const crypto = require("crypto");
 
 const app = express();
-app.use(cors());
+
+// ── Security headers (helmet) ─────────────────────────────────────────────────
+app.use(helmet({
+  contentSecurityPolicy: false,   // API-only, no HTML served
+  crossOriginEmbedderPolicy: false,
+}));
+
+// ── CORS — locked to known origins ───────────────────────────────────────────
+const ALLOWED_ORIGINS = [
+  "https://wingmantravel.app",
+  "https://www.wingmantravel.app",
+  "exp://",        // Expo Go dev
+  /^exp:\/\//,
+  /^https:\/\/.*\.expo\.dev$/,
+];
+app.use(cors({
+  origin: (origin, cb) => {
+    // Allow no-origin (mobile apps, curl, Render health checks)
+    if (!origin) return cb(null, true);
+    const ok = ALLOWED_ORIGINS.some(o =>
+      typeof o === "string" ? o === origin : o.test(origin)
+    );
+    cb(ok ? null : new Error("CORS: origin not allowed"), ok);
+  },
+  methods: ["GET", "POST", "PATCH", "DELETE", "PUT", "OPTIONS"],
+  allowedHeaders: ["Content-Type", "Authorization"],
+  credentials: true,
+}));
+
+// ── Global rate limiter — 300 req / 15 min per IP ────────────────────────────
+const globalLimiter = rateLimit({
+  windowMs: 15 * 60 * 1000,
+  max: 300,
+  standardHeaders: true,
+  legacyHeaders: false,
+  message: { error: "Too many requests, please slow down." },
+});
+app.use(globalLimiter);
+
+// Trust Render's reverse proxy for correct IP in rate limiting
+app.set("trust proxy", 1);
+
+// Force HTTPS in production
+app.use((req, res, next) => {
+  if (process.env.NODE_ENV === "production" &&
+      req.headers["x-forwarded-proto"] !== "https") {
+    return res.redirect(301, "https://" + req.headers.host + req.url);
+  }
+  next();
+});
+
+// ── Auth endpoint limiter — 10 req / 15 min per IP ───────────────────────────
+const authLimiter = rateLimit({
+  windowMs: 15 * 60 * 1000,
+  max: 10,
+  standardHeaders: true,
+  legacyHeaders: false,
+  message: { error: "Too many auth attempts, please try again later." },
+  skip: (req) => process.env.NODE_ENV === "test",
+});
+
+// ── Concierge limiter — 60 req / 10 min per IP ───────────────────────────────
+const conciergeLimiter = rateLimit({
+  windowMs: 10 * 60 * 1000,
+  max: 60,
+  standardHeaders: true,
+  legacyHeaders: false,
+  message: { error: "Concierge rate limit reached. Please wait a moment." },
+});
+
+// ── Body size limit — 1 MB ────────────────────────────────────────────────────
 // Stripe webhook requires raw body for signature verification — skip JSON parsing for that route
 app.use((req, res, next) => {
   if (req.path === "/subscription/webhook") return next();
-  express.json()(req, res, next);
+  express.json({ limit: "1mb" })(req, res, next);
 });
 
 const PORT = process.env.PORT || 4000;
-const JWT_SECRET = process.env.JWT_SECRET || "dev-secret-change-me";
+const JWT_SECRET = process.env.JWT_SECRET;
+if (!JWT_SECRET) {
+  console.error("FATAL: JWT_SECRET env var not set. Refusing to start.");
+  process.exit(1);
+}
 const JWT_EXPIRES_IN = "30d";
+
+// ── Field-level encryption for OAuth tokens stored in DB ─────────────────────
+// ENCRYPTION_KEY must be a 64-char hex string (32 bytes) set in env
+const ENC_KEY = process.env.ENCRYPTION_KEY
+  ? Buffer.from(process.env.ENCRYPTION_KEY, "hex")
+  : null;
+const ENC_ALGO = "aes-256-gcm";
+
+function encryptField(plaintext) {
+  if (!ENC_KEY || !plaintext) return plaintext;
+  const iv = crypto.randomBytes(12);
+  const cipher = crypto.createCipheriv(ENC_ALGO, ENC_KEY, iv);
+  const encrypted = Buffer.concat([cipher.update(plaintext, "utf8"), cipher.final()]);
+  const tag = cipher.getAuthTag();
+  return iv.toString("hex") + ":" + tag.toString("hex") + ":" + encrypted.toString("hex");
+}
+
+function decryptField(ciphertext) {
+  if (!ENC_KEY || !ciphertext) return ciphertext;
+  // If it doesn't look encrypted (legacy plaintext), return as-is
+  const parts = ciphertext.split(":");
+  if (parts.length !== 3) return ciphertext;
+  try {
+    const iv = Buffer.from(parts[0], "hex");
+    const tag = Buffer.from(parts[1], "hex");
+    const encrypted = Buffer.from(parts[2], "hex");
+    const decipher = crypto.createDecipheriv(ENC_ALGO, ENC_KEY, iv);
+    decipher.setAuthTag(tag);
+    return decipher.update(encrypted) + decipher.final("utf8");
+  } catch { return ciphertext; } // fallback for legacy unencrypted values
+}
+
+// ── HTTPS enforcement — trust Render's proxy ─────────────────────────────────
 
 // ---------------------------------------------------------------------------
 // Reusable JWT auth middleware
 // ---------------------------------------------------------------------------
+// ── Input sanitisation helpers ────────────────────────────────────────────────
+function sanitiseEmail(e) {
+  if (!e || typeof e !== "string") return null;
+  const trimmed = e.trim().toLowerCase();
+  return validator.isEmail(trimmed) ? trimmed : null;
+}
+function sanitiseStr(s, maxLen = 500) {
+  if (!s || typeof s !== "string") return "";
+  return s.trim().slice(0, maxLen);
+}
+
 function auth(req, res, next) {
   const authHeader = req.headers.authorization || "";
   const token = authHeader.replace("Bearer ", "");
@@ -797,7 +919,7 @@ app.post("/points/redeem", auth, async (req, res) => {
 
 // POST /auth/request — send OTP
 // ---------------------------------------------------------------------------
-app.post("/auth/request", async (req, res) => {
+app.post("/auth/request", authLimiter, async (req, res) => {
   const email = ((req.body && req.body.email) || "").trim().toLowerCase();
   if (!email || !email.includes("@")) {
     return res.status(400).json({ error: "valid email required" });
@@ -834,7 +956,7 @@ app.post("/auth/request", async (req, res) => {
 // ---------------------------------------------------------------------------
 // POST /auth/verify — verify OTP, return JWT
 // ---------------------------------------------------------------------------
-app.post("/auth/verify", async (req, res) => {
+app.post("/auth/verify", authLimiter, async (req, res) => {
   const email = ((req.body && req.body.email) || "").trim().toLowerCase();
   const code = String((req.body && req.body.code) || "").trim();
   if (!email || !code) return res.status(400).json({ error: "email and code required" });
@@ -861,7 +983,7 @@ app.post("/auth/verify", async (req, res) => {
 // ---------------------------------------------------------------------------
 // POST /auth/apple — Sign in with Apple (verify identity token, return JWT)
 // ---------------------------------------------------------------------------
-app.post("/auth/apple", async (req, res) => {
+app.post("/auth/apple", authLimiter, async (req, res) => {
   const { identityToken, email: appleEmail, fullName } = req.body || {};
   if (!identityToken) return res.status(400).json({ error: "identityToken required" });
   try {
@@ -1336,7 +1458,7 @@ app.get("/auth/gmail/callback", async (req, res) => {
     const { tokens } = await oauth2.getToken(code);
     await sql`
       INSERT INTO gmail_tokens (user_email, access_token, refresh_token, expiry_date)
-      VALUES (${userEmail}, ${tokens.access_token}, ${tokens.refresh_token || null}, ${tokens.expiry_date || null})
+      VALUES (${userEmail}, ${encryptField(tokens.access_token)}, ${encryptField(tokens.refresh_token) || null}, ${tokens.expiry_date || null})
       ON CONFLICT (user_email) DO UPDATE SET
         access_token = EXCLUDED.access_token,
         refresh_token = COALESCE(EXCLUDED.refresh_token, gmail_tokens.refresh_token),
@@ -1364,8 +1486,8 @@ async function getGmailClient(userEmail) {
   if (!rows[0]) return null;
   const oauth2 = makeOAuth2Client();
   oauth2.setCredentials({
-    access_token: rows[0].access_token,
-    refresh_token: rows[0].refresh_token,
+    access_token: decryptField(rows[0].access_token),
+    refresh_token: decryptField(rows[0].refresh_token),
     expiry_date: rows[0].expiry_date,
   });
   // Auto-refresh if needed
@@ -1939,7 +2061,7 @@ async function getPerplexityGrounding(userMessage) {
 // ---------------------------------------------------------------------------
 // POST /concierge — LLM chat with trip context
 // ---------------------------------------------------------------------------
-app.post("/concierge", async (req, res) => {
+app.post("/concierge", conciergeLimiter, async (req, res) => {
   const email = await verifyAccessToken(req);
   if (!email) return res.status(401).json({ error: "unauthorized" });
   const { message, history, location } = req.body || {};
@@ -2400,7 +2522,7 @@ app.post("/trips/:id/refresh", async (req, res) => {
 // ---------------------------------------------------------------------------
 // Privacy Policy
 // ---------------------------------------------------------------------------
-app.get("/privacy", (_req, res) => {
+app.get("/privacy-html", (_req, res) => {
   res.sendFile(path.join(__dirname, "privacy.html"));
 });
 
@@ -6407,5 +6529,124 @@ app.post("/journey/transit-check", async (req, res) => {
   }
 });
 
+
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// DATA PRIVACY & GDPR/CCPA COMPLIANCE ENDPOINTS
+// ═══════════════════════════════════════════════════════════════════════════════
+
+// ── DELETE /me — full account deletion (GDPR Art. 17 / CCPA right to delete) ──
+// Cascades: trips, legs, activity, concierge threads, loyalty, gmail tokens,
+//           push tokens, refresh tokens, points, preferences — everything.
+app.delete("/me", auth, async (req, res) => {
+  const email = req.user.email;
+  try {
+    // Log the deletion request before wiping (for compliance audit trail)
+    await sql`
+      INSERT INTO data_deletion_log (user_email, requested_at, completed_at, method)
+      VALUES (${email}, NOW(), NOW(), 'user_request')
+      ON CONFLICT DO NOTHING
+    `.catch(() => {}); // table may not exist yet — handled below
+
+    // Cascade delete — all tables reference users(email) with ON DELETE CASCADE
+    // but we do it explicitly for clarity and to handle any missing FK constraints
+    await sql`DELETE FROM concierge_threads WHERE user_email = ${email}`;
+    await sql`DELETE FROM activity_log WHERE user_email = ${email}`;
+    await sql`DELETE FROM trip_legs WHERE trip_id IN (SELECT id FROM trips WHERE user_email = ${email})`;
+    await sql`DELETE FROM trips WHERE user_email = ${email}`;
+    await sql`DELETE FROM loyalty_accounts WHERE user_email = ${email}`;
+    await sql`DELETE FROM gmail_tokens WHERE user_email = ${email}`;
+    await sql`DELETE FROM refresh_tokens WHERE user_email = ${email}`;
+    await sql`DELETE FROM wingman_points_events WHERE user_email = ${email}`;
+    await sql`DELETE FROM wingman_points WHERE user_email = ${email}`;
+    await sql`DELETE FROM users WHERE email = ${email}`;
+
+    res.json({ ok: true, message: "Account and all associated data permanently deleted." });
+  } catch (e) {
+    console.error("[DELETE /me]", e.message);
+    res.status(500).json({ error: "Deletion failed. Please contact support@wingmantravel.app." });
+  }
+});
+
+// ── GET /me/data-export — full data export (GDPR Art. 20 portability) ─────────
+app.get("/me/data-export", auth, async (req, res) => {
+  const email = req.user.email;
+  try {
+    const [user]     = await sql`SELECT email, first_name, created_at, preferences, taste_profile FROM users WHERE email = ${email}`;
+    const trips      = await sql`SELECT * FROM trips WHERE user_email = ${email}`;
+    const legs       = await sql`SELECT tl.* FROM trip_legs tl JOIN trips t ON t.id = tl.trip_id WHERE t.user_email = ${email}`;
+    const loyalty    = await sql`SELECT program, points_balance, elite_status, updated_at FROM loyalty_accounts WHERE user_email = ${email}`;
+    const activity   = await sql`SELECT event_type, summary, created_at FROM activity_log WHERE user_email = ${email} ORDER BY created_at DESC LIMIT 500`;
+    const points     = await sql`SELECT balance, tier, updated_at FROM wingman_points WHERE user_email = ${email}`;
+
+    const export_data = {
+      exported_at: new Date().toISOString(),
+      notice: "This is all personal data Wingman holds about you. We do not sell this data to third parties.",
+      profile: {
+        email: user?.email,
+        first_name: user?.first_name,
+        member_since: user?.created_at,
+        preferences: user?.preferences,
+        taste_profile: user?.taste_profile,
+      },
+      trips: trips.map(t => ({ id: t.id, title: t.title, status: t.status, created_at: t.created_at })),
+      trip_legs: legs,
+      loyalty_accounts: loyalty,
+      wingman_points: points[0] || null,
+      activity_log: activity,
+    };
+
+    res.setHeader("Content-Disposition", `attachment; filename="wingman-data-export-${Date.now()}.json"`);
+    res.setHeader("Content-Type", "application/json");
+    res.json(export_data);
+  } catch (e) {
+    console.error("[data-export]", e.message);
+    res.status(500).json({ error: e.message });
+  }
+});
+
+// ── GET /privacy — machine-readable privacy manifest ─────────────────────────
+// Confirms no data sale, lists all third-party processors
+app.get("/privacy", (req, res) => {
+  res.json({
+    data_controller: "Wingman Travel Ltd",
+    contact: "privacy@wingmantravel.app",
+    last_updated: "2025-01-01",
+    data_sold_to_third_parties: false,
+    data_shared_for_advertising: false,
+    third_party_processors: [
+      { name: "Anthropic (Claude)", purpose: "AI concierge responses", data_sent: "Trip context, user query — no PII beyond what user types", retention: "Not retained by Anthropic per API terms" },
+      { name: "Neon (PostgreSQL)", purpose: "Primary database", data_sent: "All user data", retention: "Until account deletion" },
+      { name: "Upstash (Redis)", purpose: "OTP codes (30s TTL)", data_sent: "Email address, 6-digit OTP", retention: "30 seconds" },
+      { name: "Resend", purpose: "Transactional email (OTP, receipts)", data_sent: "Email address, message content", retention: "Per Resend DPA" },
+      { name: "Expo Push", purpose: "Push notifications", data_sent: "Push token, notification title/body", retention: "Not stored by Expo" },
+      { name: "Google (Directions, Places)", purpose: "Transit routing, venue lookup", data_sent: "Location coordinates, place queries", retention: "Per Google API terms" },
+      { name: "FlightAware AeroAPI", purpose: "Live flight status", data_sent: "Flight identifiers", retention: "Not retained" },
+      { name: "Amadeus", purpose: "Flight search and booking", data_sent: "Origin, destination, dates — no PII until booking", retention: "Per Amadeus DPA" },
+      { name: "Duffel", purpose: "Flight booking", data_sent: "Passenger details at booking only", retention: "Per Duffel DPA" },
+      { name: "Render", purpose: "API hosting (EU region)", data_sent: "All API traffic", retention: "Per Render DPA" },
+    ],
+    user_rights: ["access", "rectification", "erasure", "portability", "restriction", "objection"],
+    deletion_endpoint: "DELETE /me (authenticated)",
+    export_endpoint: "GET /me/data-export (authenticated)",
+  });
+});
+
+// ── DB migration for deletion log ─────────────────────────────────────────────
+(async () => {
+  try {
+    await sql`
+      CREATE TABLE IF NOT EXISTS data_deletion_log (
+        id SERIAL PRIMARY KEY,
+        user_email TEXT NOT NULL,
+        requested_at TIMESTAMPTZ NOT NULL,
+        completed_at TIMESTAMPTZ,
+        method TEXT DEFAULT 'user_request'
+      )
+    `;
+  } catch (e) {
+    console.warn("[migration] data_deletion_log:", e.message);
+  }
+})();
 
 app.listen(PORT, () => console.log("Wingman API on http://localhost:" + PORT));

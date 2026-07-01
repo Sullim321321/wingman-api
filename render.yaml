@@ -18,5 +18,7 @@ services:
         value: beta
       - key: JWT_SECRET
         generateValue: true
-      - key: OPENWEATHER_API_KEY
+      - key: ENCRYPTION_KEY
+    value: 0138c4cf75f974d3bbe8d982123f5f34734f5d66de9c83f1f785c1dff7fc7839
+  - key: OPENWEATHER_API_KEY
         value: fc81010424b80a83d0a6b4ebf28ad6a6
