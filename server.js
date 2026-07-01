@@ -1244,57 +1244,73 @@ app.get("/loyalty", async (req, res) => {
   }
 });
 
-// POST /loyalty/connect — connect a loyalty account
+// POST /loyalty/connect — connect a loyalty account (manual entry: member number + status tier)
 app.post("/loyalty/connect", async (req, res) => {
   const email = await verifyAccessToken(req);
   if (!email) return res.status(401).json({ error: "unauthorized" });
-  const { program, login, password, login2 } = req.body || {};
-  if (!program || !login || !password) return res.status(400).json({ error: "program, login, password required" });
+  const { program, login, password, login2, member_number, elite_status, member_name } = req.body || {};
+  if (!program) return res.status(400).json({ error: "program required" });
   const prog = LOYALTY_PROGRAMS[program];
   if (!prog) return res.status(400).json({ error: "unknown program" });
   try {
-    // Submit account to AwardWallet for initial sync
-    const awResp = await awRequest("/accounts", {
-      method: "POST",
-      body: JSON.stringify({
-        provider: prog.code,
-        login,
-        password,
-        ...(login2 ? { login2 } : {}),
-        userId: email,
-        userData: JSON.stringify({ userEmail: email, program }),
-      }),
-    });
-    // awResp contains accountId — store it
-    const awAccountId = awResp.accountId || awResp.id || null;
+    // Store the account with whatever data was provided (manual entry or credentials)
+    const accountNumber = member_number || login || null;
+    const statusTier = elite_status || null;
+    const displayName = member_name || null;
+
     await sql`
-      INSERT INTO loyalty_accounts (user_email, program, provider_code, aw_account_id, last_synced)
-      VALUES (${email}, ${program}, ${prog.code}, ${awAccountId}, NOW())
+      INSERT INTO loyalty_accounts (
+        user_email, program, provider_code,
+        account_number, member_name, elite_status,
+        last_synced
+      )
+      VALUES (
+        ${email}, ${program}, ${prog.code},
+        ${accountNumber}, ${displayName}, ${statusTier},
+        NOW()
+      )
       ON CONFLICT (user_email, provider_code)
-      DO UPDATE SET aw_account_id = EXCLUDED.aw_account_id, last_synced = NOW()
+      DO UPDATE SET
+        account_number = COALESCE(EXCLUDED.account_number, loyalty_accounts.account_number),
+        member_name    = COALESCE(EXCLUDED.member_name, loyalty_accounts.member_name),
+        elite_status   = COALESCE(EXCLUDED.elite_status, loyalty_accounts.elite_status),
+        last_synced    = NOW()
     `;
-    // Trigger an immediate sync
-    syncLoyaltyAccount(email, program).catch(e => console.error("[loyalty-sync]", e.message));
+
+    const statusMsg = statusTier ? ` · ${statusTier}` : "";
     await logActivity(email, "loyalty", `${prog.name} connected`,
-      `Wingman is now tracking your ${prog.name} balance and status. Syncing now…`);
-    res.json({ ok: true, program, awAccountId });
+      `${prog.name}${statusMsg} added to your profile.`);
+
+    // If credentials also provided, attempt AwardWallet sync in background (optional)
+    if (login && password) {
+      const awUser = process.env.AWARDWALLET_API_USER;
+      const awPass = process.env.AWARDWALLET_API_PASS;
+      if (awUser && awPass) {
+        awRequest("/accounts", {
+          method: "POST",
+          body: JSON.stringify({
+            provider: prog.code, login, password,
+            ...(login2 ? { login2 } : {}),
+            userId: email,
+            userData: JSON.stringify({ userEmail: email, program }),
+          }),
+        }).then(awResp => {
+          const awAccountId = awResp.accountId || awResp.id || null;
+          if (awAccountId) {
+            sql`UPDATE loyalty_accounts SET aw_account_id = ${awAccountId} WHERE user_email = ${email} AND program = ${program}`
+              .catch(e => console.error("[loyalty-aw-update]", e.message));
+          }
+          syncLoyaltyAccount(email, program).catch(e => console.error("[loyalty-sync]", e.message));
+        }).catch(e => console.error("[loyalty-aw]", e.message));
+      }
+    }
+
+    res.json({ ok: true, program, elite_status: statusTier, account_number: accountNumber });
   } catch (e) {
     console.error("[loyalty-connect]", e.message);
-    // If AwardWallet not configured, store the account anyway for manual sync later
-    if (e.message.includes("not set")) {
-      await sql`
-        INSERT INTO loyalty_accounts (user_email, program, provider_code, last_synced)
-        VALUES (${email}, ${program}, ${prog.code}, NOW())
-        ON CONFLICT (user_email, provider_code) DO NOTHING
-      `;
-      await logActivity(email, "loyalty", `${prog.name} added`,
-        `${prog.name} account saved. Configure AWARDWALLET_API_USER/PASS on Render to enable auto-sync.`);
-      return res.json({ ok: true, program, note: "stored without sync — AwardWallet not configured" });
-    }
     res.status(500).json({ error: e.message });
   }
 });
-
 // POST /loyalty/sync — manually trigger a sync for one or all accounts
 app.post("/loyalty/sync", async (req, res) => {
   const email = await verifyAccessToken(req);
@@ -1323,6 +1339,39 @@ app.delete("/loyalty/:program", async (req, res) => {
     await logActivity(email, "loyalty", `${prog?.name || program} disconnected`,
       `Wingman is no longer tracking your ${prog?.name || program} account.`);
     res.json({ ok: true });
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
+// PATCH /loyalty/:program — update status/balance manually
+app.patch("/loyalty/:program", async (req, res) => {
+  const email = await verifyAccessToken(req);
+  if (!email) return res.status(401).json({ error: "unauthorized" });
+  const { program } = req.params;
+  const { elite_status, points_balance, nights_ytd, segments_ytd, account_number, member_name } = req.body || {};
+  try {
+    const updates = [];
+    if (elite_status   !== undefined) updates.push(`elite_status = '${elite_status.replace(/'/g, "''")}'`);
+    if (points_balance !== undefined) updates.push(`points_balance = ${parseInt(points_balance) || 0}`);
+    if (nights_ytd     !== undefined) updates.push(`nights_ytd = ${parseInt(nights_ytd) || 0}`);
+    if (segments_ytd   !== undefined) updates.push(`segments_ytd = ${parseInt(segments_ytd) || 0}`);
+    if (account_number !== undefined) updates.push(`account_number = '${account_number.replace(/'/g, "''")}'`);
+    if (member_name    !== undefined) updates.push(`member_name = '${member_name.replace(/'/g, "''")}'`);
+    if (updates.length === 0) return res.json({ ok: true, note: "nothing to update" });
+    updates.push(`last_synced = NOW()`);
+    await sql`
+      UPDATE loyalty_accounts
+      SET elite_status   = COALESCE(${elite_status   ?? null}, elite_status),
+          points_balance = COALESCE(${points_balance != null ? parseInt(points_balance) : null}, points_balance),
+          nights_ytd     = COALESCE(${nights_ytd     != null ? parseInt(nights_ytd)     : null}, nights_ytd),
+          segments_ytd   = COALESCE(${segments_ytd   != null ? parseInt(segments_ytd)   : null}, segments_ytd),
+          account_number = COALESCE(${account_number ?? null}, account_number),
+          member_name    = COALESCE(${member_name    ?? null}, member_name),
+          last_synced    = NOW()
+      WHERE user_email = ${email} AND program = ${program}
+    `;
+    res.json({ ok: true, program });
   } catch (e) {
     res.status(500).json({ error: e.message });
   }
@@ -2982,7 +3031,7 @@ app.post("/auth/refresh", authLimiter, async (req, res) => {
   }
 });
 
-app.get("/health", (_req, res) => res.json({ ok: true, ts: Date.now(), version: "2.9.2" }));
+app.get("/health", (_req, res) => res.json({ ok: true, ts: Date.now(), version: "2.9.3" }));
 
 // ---------------------------------------------------------------------------
 // Disruption polling cron — runs every 15 min
