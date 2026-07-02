@@ -383,6 +383,7 @@ async function bootstrapDB() {
       )
     `;
     await sql`CREATE UNIQUE INDEX IF NOT EXISTS idx_concierge_thread ON concierge_threads(user_email, COALESCE(trip_id, -1))`;
+    await sql`CREATE UNIQUE INDEX IF NOT EXISTS idx_trips_email_id ON trips(user_email, raw_email_id) WHERE raw_email_id IS NOT NULL`;
     // Trip share tokens
     await sql`
       CREATE TABLE IF NOT EXISTS trip_shares (
@@ -1804,19 +1805,48 @@ async function scanGmailAccountForTrips(userEmail, accountEmail) {
   if (!gmail) return;
   // Search for booking confirmation emails
   const queries = [
+    // Airlines
     "from:united.com subject:confirmation",
     "from:delta.com subject:confirmation",
     "from:aa.com subject:confirmation",
     "from:southwest.com subject:confirmation",
     "from:alaskaair.com subject:confirmation",
     "from:jetblue.com subject:confirmation",
-    "from:marriott.com subject:confirmation",
-    "from:hilton.com subject:confirmation",
-    "from:airbnb.com subject:confirmation",
-    "from:hotels.com subject:confirmation",
-    "from:expedia.com subject:confirmation",
-    "from:booking.com subject:confirmation",
-    "subject:(flight confirmation OR itinerary OR booking confirmation) newer_than:6m",
+    "from:britishairways.com",
+    "from:virginatlantic.com",
+    "from:lufthansa.com subject:confirmation",
+    "from:emirates.com subject:confirmation",
+    "from:qantas.com subject:confirmation",
+    // Hotels - major chains
+    "from:marriott.com",
+    "from:hilton.com",
+    "from:ihg.com",
+    "from:hyatt.com",
+    "from:fourseasons.com",
+    "from:accor.com",
+    "from:wyndham.com",
+    "from:bestwestern.com",
+    "from:radissonhotels.com",
+    "from:choicehotels.com",
+    // OTAs
+    "from:airbnb.com",
+    "from:hotels.com",
+    "from:expedia.com",
+    "from:booking.com",
+    "from:priceline.com",
+    "from:kayak.com",
+    "from:hotwire.com",
+    "from:tripadvisor.com",
+    "from:agoda.com",
+    "from:vrbo.com",
+    // Car rental
+    "from:hertz.com subject:confirmation",
+    "from:enterprise.com subject:confirmation",
+    "from:avis.com subject:confirmation",
+    // Broad catch-all for anything travel-related in the last 6 months
+    "subject:(hotel confirmation OR hotel reservation OR booking confirmation OR reservation confirmed OR check-in OR itinerary) newer_than:6m",
+    "subject:(flight confirmation OR flight itinerary OR e-ticket OR boarding pass) newer_than:6m",
+    "subject:(your booking OR your reservation OR booking reference OR reservation number) newer_than:6m",
   ];
   const seen = new Set();
   for (const q of queries) {
@@ -1929,7 +1959,7 @@ Return this exact JSON structure (null for unknown fields):
     const tripRows = await sql`
       INSERT INTO trips (user_email, title, source, raw_email_id)
       VALUES (${userEmail}, ${tripTitle}, 'gmail', ${message.id})
-      ON CONFLICT DO NOTHING
+      ON CONFLICT (user_email, raw_email_id) DO NOTHING
       RETURNING id
     `;
     if (tripRows.length === 0) return;
@@ -2097,10 +2127,17 @@ app.post("/auth/gmail/scan", async (req, res) => {
     }
   }
 
-  // Otherwise: trigger a background Gmail re-scan (existing behaviour)
+  // Otherwise: trigger a background Gmail re-scan
+  // ?force=true clears previously-scanned gmail trips so missed emails are re-processed
+  const force = req.query.force === 'true' || req.body?.force === true;
   try {
+    if (force) {
+      // Delete all gmail-sourced trips so the scan picks them up fresh
+      const deleted = await sql`DELETE FROM trips WHERE user_email = ${email} AND source = 'gmail' RETURNING id`;
+      console.log(`[scan/force] cleared ${deleted.length} gmail trips for ${email}`);
+    }
     scanGmailForTrips(email).catch(e => console.error("[scan]", e.message));
-    res.json({ ok: true, message: "Scan started", trips_created: 0 });
+    res.json({ ok: true, message: force ? "Force rescan started — all Gmail trips cleared and re-importing" : "Scan started", trips_created: 0 });
   } catch (e) {
     res.status(500).json({ error: e.message });
   }
