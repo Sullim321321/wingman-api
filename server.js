@@ -5627,6 +5627,100 @@ function estimateDistanceKm(origin, dest) {
   return Math.round(R * 2 * Math.atan2(Math.sqrt(x), Math.sqrt(1-x)));
 }
 
+// Airline claim contact lookup
+const AIRLINE_CLAIM_CONTACTS = {
+  BA:  { name: "British Airways",    url: "https://www.britishairways.com/en-gb/information/legal/passenger-rights", email: "customer.relations@ba.com" },
+  LH:  { name: "Lufthansa",          url: "https://www.lufthansa.com/de/en/flight-disruption", email: "customercare@lufthansa.com" },
+  AF:  { name: "Air France",         url: "https://www.airfrance.com/en/information/passenger-rights", email: "customer.relations@airfrance.fr" },
+  KL:  { name: "KLM",                url: "https://www.klm.com/en/information/passenger-rights", email: "customer.care@klm.com" },
+  IB:  { name: "Iberia",             url: "https://www.iberia.com/en/information/passenger-rights", email: "atencionalcliente@iberia.es" },
+  FR:  { name: "Ryanair",            url: "https://www.ryanair.com/en/eu261", email: "eu261claims@ryanair.com" },
+  U2:  { name: "easyJet",            url: "https://www.easyjet.com/en/help/compensation", email: "customerservices@easyjet.com" },
+  UA:  { name: "United Airlines",    url: "https://www.united.com/en/us/fly/travel/disruptions.html", email: "customer.care@united.com" },
+  AA:  { name: "American Airlines",  url: "https://www.aa.com/i18n/customer-service/contact-american/passenger-rights.jsp", email: "customer.relations@aa.com" },
+  DL:  { name: "Delta Air Lines",    url: "https://www.delta.com/us/en/passenger-rights", email: "customer.care@delta.com" },
+  EK:  { name: "Emirates",           url: "https://www.emirates.com/english/help/passenger-rights", email: "customer.affairs@emirates.com" },
+  QR:  { name: "Qatar Airways",      url: "https://www.qatarairways.com/en/passenger-rights.html", email: "customercare@qatarairways.com" },
+  SQ:  { name: "Singapore Airlines", url: "https://www.singaporeair.com/en_UK/sg/travel-info/passenger-rights", email: "customerrelations@singaporeair.com" },
+  TK:  { name: "Turkish Airlines",   url: "https://www.turkishairlines.com/en-int/any-questions/passenger-rights", email: "customer@thy.com" },
+};
+
+// POST /trips/:tripId/compensation/check — check eligibility without creating a claim
+app.post("/trips/:tripId/compensation/check", auth, async (req, res) => {
+  try {
+    const { tripId } = req.params;
+    const { leg_id, disruption_type, delay_minutes } = req.body;
+    let leg = null;
+    if (leg_id) {
+      const rows = await sql`SELECT * FROM trip_legs WHERE id = ${leg_id} AND trip_id = ${tripId} LIMIT 1`;
+      leg = rows[0] || null;
+    }
+    if (!leg) {
+      const rows = await sql`SELECT * FROM trip_legs WHERE trip_id = ${tripId} AND type = 'flight' ORDER BY departs_at ASC LIMIT 1`;
+      leg = rows[0] || null;
+    }
+    if (!leg) return res.json({ eligible: false, reason: 'No flight leg found for this trip.' });
+    const origin  = leg.origin || '';
+    const dest    = leg.destination || '';
+    const carrier = (leg.carrier || '').toUpperCase();
+    const flightIdent = carrier && leg.flight_number ? `${carrier}${leg.flight_number}` : (leg.flight_ident || '');
+    const delayMins = delay_minutes || leg.delay_minutes || 0;
+    const cancelled = disruption_type === 'cancelled' || leg.status === 'cancelled';
+    const distanceKm = estimateDistanceKm(origin, dest);
+    const US_AIRPORTS = new Set(['JFK','LAX','ORD','ATL','DFW','MIA','SFO','BOS','SEA','DEN','LAS','IAH','PHX','EWR','MCO','CLT','LGA','SLC','DTW','MSP']);
+    const isUS = US_AIRPORTS.has(origin.toUpperCase()) || US_AIRPORTS.has(dest.toUpperCase());
+    const ec261 = calcEC261(origin, dest, delayMins, cancelled);
+    const airlineContact = AIRLINE_CLAIM_CONTACTS[carrier] || null;
+    const airlineName = airlineContact?.name || carrier || 'the airline';
+    if (!ec261 && !isUS) {
+      return res.json({
+        eligible: false,
+        reason: `This flight does not appear to qualify for EU261 or US DOT compensation. The route (${origin}\u2192${dest}) may not be covered, or the delay may be below the threshold.`,
+        flight: flightIdent, delay_minutes: delayMins, goodwill_available: true,
+      });
+    }
+    let amount, regulation, currency, basis;
+    if (ec261) {
+      amount = ec261.amount_eur; regulation = 'EU261'; currency = 'EUR'; basis = ec261.basis;
+    } else {
+      amount = null; regulation = 'DOT'; currency = 'USD';
+      basis = cancelled ? 'Flight cancelled' : `Delay of ${Math.round(delayMins/60)}h ${delayMins%60}m`;
+    }
+    const templateSubject = `${regulation === 'EU261' ? 'EU261/2004' : 'US DOT'} Compensation Claim \u2014 ${flightIdent}`;
+    const templateBody = [
+      `Dear ${airlineName} Customer Relations,`,
+      ``,
+      `I am writing to formally request compensation under ${regulation === 'EU261' ? 'EC Regulation 261/2004' : 'US DOT regulations'} in respect of flight ${flightIdent}${origin && dest ? ` operating ${origin}\u2013${dest}` : ''}.`,
+      ``,
+      basis ? `Disruption: ${basis}.` : '',
+      ``,
+      regulation === 'EU261'
+        ? `Under EC 261/2004, I am entitled to compensation of \u20ac${amount} based on the flight distance of approximately ${distanceKm.toLocaleString()} km.`
+        : `Under US DOT rules, I am requesting the applicable compensation for this disruption.`,
+      ``,
+      `Please confirm receipt of this claim and advise on next steps. I am happy to provide my booking reference, boarding pass, and any other documentation required.`,
+      ``,
+      `I expect a response within 14 days as required by regulation.`,
+      ``,
+      `Kind regards,`,
+      `[Your full name]`,
+      `[Booking reference]`,
+      `[Contact email]`,
+    ].filter(l => l !== null).join('\n');
+    res.json({
+      eligible: true, regulation, estimated_amount: amount, currency,
+      flight: flightIdent, origin, destination: dest, distance_km: distanceKm,
+      delay_minutes: delayMins, reason: basis, airline_name: airlineName,
+      airline_email: airlineContact?.email || null,
+      airline_claim_url: airlineContact?.url || null,
+      template_subject: templateSubject, template_body: templateBody,
+    });
+  } catch (e) {
+    console.error('[compensation/check]', e.message);
+    res.status(500).json({ error: e.message });
+  }
+});
+
 // POST /trips/:tripId/compensation — create or get a compensation claim
 app.post("/trips/:tripId/compensation", auth, async (req, res) => {
   try {
