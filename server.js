@@ -4891,9 +4891,21 @@ app.post("/trips/:tripId/rescue", auth, async (req, res) => {
       { disruption_type, delay_minutes, options_count: options.length, source: duffelSource ? "duffel" : "estimate" }
     );
 
+    // Build downstream leg summaries for the notification UI
+    const downstreamLegSummaries = downstreamLegs.map(dl => ({
+      id: dl.id,
+      type: dl.type || "other",
+      name: dl.carrier || dl.type || "Reservation",
+      origin: dl.origin || null,
+      destination: dl.destination || null,
+      departs_at: dl.departs_at,
+      confirmation: dl.confirmation || null,
+    }));
+
     res.json({
       disrupted_leg: { id: leg.id, flight: (leg.carrier || "") + (leg.flight_number || ""), origin, destination: dest },
       downstream_legs: downstreamLegs.length,
+      downstream_legs_detail: downstreamLegSummaries,
       downstream_value_at_risk: downstreamValue,
       options,
       data_source: duffelSource ? "live" : "estimate",
