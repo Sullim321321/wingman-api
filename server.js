@@ -1862,9 +1862,24 @@ Return this exact JSON structure (null for unknown fields):
 
     if (!parsed.is_travel_booking) return;
 
-    // Create or find trip
-    const dest = parsed.destination || "Unknown";
-    const tripTitle = parsed.title || (dest + " Trip");
+    // Create or find trip — build a meaningful title even when Claude returns null
+    const dest = parsed.destination || null;
+    const origin = parsed.origin || null;
+    const carrier = parsed.carrier || null;
+    let tripTitle = parsed.title;
+    if (!tripTitle || tripTitle === "Unknown" || tripTitle === "Unknown Trip") {
+      if (origin && dest) {
+        tripTitle = `${origin} → ${dest}`;
+      } else if (dest) {
+        tripTitle = `${dest} Trip`;
+      } else if (carrier && parsed.flight_number) {
+        tripTitle = `${carrier}${parsed.flight_number}`;
+      } else if (carrier) {
+        tripTitle = `${carrier} Flight`;
+      } else {
+        tripTitle = "Trip";
+      }
+    }
     const tripRows = await sql`
       INSERT INTO trips (user_email, title, source, raw_email_id)
       VALUES (${userEmail}, ${tripTitle}, 'gmail', ${message.id})
@@ -1913,6 +1928,48 @@ Return this exact JSON structure (null for unknown fields):
 }
 
 // ---------------------------------------------------------------------------
+// POST /trips/rename-unknown — retroactively rename Unknown Trip records using existing leg data
+// ---------------------------------------------------------------------------
+app.post("/trips/rename-unknown", auth, async (req, res) => {
+  const email = req.email;
+  try {
+    // Find all Unknown Trip records with at least one leg
+    const unknowns = await sql`
+      SELECT t.id, tl.origin, tl.destination, tl.carrier, tl.flight_number
+      FROM trips t
+      JOIN trip_legs tl ON tl.trip_id = t.id
+      WHERE t.user_email = ${email}
+        AND (t.title = 'Unknown Trip' OR t.title = 'Unknown' OR t.title LIKE 'Unknown%Trip')
+      ORDER BY t.id, tl.id
+    `;
+    // Group by trip id, use first leg for title
+    const seen = new Set();
+    let renamed = 0;
+    for (const row of unknowns) {
+      if (seen.has(row.id)) continue;
+      seen.add(row.id);
+      let newTitle;
+      if (row.origin && row.destination) {
+        newTitle = `${row.origin} \u2192 ${row.destination}`;
+      } else if (row.destination) {
+        newTitle = `${row.destination} Trip`;
+      } else if (row.carrier && row.flight_number) {
+        newTitle = `${row.carrier}${row.flight_number}`;
+      } else if (row.carrier) {
+        newTitle = `${row.carrier} Flight`;
+      } else {
+        continue; // no data to improve on
+      }
+      await sql`UPDATE trips SET title = ${newTitle} WHERE id = ${row.id} AND user_email = ${email}`;
+      renamed++;
+    }
+    res.json({ ok: true, renamed });
+  } catch (e) {
+    console.error("[rename-unknown]", e.message);
+    res.status(500).json({ error: e.message });
+  }
+});
+
 // POST /trips/reparse-unknown — delete Unknown Trip records and re-trigger Gmail scan
 // ---------------------------------------------------------------------------
 app.post("/trips/reparse-unknown", async (req, res) => {
@@ -7220,6 +7277,27 @@ app.get("/me/home-state", async (req, res) => {
       suggestions.push({ label: "I'm somewhere new", icon: "📍", route: "Concierge", prefill: "I'm somewhere new — what should I know?" });
     }
 
+    // Find hotel leg for the active trip (current stay or next check-in within 7 days)
+    let hotelLeg = null;
+    if (activeTrip) {
+      try {
+        const hotelLegs = await sql`
+          SELECT * FROM trip_legs
+          WHERE trip_id = ${activeTrip.id}
+            AND type = 'hotel'
+          ORDER BY departs_at ASC
+          LIMIT 3
+        `;
+        for (const h of hotelLegs) {
+          const checkin = h.departs_at ? new Date(h.departs_at).getTime() : null;
+          const checkout = h.arrives_at ? new Date(h.arrives_at).getTime() : null;
+          const nowMs = now.getTime();
+          if (checkin && checkout && nowMs >= checkin && nowMs <= checkout) { hotelLeg = h; break; }
+          if (checkin && checkin > nowMs && (checkin - nowMs) < 7 * 86400000) { hotelLeg = h; break; }
+        }
+      } catch {}
+    }
+
     res.json({
       ok: true,
       state,
@@ -7245,6 +7323,12 @@ app.get("/me/home-state", async (req, res) => {
       } : null,
       hours_to_depart: hoursToDepart,
       weather: weatherData,
+      hotel: hotelLeg ? {
+        name: hotelLeg.carrier || hotelLeg.title || "Hotel",
+        checkin_at: hotelLeg.departs_at,
+        checkout_at: hotelLeg.arrives_at,
+        destination: hotelLeg.destination,
+      } : null,
       suggestions,
     });
   } catch (e) {
