@@ -2938,10 +2938,12 @@ app.get("/predict", async (req, res) => {
 });
 
 // ---------------------------------------------------------------------------
-// FlightAware AeroAPI — live flight status
+// Live flight status — FlightAware AeroAPI (primary) + AviationStack (fallback)
 // ---------------------------------------------------------------------------
 const AEROAPI_BASE = "https://aeroapi.flightaware.com/aeroapi";
-async function getFlightStatus(flightIdent) {
+
+// FlightAware AeroAPI — primary source
+async function getFlightStatusFlightAware(flightIdent) {
   const key = process.env.FLIGHTAWARE_API_KEY;
   if (!key) return null;
   try {
@@ -2964,11 +2966,62 @@ async function getFlightStatus(flightIdent) {
     const terminal = flight.terminal_origin || null;
     const actualDep = flight.actual_out || flight.estimated_out || null;
     const scheduledDep = flight.scheduled_out || null;
-    return { status, delay, gate, terminal, actualDep, scheduledDep };
+    return { status, delay, gate, terminal, actualDep, scheduledDep, source: "flightaware" };
   } catch (e) {
     console.error("[aeroapi]", e.message);
     return null;
   }
+}
+
+// AviationStack — free-tier fallback (500 calls/mo free, $9.99/mo for 10K)
+// Maps AviationStack flight_status values to Wingman's canonical status strings
+const AVIATIONSTACK_STATUS_MAP = {
+  scheduled: "Scheduled",
+  active:    "In Air",
+  landed:    "Landed",
+  cancelled: "Cancelled",
+  incident:  "Cancelled",
+  diverted:  "Delayed",
+};
+async function getFlightStatusAviationStack(flightIdent) {
+  const key = process.env.AVIATIONSTACK_API_KEY;
+  if (!key) return null;
+  // Parse IATA carrier code + flight number (e.g. "AA100" → iata_code=AA, flight_number=100)
+  const match = flightIdent.match(/^([A-Z]{2,3})(\d+)$/);
+  if (!match) return null;
+  const [, iata, num] = match;
+  try {
+    const url = `http://api.aviationstack.com/v1/flights?access_key=${key}&flight_iata=${encodeURIComponent(flightIdent)}&limit=1`;
+    const r = await fetch(url, { headers: { "Accept": "application/json" } });
+    if (!r.ok) return null;
+    const j = await r.json();
+    const flight = j.data?.[0];
+    if (!flight) return null;
+    const rawStatus = (flight.flight_status || "").toLowerCase();
+    const status = AVIATIONSTACK_STATUS_MAP[rawStatus] || "Unknown";
+    // Compute delay in minutes from scheduled vs estimated departure
+    let delay = 0;
+    const sched = flight.departure?.scheduled;
+    const est   = flight.departure?.estimated || flight.departure?.actual;
+    if (sched && est) {
+      delay = Math.max(0, Math.round((new Date(est) - new Date(sched)) / 60000));
+    }
+    const gate     = flight.departure?.gate || null;
+    const terminal = flight.departure?.terminal || null;
+    const actualDep    = flight.departure?.actual || flight.departure?.estimated || null;
+    const scheduledDep = flight.departure?.scheduled || null;
+    return { status, delay, gate, terminal, actualDep, scheduledDep, source: "aviationstack" };
+  } catch (e) {
+    console.error("[aviationstack]", e.message);
+    return null;
+  }
+}
+
+// Unified getFlightStatus — tries FlightAware first, falls back to AviationStack
+async function getFlightStatus(flightIdent) {
+  const fa = await getFlightStatusFlightAware(flightIdent);
+  if (fa) return fa;
+  return getFlightStatusAviationStack(flightIdent);
 }
 
 // GET /flight-status?ident=UA412
@@ -3331,6 +3384,103 @@ app.get("/profile/passenger", auth, async (req, res) => {
 });
 
 // ---------------------------------------------------------------------------
+// Passport OCR  POST /profile/passport-scan
+// Accepts a base64-encoded passport image, uses Claude Vision to extract MRZ
+// data, and saves the result to the passenger_profile.
+// PII note: the image is sent to Anthropic but NOT stored on our servers.
+// The extracted fields (name, DOB, passport number) are stored encrypted in
+// the user's preferences JSONB under passenger_profile.
+// ---------------------------------------------------------------------------
+app.post("/profile/passport-scan", auth, requirePro, async (req, res) => {
+  const { image_base64, media_type = "image/jpeg" } = req.body || {};
+  if (!image_base64) return res.status(400).json({ error: "image_base64 required" });
+  // Validate media type
+  const allowed = ["image/jpeg", "image/png", "image/webp", "image/gif"];
+  if (!allowed.includes(media_type)) return res.status(400).json({ error: "Unsupported media type" });
+  // Enforce max image size (1.5 MB base64 ≈ 1.1 MB binary)
+  if (image_base64.length > 2_000_000) return res.status(413).json({ error: "Image too large (max ~1.5 MB)" });
+  try {
+    const anthropic = getAnthropic();
+    const response = await anthropic.messages.create({
+      model: "claude-opus-4-5",
+      max_tokens: 400,
+      messages: [{
+        role: "user",
+        content: [
+          {
+            type: "image",
+            source: { type: "base64", media_type, data: image_base64 },
+          },
+          {
+            type: "text",
+            text: `You are a passport MRZ (Machine Readable Zone) parser. Extract the following fields from this passport image and return ONLY valid JSON with no other text:
+{
+  "given_name": "<first name(s) as on passport>",
+  "family_name": "<surname as on passport>",
+  "born_on": "<date of birth in YYYY-MM-DD format>",
+  "gender": "<m or f>",
+  "passport_number": "<passport number>",
+  "passport_expiry": "<expiry date in YYYY-MM-DD format>",
+  "passport_country": "<3-letter ISO country code>",
+  "nationality": "<3-letter ISO nationality code>"
+}
+If a field cannot be read, use null. Do not include any explanation or markdown.`,
+          },
+        ],
+      }],
+    });
+    let parsed;
+    try {
+      parsed = JSON.parse(response.content[0].text.replace(/```json\n?|```/g, "").trim());
+    } catch (_) {
+      return res.status(422).json({ error: "Could not parse passport data", raw: response.content[0].text });
+    }
+    // Validate we got at least name and DOB
+    if (!parsed.given_name || !parsed.family_name || !parsed.born_on) {
+      return res.status(422).json({ error: "Could not extract required fields (name, date of birth) from passport image" });
+    }
+    // Sanitise all extracted fields
+    const passengerProfile = {
+      given_name:       sanitiseStr(parsed.given_name, 100),
+      family_name:      sanitiseStr(parsed.family_name, 100),
+      born_on:          sanitiseStr(parsed.born_on, 20),
+      gender:           sanitiseStr(parsed.gender || "m", 10),
+      passport_number:  parsed.passport_number  ? sanitiseStr(parsed.passport_number, 20)  : undefined,
+      passport_expiry:  parsed.passport_expiry  ? sanitiseStr(parsed.passport_expiry, 20)  : undefined,
+      passport_country: parsed.passport_country ? sanitiseStr(parsed.passport_country, 5)  : undefined,
+      nationality:      parsed.nationality      ? sanitiseStr(parsed.nationality, 5)        : undefined,
+      ocr_source: "claude_vision",
+      ocr_at: new Date().toISOString(),
+    };
+    // Remove undefined fields
+    Object.keys(passengerProfile).forEach(k => passengerProfile[k] === undefined && delete passengerProfile[k]);
+    // Merge into existing preferences
+    const rows = await sql`SELECT preferences FROM users WHERE email = ${req.user.email}`;
+    const existing = rows[0]?.preferences || {};
+    const merged = { ...existing, passenger_profile: { ...(existing.passenger_profile || {}), ...passengerProfile } };
+    await sql`UPDATE users SET preferences = ${JSON.stringify(merged)}::jsonb WHERE email = ${req.user.email}`;
+    // Sync first_name to users table for greeting
+    await sql`UPDATE users SET first_name = ${passengerProfile.given_name} WHERE email = ${req.user.email}`;
+    // Return masked confirmation — never echo passport number back
+    res.json({
+      ok: true,
+      passenger_profile: {
+        given_name:      passengerProfile.given_name,
+        family_name:     passengerProfile.family_name,
+        born_on:         passengerProfile.born_on ? passengerProfile.born_on.slice(0, 4) + "-**-**" : null,
+        gender:          passengerProfile.gender,
+        has_passport:    !!passengerProfile.passport_number,
+        passport_expiry: passengerProfile.passport_expiry || null,
+        passport_country: passengerProfile.passport_country || null,
+      },
+    });
+  } catch (e) {
+    console.error("[passport-ocr]", e.message);
+    res.status(500).json({ error: "Passport scan failed", detail: e.message });
+  }
+});
+
+// ---------------------------------------------------------------------------
 // ROI / Insights  GET /insights/roi
 // ---------------------------------------------------------------------------
 app.get("/insights/roi", auth, async (req, res) => {
@@ -3456,7 +3606,38 @@ app.post("/auth/refresh", authLimiter, async (req, res) => {
   }
 });
 
-app.get("/health", (_req, res) => res.json({ ok: true, ts: Date.now(), version: "2.11.0" }));
+app.get("/health", (_req, res) => res.json({ ok: true, ts: Date.now(), version: "2.12.0" }));
+
+// GET /env-status — internal diagnostic (auth required, non-sensitive)
+// Shows which optional API integrations are configured without exposing key values
+app.get("/env-status", auth, (_req, res) => {
+  res.json({
+    version: "2.12.0",
+    integrations: {
+      flightaware:    { configured: !!process.env.FLIGHTAWARE_API_KEY,    label: "FlightAware AeroAPI (primary flight status)" },
+      aviationstack:  { configured: !!process.env.AVIATIONSTACK_API_KEY,  label: "AviationStack (fallback flight status, free tier)" },
+      duffel:         { configured: !!process.env.DUFFEL_API_KEY,          label: "Duffel (flight search + booking execution)" },
+      stripe:         { configured: !!process.env.STRIPE_SECRET_KEY,       label: "Stripe (subscriptions + Apple Pay)" },
+      stripe_pro_price: { configured: !!(process.env.STRIPE_PRO_PRICE_ID && !process.env.STRIPE_PRO_PRICE_ID.startsWith('price_pro')), label: "Stripe Pro price ID (real product)" },
+      stripe_elite_price: { configured: !!(process.env.STRIPE_ELITE_PRICE_ID && !process.env.STRIPE_ELITE_PRICE_ID.startsWith('price_elite')), label: "Stripe Elite price ID (real product)" },
+      stripe_webhook: { configured: !!process.env.STRIPE_WEBHOOK_SECRET,  label: "Stripe webhook signature verification" },
+      anthropic:      { configured: !!process.env.ANTHROPIC_API_KEY,       label: "Anthropic Claude (concierge + passport OCR)" },
+      google_oauth:   { configured: !!(process.env.GOOGLE_CLIENT_ID && process.env.GOOGLE_CLIENT_SECRET), label: "Google OAuth (Gmail import)" },
+      resend:         { configured: !!(process.env.RESEND_API_KEY && !process.env.RESEND_API_KEY.startsWith('re_placeholder')), label: "Resend (transactional email)" },
+      database:       { configured: !!(process.env.DATABASE_URL && !process.env.DATABASE_URL.includes('placeholder')), label: "Neon PostgreSQL" },
+      redis:          { configured: !!process.env.UPSTASH_REDIS_REST_URL,  label: "Upstash Redis (OTP)" },
+    },
+    crons: {
+      disruption_poll:    "every 15 min (30s startup delay)",
+      pre_departure_push: "every 5 min",
+      post_trip_debrief:  "every 10 min",
+      loyalty_sync:       "every 6 hr",
+      hotel_monitor:      "every 30 min",
+      upgrade_bid_watcher: "every 6 hr (node-cron)",
+      points_expiry:      "every 6 hr",
+    },
+  });
+});
 
 // ---------------------------------------------------------------------------
 // Disruption polling cron — runs every 15 min
@@ -4682,7 +4863,7 @@ app.get("/trips/:tripId/risk", auth, async (req, res) => {
 // Queries live Duffel for cash options; Point.me for award options if key present.
 // Falls back to structured estimates when APIs are unavailable.
 // ---------------------------------------------------------------------------
-app.post("/trips/:tripId/rescue", auth, async (req, res) => {
+app.post("/trips/:tripId/rescue", auth, requirePro, async (req, res) => {
   const { tripId } = req.params;
   const { disrupted_leg_id, disruption_type, delay_minutes } = req.body || {};
   try {
@@ -4918,7 +5099,7 @@ app.post("/trips/:tripId/rescue", auth, async (req, res) => {
 
 // POST /trips/:tripId/rescue/accept — user accepts a rescue option
 // If option has a duffel_offer_id and passengers are provided, executes the booking via Duffel.
-app.post("/trips/:tripId/rescue/accept", auth, async (req, res) => {
+app.post("/trips/:tripId/rescue/accept", auth, requirePro, async (req, res) => {
   const { tripId } = req.params;
   const { option_id, disrupted_leg_id, value_saved, duffel_offer_id, passengers } = req.body || {};
   try {
@@ -5019,7 +5200,7 @@ app.post("/trips/:tripId/rescue/accept", auth, async (req, res) => {
 });
 
 // POST /trips/:tripId/rescue/reject — user rejects all rescue options
-app.post("/trips/:tripId/rescue/reject", auth, async (req, res) => {
+app.post("/trips/:tripId/rescue/reject", auth, requirePro, async (req, res) => {
   const { tripId } = req.params;
   const { disrupted_leg_id, reason } = req.body || {};
   try {
@@ -5387,7 +5568,7 @@ function requirePro(req, res, next) {
 // DAY-OF-FLIGHT BRIEFING ENDPOINT
 // GET /trips/:tripId/briefing — live gate, TSA wait, drive time, weather
 // ---------------------------------------------------------------------------
-app.get('/trips/:tripId/briefing', auth, async (req, res) => {
+app.get('/trips/:tripId/briefing', auth, requirePro, async (req, res) => {
   try {
     const { tripId } = req.params;
     const legs = await sql`
@@ -5434,7 +5615,7 @@ app.get('/trips/:tripId/briefing', auth, async (req, res) => {
 // DESTINATION INTELLIGENCE ENDPOINT
 // GET /trips/:tripId/destination-intel — personalised restaurant/hotel/neighbourhood tips
 // ---------------------------------------------------------------------------
-app.get('/trips/:tripId/destination-intel', auth, async (req, res) => {
+app.get('/trips/:tripId/destination-intel', auth, requirePro, async (req, res) => {
   try {
     const { tripId } = req.params;
     const [tripRows, userRows] = await Promise.all([
@@ -5864,7 +6045,7 @@ app.patch("/compensation/:id", auth, async (req, res) => {
 // ---------------------------------------------------------------------------
 
 // POST /trips/:tripId/upgrade-bid — set an upgrade bid for a flight leg
-app.post("/trips/:tripId/upgrade-bid", auth, async (req, res) => {
+app.post("/trips/:tripId/upgrade-bid", auth, requirePro, async (req, res) => {
   try {
     const { leg_id, flight_ident, cabin_target, max_points, max_cash_usd } = req.body;
     if (!flight_ident) return res.status(400).json({ error: "flight_ident required" });
@@ -7207,7 +7388,7 @@ async function sendTwilioSMS(to, body) {
 // POST /trips/:tripId/cascade/hotel-notify
 // Sends an SMS or generates a call script to notify the hotel of a late arrival.
 // Body: { leg_id, delay_minutes, hotel_phone? }
-app.post("/trips/:tripId/cascade/hotel-notify", auth, async (req, res) => {
+app.post("/trips/:tripId/cascade/hotel-notify", auth, requirePro, async (req, res) => {
   const { tripId } = req.params;
   const { leg_id, delay_minutes, hotel_phone } = req.body || {};
   try {
@@ -7260,7 +7441,7 @@ app.post("/trips/:tripId/cascade/hotel-notify", auth, async (req, res) => {
 // POST /trips/:tripId/cascade/restaurant-reschedule
 // Uses Claude to draft a polite reschedule message for a restaurant reservation.
 // Body: { leg_id, delay_minutes, restaurant_phone? }
-app.post("/trips/:tripId/cascade/restaurant-reschedule", auth, async (req, res) => {
+app.post("/trips/:tripId/cascade/restaurant-reschedule", auth, requirePro, async (req, res) => {
   const { tripId } = req.params;
   const { leg_id, delay_minutes, restaurant_phone } = req.body || {};
   try {
