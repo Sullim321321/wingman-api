@@ -559,6 +559,60 @@ async function bootstrapDB() {
     } catch {}
     // Backfill account_email for existing rows that have NULL
     await sql`UPDATE gmail_tokens SET account_email = user_email WHERE account_email IS NULL`;
+
+    // ── Deduplicate gmail trips: keep only the lowest id per (user_email, raw_email_id) ──
+    try {
+      const dupes = await sql`
+        DELETE FROM trips
+        WHERE id IN (
+          SELECT id FROM (
+            SELECT id,
+                   ROW_NUMBER() OVER (PARTITION BY user_email, raw_email_id ORDER BY id ASC) AS rn
+            FROM trips
+            WHERE raw_email_id IS NOT NULL
+          ) ranked
+          WHERE rn > 1
+        )
+        RETURNING id
+      `;
+      if (dupes.length > 0) console.log(`[db] deduped ${dupes.length} duplicate gmail trips`);
+    } catch (e) {
+      console.error("[db] dedup error:", e.message);
+    }
+
+    // ── Auto-rename poorly-titled gmail trips using leg data ──
+    try {
+      await sql`
+        UPDATE trips t
+        SET title = CASE
+          WHEN tl.origin IS NOT NULL AND tl.destination IS NOT NULL
+            THEN tl.origin || ' → ' || tl.destination
+          WHEN tl.destination IS NOT NULL
+            THEN tl.destination || ' Trip'
+          WHEN tl.carrier IS NOT NULL AND tl.flight_number IS NOT NULL
+            THEN tl.carrier || tl.flight_number
+          WHEN tl.carrier IS NOT NULL
+            THEN tl.carrier || ' Booking'
+          ELSE t.title
+        END
+        FROM trip_legs tl
+        WHERE tl.trip_id = t.id
+          AND t.source = 'gmail'
+          AND (
+            t.title = 'Unknown Trip'
+            OR t.title = 'Unknown'
+            OR t.title LIKE 'Unknown%Trip'
+            OR t.title = 'Trip'
+            OR t.title LIKE '% Flight'
+            OR t.title LIKE '% Airlines Flight'
+            OR t.title LIKE '% Booking'
+            OR t.title = 'Imported Trip'
+          )
+      `;
+    } catch (e) {
+      console.error("[db] rename error:", e.message);
+    }
+
     console.log("[db] tables ready");
   } catch (e) {
     console.error("[db] bootstrap error:", e.message);
@@ -1966,23 +2020,35 @@ async function parseAndStoreEmail(userEmail, message) {
   const body = extractEmailBody(message.payload);
   const snippet = message.snippet || "";
 
-  // Use GPT to extract structured trip data
+    // Use Claude to extract structured trip data
   try {
-    const prompt = `Extract travel booking information from this email. Return JSON only, no markdown.
+    const prompt = `You are a travel booking parser. Extract structured data from this booking confirmation email.
+Return ONLY valid JSON — no markdown, no explanation, no code fences.
+
 Subject: ${subject}
 From: ${from}
 Body (first 3000 chars): ${(body || snippet).slice(0, 3000)}
 
-Return this exact JSON structure (null for unknown fields):
+Rules:
+- "title" MUST be a meaningful short name (e.g. "New York Trip", "London → Paris", "Marriott Chicago", "Hertz LAX"). NEVER return null, "Unknown", or "Unknown Trip" for title.
+- For hotels: title = "[Hotel Name] [City]" (e.g. "Hilton Midtown New York")
+- For flights: title = "[Origin] → [Destination]" (e.g. "JFK → LAX")
+- For cars: title = "[Brand] [City]" (e.g. "Hertz Miami")
+- "destination" for hotels = the city/property location, NOT null
+- "departs_at" for hotels = check-in datetime; "arrives_at" = check-out datetime
+- "carrier" for hotels = the hotel property name (e.g. "Marriott Times Square")
+- "is_travel_booking" = true only if this is a confirmed booking (not a promotional email)
+
+Return this exact JSON structure:
 {
-  "type": "flight|hotel|car|other",
-  "title": "short trip title e.g. New York Trip",
-  "carrier": "airline or hotel name",
-  "confirmation": "confirmation/booking number",
-  "origin": "departure city or airport code (flights only)",
-  "destination": "arrival city or airport code",
-  "departs_at": "ISO 8601 datetime or null",
-  "arrives_at": "ISO 8601 datetime or null",
+  "type": "flight|hotel|car|cruise|train|other",
+  "title": "REQUIRED — meaningful short name, never null or Unknown",
+  "carrier": "airline name, hotel property name, or car rental company",
+  "confirmation": "confirmation or booking reference number",
+  "origin": "departure city or airport code (flights/trains only, null for hotels)",
+  "destination": "destination city, airport code, or hotel city",
+  "departs_at": "ISO 8601 datetime (check-in for hotels) or null",
+  "arrives_at": "ISO 8601 datetime (check-out for hotels) or null",
   "is_travel_booking": true or false
 }`;
 
