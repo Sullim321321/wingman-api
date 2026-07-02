@@ -296,11 +296,14 @@ async function bootstrapDB() {
     await sql`
       CREATE TABLE IF NOT EXISTS gmail_tokens (
         id SERIAL PRIMARY KEY,
-        user_email TEXT UNIQUE NOT NULL,
+        user_email TEXT NOT NULL,
+        account_email TEXT,
+        account_label TEXT,
         access_token TEXT NOT NULL,
         refresh_token TEXT,
         expiry_date BIGINT,
-        updated_at TIMESTAMPTZ DEFAULT NOW()
+        updated_at TIMESTAMPTZ DEFAULT NOW(),
+        UNIQUE (user_email, account_email)
       )
     `;
     await sql`
@@ -542,6 +545,19 @@ async function bootstrapDB() {
     // ── Ensure all trip_legs columns exist ──
     await sql`ALTER TABLE trip_legs ADD COLUMN IF NOT EXISTS status TEXT DEFAULT 'upcoming'`;
     await sql`ALTER TABLE trip_legs ADD COLUMN IF NOT EXISTS raw_data JSONB`;
+    // ── Multi-account Gmail support: add account_email column and swap unique constraint ──
+    await sql`ALTER TABLE gmail_tokens ADD COLUMN IF NOT EXISTS account_email TEXT`;
+    await sql`ALTER TABLE gmail_tokens ADD COLUMN IF NOT EXISTS account_label TEXT`;
+    // Drop the old single-account unique constraint (user_email) if it still exists
+    try {
+      await sql`ALTER TABLE gmail_tokens DROP CONSTRAINT IF EXISTS gmail_tokens_user_email_key`;
+    } catch {}
+    // Add the new composite unique constraint if not already present
+    try {
+      await sql`ALTER TABLE gmail_tokens ADD CONSTRAINT gmail_tokens_user_account_unique UNIQUE (user_email, account_email)`;
+    } catch {}
+    // Backfill account_email for existing rows that have NULL
+    await sql`UPDATE gmail_tokens SET account_email = user_email WHERE account_email IS NULL`;
     console.log("[db] tables ready");
   } catch (e) {
     console.error("[db] bootstrap error:", e.message);
@@ -1596,9 +1612,15 @@ app.get("/me", async (req, res) => {
   try {
     const rows = await sql`SELECT email, first_name, push_token, preferences, created_at FROM users WHERE email = ${email}`;
     if (!rows[0]) return res.status(404).json({ error: "user not found" });
-    // Check if Gmail is connected
-    const gmailRows = await sql`SELECT id FROM gmail_tokens WHERE user_email = ${email}`;
-    res.json({ ...rows[0], gmail_connected: gmailRows.length > 0 });
+    // Return all connected Google accounts
+    const gmailRows = await sql`SELECT id, account_email, account_label, updated_at FROM gmail_tokens WHERE user_email = ${email} ORDER BY id ASC`;
+    const connected_accounts = gmailRows.map(r => ({
+      id: r.id,
+      account_email: r.account_email || email,
+      label: r.account_label || null,
+      connected_at: r.updated_at,
+    }));
+    res.json({ ...rows[0], gmail_connected: gmailRows.length > 0, connected_accounts });
   } catch (e) {
     res.status(500).json({ error: "db error" });
   }
@@ -1686,10 +1708,21 @@ app.get("/auth/gmail/callback", async (req, res) => {
   try {
     const oauth2 = makeOAuth2Client();
     const { tokens } = await oauth2.getToken(code);
+    // Fetch the Google account email so we can store it as account_email
+    let accountEmail = userEmail; // fallback
+    try {
+      oauth2.setCredentials(tokens);
+      const { google } = require("googleapis");
+      const oauth2Api = google.oauth2({ version: "v2", auth: oauth2 });
+      const info = await oauth2Api.userinfo.get();
+      if (info.data?.email) accountEmail = info.data.email;
+    } catch (e) {
+      console.warn("[gmail/callback] could not fetch account email:", e.message);
+    }
     await sql`
-      INSERT INTO gmail_tokens (user_email, access_token, refresh_token, expiry_date)
-      VALUES (${userEmail}, ${encryptField(tokens.access_token)}, ${encryptField(tokens.refresh_token) || null}, ${tokens.expiry_date || null})
-      ON CONFLICT (user_email) DO UPDATE SET
+      INSERT INTO gmail_tokens (user_email, account_email, access_token, refresh_token, expiry_date)
+      VALUES (${userEmail}, ${accountEmail}, ${encryptField(tokens.access_token)}, ${encryptField(tokens.refresh_token) || null}, ${tokens.expiry_date || null})
+      ON CONFLICT (user_email, account_email) DO UPDATE SET
         access_token = EXCLUDED.access_token,
         refresh_token = COALESCE(EXCLUDED.refresh_token, gmail_tokens.refresh_token),
         expiry_date = EXCLUDED.expiry_date,
@@ -1735,26 +1768,39 @@ app.get("/auth/gmail/callback", async (req, res) => {
 // ---------------------------------------------------------------------------
 // Gmail scanner — parse booking confirmation emails into trips
 // ---------------------------------------------------------------------------
-async function getGmailClient(userEmail) {
-  const rows = await sql`SELECT * FROM gmail_tokens WHERE user_email = ${userEmail}`;
+async function getGmailClient(userEmail, accountEmail = null) {
+  // If accountEmail specified, use that specific account; otherwise use first available
+  const rows = accountEmail
+    ? await sql`SELECT * FROM gmail_tokens WHERE user_email = ${userEmail} AND account_email = ${accountEmail}`
+    : await sql`SELECT * FROM gmail_tokens WHERE user_email = ${userEmail} ORDER BY id ASC`;
   if (!rows[0]) return null;
+  const row = rows[0];
   const oauth2 = makeOAuth2Client();
   oauth2.setCredentials({
-    access_token: decryptField(rows[0].access_token),
-    refresh_token: decryptField(rows[0].refresh_token),
-    expiry_date: rows[0].expiry_date,
+    access_token: decryptField(row.access_token),
+    refresh_token: decryptField(row.refresh_token),
+    expiry_date: row.expiry_date,
   });
-  // Auto-refresh if needed
+  // Auto-refresh if needed — update the specific row by id
   oauth2.on("tokens", async (tokens) => {
     if (tokens.access_token) {
-      await sql`UPDATE gmail_tokens SET access_token = ${tokens.access_token}, expiry_date = ${tokens.expiry_date || null}, updated_at = NOW() WHERE user_email = ${userEmail}`;
+      await sql`UPDATE gmail_tokens SET access_token = ${tokens.access_token}, expiry_date = ${tokens.expiry_date || null}, updated_at = NOW() WHERE id = ${row.id}`;
     }
   });
   return google.gmail({ version: "v1", auth: oauth2 });
 }
 
 async function scanGmailForTrips(userEmail, tokens) {
-  const gmail = await getGmailClient(userEmail);
+  // Scan ALL connected Google accounts for this user
+  const accountRows = await sql`SELECT account_email FROM gmail_tokens WHERE user_email = ${userEmail}`;
+  if (accountRows.length === 0) return;
+  for (const accountRow of accountRows) {
+    await scanGmailAccountForTrips(userEmail, accountRow.account_email);
+  }
+}
+
+async function scanGmailAccountForTrips(userEmail, accountEmail) {
+  const gmail = await getGmailClient(userEmail, accountEmail);
   if (!gmail) return;
   // Search for booking confirmation emails
   const queries = [
@@ -1933,13 +1979,21 @@ Return this exact JSON structure (null for unknown fields):
 app.post("/trips/rename-unknown", auth, async (req, res) => {
   const email = req.email;
   try {
-    // Find all Unknown Trip records with at least one leg
+    // Find all poorly-named trips: Unknown Trip variants AND carrier-only titles like "United Airlines Flight"
     const unknowns = await sql`
-      SELECT t.id, tl.origin, tl.destination, tl.carrier, tl.flight_number
+      SELECT t.id, t.title, tl.origin, tl.destination, tl.carrier, tl.flight_number
       FROM trips t
       JOIN trip_legs tl ON tl.trip_id = t.id
       WHERE t.user_email = ${email}
-        AND (t.title = 'Unknown Trip' OR t.title = 'Unknown' OR t.title LIKE 'Unknown%Trip')
+        AND (
+          t.title = 'Unknown Trip'
+          OR t.title = 'Unknown'
+          OR t.title LIKE 'Unknown%Trip'
+          OR t.title LIKE '% Flight'
+          OR t.title LIKE '% Airlines Flight'
+          OR t.title = 'Trip'
+          OR t.title = 'Imported Trip'
+        )
       ORDER BY t.id, tl.id
     `;
     // Group by trip id, use first leg for title
@@ -1995,21 +2049,29 @@ app.post("/trips/reparse-unknown", async (req, res) => {
 
 
 // DELETE /auth/gmail — disconnect Gmail (revoke token and delete from DB)
+// Optional query param: ?account_id=<id> to disconnect a specific account only
 app.delete("/auth/gmail", auth, async (req, res) => {
   const email = req.email;
+  const accountId = req.query.account_id ? Number(req.query.account_id) : null;
   try {
-    // Revoke the token with Google if we have a refresh token
-    const rows = await sql`SELECT refresh_token, access_token FROM gmail_tokens WHERE user_email = ${email}`;
-    if (rows.length > 0) {
-      const token = rows[0].refresh_token || rows[0].access_token;
+    // Fetch the specific row(s) to revoke
+    const rows = accountId
+      ? await sql`SELECT id, refresh_token, access_token FROM gmail_tokens WHERE user_email = ${email} AND id = ${accountId}`
+      : await sql`SELECT id, refresh_token, access_token FROM gmail_tokens WHERE user_email = ${email}`;
+    for (const row of rows) {
+      const token = row.refresh_token || row.access_token;
       if (token) {
         try {
           await fetch(`https://oauth2.googleapis.com/revoke?token=${encodeURIComponent(token)}`, { method: "POST" });
         } catch {} // best-effort revoke
       }
     }
-    await sql`DELETE FROM gmail_tokens WHERE user_email = ${email}`;
-    await logActivity(email, "gmail_disconnected", "Gmail disconnected", "Your Gmail connection has been removed. Wingman will no longer scan your inbox.", null, null, {});
+    if (accountId) {
+      await sql`DELETE FROM gmail_tokens WHERE user_email = ${email} AND id = ${accountId}`;
+    } else {
+      await sql`DELETE FROM gmail_tokens WHERE user_email = ${email}`;
+    }
+    await logActivity(email, "gmail_disconnected", "Gmail disconnected", "A Gmail account connection has been removed.", null, null, {});
     res.json({ ok: true });
   } catch (e) {
     console.error("[DELETE /auth/gmail]", e.message);
@@ -3213,9 +3275,13 @@ app.patch("/policy", auth, async (req, res) => {
 // These are stored encrypted in the user's preferences JSONB under 'passenger_profile'.
 // ---------------------------------------------------------------------------
 app.post("/profile/passenger", auth, async (req, res) => {
-  const { given_name, family_name, born_on, gender, phone, passport_number, passport_expiry, passport_country } = req.body || {};
+  const body = req.body || {};
+  // Accept both field name conventions (app sends first_name/last_name, some clients send given_name/family_name)
+  const given_name = body.given_name || body.first_name;
+  const family_name = body.family_name || body.last_name;
+  const { born_on, gender, phone, passport_number, passport_expiry, passport_country } = body;
   if (!given_name || !family_name || !born_on) {
-    return res.status(400).json({ error: "given_name, family_name, and born_on are required" });
+    return res.status(400).json({ error: "first_name (or given_name), last_name (or family_name), and born_on are required" });
   }
   try {
     const rows = await sql`SELECT preferences FROM users WHERE email = ${req.user.email}`;
@@ -3234,6 +3300,8 @@ app.post("/profile/passenger", auth, async (req, res) => {
     };
     const merged = { ...existing, passenger_profile: passengerProfile };
     await sql`UPDATE users SET preferences = ${JSON.stringify(merged)}::jsonb WHERE email = ${req.user.email}`;
+    // Also sync given_name → users.first_name so the Home greeting works
+    await sql`UPDATE users SET first_name = ${passengerProfile.given_name} WHERE email = ${req.user.email}`;
     res.json({ ok: true, passenger_profile: { given_name: passengerProfile.given_name, family_name: passengerProfile.family_name, born_on: passengerProfile.born_on } });
   } catch (e) {
     res.status(500).json({ error: "Failed to save passenger profile", detail: e.message });
@@ -5855,11 +5923,13 @@ app.post("/auth/gmail/import", auth, async (req, res) => {
   try {
     const tokenRows = await sql`SELECT * FROM gmail_tokens WHERE user_email = ${req.email}`;
     if (!tokenRows.length) return res.status(400).json({ error: "Gmail not connected" });
+    // Use first connected account for the import endpoint (full multi-account scan via /auth/gmail/scan)
+    const tokenRow = tokenRows[0];
     const oAuth2Client = makeOAuth2Client();
     oAuth2Client.setCredentials({
-      access_token: tokenRows[0].access_token,
-      refresh_token: tokenRows[0].refresh_token,
-      expiry_date: Number(tokenRows[0].expiry_date),
+      access_token: decryptField(tokenRow.access_token) || tokenRow.access_token,
+      refresh_token: decryptField(tokenRow.refresh_token) || tokenRow.refresh_token,
+      expiry_date: Number(tokenRow.expiry_date),
     });
     const gmail = google.gmail({ version: "v1", auth: oAuth2Client });
     // Search for booking confirmation emails from the last 6 months
