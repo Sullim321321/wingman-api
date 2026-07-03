@@ -546,6 +546,23 @@ async function bootstrapDB() {
     // ── Ensure all trip_legs columns exist ──
     await sql`ALTER TABLE trip_legs ADD COLUMN IF NOT EXISTS status TEXT DEFAULT 'upcoming'`;
     await sql`ALTER TABLE trip_legs ADD COLUMN IF NOT EXISTS raw_data JSONB`;
+    // ── Enriched leg fields for all reservation types (v2 pipeline) ──
+    await sql`ALTER TABLE trip_legs ADD COLUMN IF NOT EXISTS destination_city TEXT`;
+    await sql`ALTER TABLE trip_legs ADD COLUMN IF NOT EXISTS nights INTEGER`;
+    await sql`ALTER TABLE trip_legs ADD COLUMN IF NOT EXISTS guests INTEGER`;
+    await sql`ALTER TABLE trip_legs ADD COLUMN IF NOT EXISTS station_from TEXT`;
+    await sql`ALTER TABLE trip_legs ADD COLUMN IF NOT EXISTS station_to TEXT`;
+    await sql`ALTER TABLE trip_legs ADD COLUMN IF NOT EXISTS pickup_location TEXT`;
+    await sql`ALTER TABLE trip_legs ADD COLUMN IF NOT EXISTS dropoff_location TEXT`;
+    await sql`ALTER TABLE trip_legs ADD COLUMN IF NOT EXISTS vehicle_class TEXT`;
+    await sql`ALTER TABLE trip_legs ADD COLUMN IF NOT EXISTS property_address TEXT`;
+    await sql`ALTER TABLE trip_legs ADD COLUMN IF NOT EXISTS price_total NUMERIC(12,2)`;
+    await sql`ALTER TABLE trip_legs ADD COLUMN IF NOT EXISTS currency TEXT`;
+    await sql`ALTER TABLE trip_legs ADD COLUMN IF NOT EXISTS seat TEXT`;
+    await sql`ALTER TABLE trip_legs ADD COLUMN IF NOT EXISTS cabin_class TEXT`;
+    // Index for trip grouping lookups
+    await sql`CREATE INDEX IF NOT EXISTS idx_trip_legs_dest_city ON trip_legs(trip_id, destination_city)`;
+    await sql`CREATE INDEX IF NOT EXISTS idx_trip_legs_dates ON trip_legs(departs_at, arrives_at)`;
     // ── Multi-account Gmail support: add account_email column and swap unique constraint ──
     await sql`ALTER TABLE gmail_tokens ADD COLUMN IF NOT EXISTS account_email TEXT`;
     await sql`ALTER TABLE gmail_tokens ADD COLUMN IF NOT EXISTS account_label TEXT`;
@@ -1967,12 +1984,95 @@ async function scanGmailAccountForTrips(userEmail, accountEmail) {
     "from:ncl.com subject:confirmation",
     "from:princess.com subject:confirmation",
     "from:celebrity.com subject:confirmation",
+    // UK & European rail operators
+    "from:eurostar.com",
+    "from:thetrainline.com",
+    "from:email.thetrainline.com",
+    "from:lner.co.uk",
+    "from:avantitrain.co.uk",
+    "from:tpexpress.co.uk",
+    "from:gwr.com",
+    "from:southwesternrailway.com",
+    "from:southeastern.co.uk",
+    "from:scotrail.co.uk",
+    "from:crosscountrytrains.co.uk",
+    "from:c2c-online.co.uk",
+    "from:chilternrailways.co.uk",
+    "from:greateranglia.co.uk",
+    "from:nationalrail.co.uk",
+    "from:raileurope.com",
+    "from:sncf-connect.com",
+    "from:bahn.de",
+    "from:thalys.com",
+    "from:italo.it",
+    "from:trenitalia.com",
+    "from:renfe.com",
+    "from:ouigo.com",
+    "from:flixbus.com",
+    "from:busbud.com",
+    // Ferry operators
+    "from:stenaline.co.uk",
+    "from:poferries.com",
+    "from:brittanyferries.co.uk",
+    "from:dfdsseaways.co.uk",
+    "from:irishferries.com",
+    "from:calmac.co.uk",
+    "from:northlinkferries.co.uk",
+    "from:directferries.co.uk",
+    "from:condorferries.co.uk",
+    // Car rental — additional platforms
+    "from:rentalcars.com",
+    "from:email.rentalcars.com",
+    "from:getaround.com",
+    "from:zipcar.com",
+    "from:enterprise.co.uk",
+    "from:hertz.co.uk",
+    "from:europcar.com",
+    "from:email.europcar.com",
+    "from:goldcar.es",
+    "from:thrifty.com",
+    "from:dollar.com",
+    "from:fox.com subject:confirmation",
+    "from:paylesscar.com",
+    "from:easirent.com",
+    "from:holidayautos.com",
+    "from:autoeurope.com",
+    // Activity & experience booking
+    "from:viator.com",
+    "from:getyourguide.com",
+    "from:klook.com",
+    "from:airbnbexperiences.com",
+    "from:eventbrite.com subject:(ticket OR confirmation)",
+    "from:ticketmaster.com subject:confirmation",
+    "from:opentable.com subject:confirmation",
+    "from:resy.com subject:confirmation",
+    // Short-term rentals
+    "from:homeaway.com",
+    "from:email.homeaway.com",
+    "from:cottages.com",
+    "from:holidaylettings.co.uk",
+    "from:sykes.com",
+    "from:hoseasons.co.uk",
+    "from:canopyandstars.co.uk",
+    "from:uniquehomestays.com",
+    // Airport transfers & ground transport
+    "from:blacklane.com",
+    "from:wheely.com",
+    "from:addison.lee",
+    "from:nationaltaxi.co.uk",
+    "from:greentomato.com",
+    "from:trainline.com subject:(booking OR confirmation)",
     // Broad catch-all for anything travel-related in the last 6 months
     "subject:(hotel confirmation OR hotel reservation OR booking confirmation OR reservation confirmed OR check-in OR itinerary) newer_than:6m",
     "subject:(flight confirmation OR flight itinerary OR e-ticket OR boarding pass) newer_than:6m",
     "subject:(your booking OR your reservation OR booking reference OR reservation number) newer_than:6m",
     "subject:(points redeemed OR miles redeemed OR award booking OR reward booking) newer_than:6m",
     "subject:(cruise confirmation OR cruise itinerary OR sail date) newer_than:6m",
+    "subject:(train booking OR rail ticket OR seat reservation) newer_than:6m",
+    "subject:(car rental OR car hire OR vehicle booking OR pickup confirmation) newer_than:6m",
+    "subject:(ferry booking OR ferry ticket OR sailing confirmation) newer_than:6m",
+    "subject:(activity booking OR experience confirmed OR tour confirmation) newer_than:6m",
+    "subject:(Airbnb OR vacation rental OR short stay OR apartment booking) newer_than:6m",
   ];
   const seen = new Set();
   for (const q of queries) {
@@ -2009,6 +2109,71 @@ function extractEmailBody(payload) {
   return "";
 }
 
+// ─── Trip grouping: find an existing trip that covers the same destination + date window ────
+async function findOrCreateGroupedTrip(userEmail, parsed, emailId, source) {
+  const dest = (parsed.destination_city || parsed.destination || "").toLowerCase().trim();
+  const startDate = parsed.departs_at ? new Date(parsed.departs_at) : null;
+  const endDate   = parsed.arrives_at  ? new Date(parsed.arrives_at)  : startDate;
+
+  // ── 1. Try to attach to an existing trip covering the same destination + overlapping dates ──
+  if (dest && startDate) {
+    const buffer = 2 * 24 * 60 * 60 * 1000; // 2-day buffer
+    const windowStart = new Date(startDate.getTime() - buffer);
+    const windowEnd   = endDate ? new Date(endDate.getTime() + buffer) : new Date(startDate.getTime() + buffer);
+
+    // Find trips where ANY leg's destination_city or destination fuzzy-matches AND dates overlap
+    const candidates = await sql`
+      SELECT DISTINCT t.id, t.title
+      FROM trips t
+      JOIN trip_legs tl ON tl.trip_id = t.id
+      WHERE t.user_email = ${userEmail}
+        AND (
+          LOWER(COALESCE(tl.destination_city, tl.destination, '')) LIKE ${'%' + dest.split(',')[0].trim() + '%'}
+          OR LOWER(COALESCE(tl.destination, '')) LIKE ${'%' + dest.split(',')[0].trim() + '%'}
+        )
+        AND (
+          (tl.departs_at IS NOT NULL AND tl.departs_at <= ${windowEnd.toISOString()} AND COALESCE(tl.arrives_at, tl.departs_at) >= ${windowStart.toISOString()})
+        )
+      ORDER BY t.id ASC
+      LIMIT 1
+    `;
+    if (candidates.length > 0) {
+      console.log(`[grouping] attaching ${parsed.type} leg to existing trip "${candidates[0].title}" (id=${candidates[0].id})`);
+      return { tripId: candidates[0].id, isNew: false };
+    }
+  }
+
+  // ── 2. No matching trip — create a new destination-named trip ──
+  // Name by destination city, not by carrier/flight number
+  const destCity = parsed.destination_city || (parsed.destination ? parsed.destination.split(',')[0].trim() : null);
+  let tripTitle = parsed.trip_title || parsed.title;
+  if (!tripTitle || tripTitle === "Unknown" || tripTitle === "Unknown Trip") {
+    if (destCity) {
+      tripTitle = destCity;
+    } else if (parsed.origin && parsed.destination) {
+      tripTitle = `${parsed.origin} \u2192 ${parsed.destination}`;
+    } else if (parsed.destination) {
+      tripTitle = `${parsed.destination} Trip`;
+    } else if (parsed.carrier) {
+      tripTitle = `${parsed.carrier} Trip`;
+    } else {
+      tripTitle = "Trip";
+    }
+  }
+
+  const tripRows = await sql`
+    INSERT INTO trips (user_email, title, source, raw_email_id)
+    VALUES (${userEmail}, ${tripTitle}, ${source || 'gmail'}, ${emailId || null})
+    ON CONFLICT (user_email, raw_email_id) DO NOTHING
+    RETURNING id
+  `;
+  if (tripRows.length === 0) {
+    // Conflict — already processed this email
+    return null;
+  }
+  return { tripId: tripRows[0].id, isNew: true, tripTitle };
+}
+
 async function parseAndStoreEmail(userEmail, message) {
   // Check if already processed
   const existing = await sql`SELECT id FROM trips WHERE user_email = ${userEmail} AND raw_email_id = ${message.id}`;
@@ -2016,47 +2181,67 @@ async function parseAndStoreEmail(userEmail, message) {
 
   const headers = message.payload?.headers || [];
   const subject = headers.find(h => h.name === "Subject")?.value || "";
-  const from = headers.find(h => h.name === "From")?.value || "";
-  const body = extractEmailBody(message.payload);
+  const from    = headers.find(h => h.name === "From")?.value || "";
+  const body    = extractEmailBody(message.payload);
   const snippet = message.snippet || "";
 
-    // Use Claude to extract structured trip data
   try {
-    const prompt = `You are a travel booking parser. Extract structured data from this booking confirmation email.
+    const prompt = `You are a travel booking parser. Extract ALL structured data from this booking confirmation email.
 Return ONLY valid JSON — no markdown, no explanation, no code fences.
 
 Subject: ${subject}
 From: ${from}
-Body (first 3000 chars): ${(body || snippet).slice(0, 3000)}
+Body (first 4000 chars): ${(body || snippet).slice(0, 4000)}
 
 Rules:
-- "title" MUST be a meaningful short name (e.g. "New York Trip", "London → Paris", "Marriott Chicago", "Hertz LAX"). NEVER return null, "Unknown", or "Unknown Trip" for title.
-- For hotels: title = "[Hotel Name] [City]" (e.g. "Hilton Midtown New York")
-- For flights: title = "[Origin] → [Destination]" (e.g. "JFK → LAX")
-- For cars: title = "[Brand] [City]" (e.g. "Hertz Miami")
-- "destination" for hotels = the city/property location, NOT null
-- "departs_at" for hotels = check-in datetime; "arrives_at" = check-out datetime
-- "carrier" for hotels = the hotel property name (e.g. "Marriott Times Square")
-- "is_travel_booking" = true only if this is a confirmed booking (not a promotional email)
+- "is_travel_booking" = true ONLY for confirmed bookings, NOT promotional emails or newsletters
+- "type" must be one of: flight | hotel | airbnb | car | train | ferry | cruise | activity | transfer | other
+- "destination_city" = the city the traveller is visiting (e.g. "Edinburgh", "New York", "Tokyo") — extract this even for flights (use arrival city)
+- "trip_title" = the destination city name only (e.g. "Edinburgh", "New York") — used to group all bookings for the same trip. NEVER include carrier/airline/hotel name here.
+- For hotels/Airbnb: "departs_at" = check-in datetime, "arrives_at" = check-out datetime, "nights" = number of nights
+- For trains: "station_from" and "station_to" are the station names (e.g. "London King's Cross", "Edinburgh Waverley")
+- For cars: "pickup_location" = city or airport where car is collected, "dropoff_location" = return location
+- For flights: "flight_number" = IATA code (e.g. "BA1234"), "origin" = departure IATA or city, "destination" = arrival IATA or city
+- "carrier" = airline, hotel property name, car rental company, train operator, ferry operator, or activity provider
+- "price_total" = total cost as a number (no currency symbol), "currency" = 3-letter ISO code (e.g. "GBP", "USD")
+- "guests" = number of guests/passengers as integer
+- "property_address" = full address for hotels/Airbnb if present
+- "vehicle_class" = car class (e.g. "Economy", "SUV", "Luxury") for car rentals
+- "seat" = seat number for flights/trains if present
+- "cabin_class" = "Economy", "Premium Economy", "Business", or "First" for flights
 
 Return this exact JSON structure:
 {
-  "type": "flight|hotel|car|cruise|train|other",
-  "title": "REQUIRED — meaningful short name, never null or Unknown",
-  "carrier": "airline name, hotel property name, or car rental company",
-  "confirmation": "confirmation or booking reference number",
-  "origin": "departure city or airport code (flights/trains only, null for hotels)",
-  "destination": "destination city, airport code, or hotel city",
-  "departs_at": "ISO 8601 datetime (check-in for hotels) or null",
-  "arrives_at": "ISO 8601 datetime (check-out for hotels) or null",
-  "is_travel_booking": true or false
+  "is_travel_booking": true or false,
+  "type": "flight|hotel|airbnb|car|train|ferry|cruise|activity|transfer|other",
+  "trip_title": "destination city name only — used for grouping (e.g. Edinburgh, New York)",
+  "destination_city": "city the traveller is visiting",
+  "carrier": "airline, hotel, car company, train operator, etc.",
+  "confirmation": "booking reference or confirmation number",
+  "origin": "departure city, airport code, or station (null for hotels/Airbnb)",
+  "destination": "arrival city, airport code, or station",
+  "departs_at": "ISO 8601 datetime or null",
+  "arrives_at": "ISO 8601 datetime or null",
+  "nights": null or integer,
+  "guests": null or integer,
+  "flight_number": "IATA flight number or null",
+  "station_from": "departure station name or null",
+  "station_to": "arrival station name or null",
+  "pickup_location": "car pickup city/airport or null",
+  "dropoff_location": "car dropoff city/airport or null",
+  "vehicle_class": "car class or null",
+  "property_address": "hotel/Airbnb address or null",
+  "price_total": null or number,
+  "currency": "3-letter ISO currency code or null",
+  "seat": "seat number or null",
+  "cabin_class": "Economy|Premium Economy|Business|First or null"
 }`;
 
     let claudeResp;
     try {
       claudeResp = await getAnthropic().messages.create({
         model: "claude-3-5-haiku-20241022",
-        max_tokens: 400,
+        max_tokens: 700,
         messages: [{ role: "user", content: prompt }],
       });
     } catch (llmErr) {
@@ -2076,66 +2261,74 @@ Return this exact JSON structure:
 
     if (!parsed.is_travel_booking) return;
 
-    // Create or find trip — build a meaningful title even when Claude returns null
-    const dest = parsed.destination || null;
-    const origin = parsed.origin || null;
-    const carrier = parsed.carrier || null;
-    let tripTitle = parsed.title;
-    if (!tripTitle || tripTitle === "Unknown" || tripTitle === "Unknown Trip") {
-      if (origin && dest) {
-        tripTitle = `${origin} → ${dest}`;
-      } else if (dest) {
-        tripTitle = `${dest} Trip`;
-      } else if (carrier && parsed.flight_number) {
-        tripTitle = `${carrier}${parsed.flight_number}`;
-      } else if (carrier) {
-        tripTitle = `${carrier} Flight`;
-      } else {
-        tripTitle = "Trip";
-      }
-    }
-    const tripRows = await sql`
-      INSERT INTO trips (user_email, title, source, raw_email_id)
-      VALUES (${userEmail}, ${tripTitle}, 'gmail', ${message.id})
-      ON CONFLICT (user_email, raw_email_id) DO NOTHING
-      RETURNING id
-    `;
-    if (tripRows.length === 0) return;
-    const tripId = tripRows[0].id;
+    // ── Find or create a grouped trip ──
+    const groupResult = await findOrCreateGroupedTrip(userEmail, parsed, message.id, 'gmail');
+    if (!groupResult) return; // duplicate email
+    const { tripId, isNew, tripTitle } = groupResult;
+    const legTitle = tripTitle || parsed.trip_title || parsed.destination_city || parsed.destination || "Trip";
 
-    // Add leg
+    // ── Insert the leg with all enriched fields ──
     await sql`
-      INSERT INTO trip_legs (trip_id, type, carrier, flight_number, origin, destination, departs_at, arrives_at, confirmation, raw_data)
-      VALUES (
+      INSERT INTO trip_legs (
+        trip_id, type, carrier, flight_number, origin, destination, destination_city,
+        departs_at, arrives_at, confirmation, raw_data,
+        nights, guests, station_from, station_to,
+        pickup_location, dropoff_location, vehicle_class,
+        property_address, price_total, currency, seat, cabin_class
+      ) VALUES (
         ${tripId},
         ${parsed.type || "flight"},
         ${parsed.carrier || null},
-        ${null},
+        ${parsed.flight_number || null},
         ${parsed.origin || null},
         ${parsed.destination || null},
+        ${parsed.destination_city || null},
         ${parsed.departs_at || null},
-        ${parsed.arrives_at || null},
+        ${parsed.arrives_at  || null},
         ${parsed.confirmation || null},
-        ${JSON.stringify(parsed)}
+        ${JSON.stringify(parsed)},
+        ${parsed.nights    || null},
+        ${parsed.guests    || null},
+        ${parsed.station_from || null},
+        ${parsed.station_to   || null},
+        ${parsed.pickup_location  || null},
+        ${parsed.dropoff_location || null},
+        ${parsed.vehicle_class    || null},
+        ${parsed.property_address || null},
+        ${parsed.price_total != null ? parsed.price_total : null},
+        ${parsed.currency || null},
+        ${parsed.seat         || null},
+        ${parsed.cabin_class  || null}
       )
     `;
+
+    const typeLabel = {
+      flight: "Flight", hotel: "Hotel", airbnb: "Airbnb", car: "Car rental",
+      train: "Train", ferry: "Ferry", cruise: "Cruise", activity: "Activity",
+      transfer: "Transfer", other: "Booking"
+    }[parsed.type] || "Booking";
+
     await logActivity(
       userEmail, "import",
-      `Imported from Gmail: ${tripTitle}`,
-      `Booking confirmation found in your inbox and linked automatically.`,
+      `${typeLabel} imported: ${parsed.carrier || parsed.destination_city || legTitle}`,
+      isNew
+        ? `New trip created: ${legTitle}. Wingman is now monitoring.`
+        : `Added to your ${legTitle} trip automatically.`,
       tripId
     );
-    // Feature C: Hotel pre-arrival preference injection
-    if ((parsed.type || "flight") === "hotel") {
-      sendHotelPreferenceEmail(userEmail, parsed, tripTitle).catch(e =>
-        console.error("[hotel-pref-email]", e.message)
-      );
-      // Feature D: Record hotel affinity from booking history
-      extractAndStoreHotelAffinity(userEmail, parsed).catch(e =>
-        console.error("[hotel-affinity]", e.message)
-      );
+
+    // Hotel-specific features
+    if (parsed.type === "hotel" || parsed.type === "airbnb") {
+      if (parsed.type === "hotel") {
+        sendHotelPreferenceEmail(userEmail, parsed, legTitle).catch(e =>
+          console.error("[hotel-pref-email]", e.message)
+        );
+        extractAndStoreHotelAffinity(userEmail, parsed).catch(e =>
+          console.error("[hotel-affinity]", e.message)
+        );
+      }
     }
-    console.log("[gmail] stored trip:", tripTitle, "for", userEmail);
+    console.log(`[gmail] stored ${parsed.type} leg for trip "${legTitle}" (id=${tripId}, new=${isNew}) for ${userEmail}`);
   } catch (e) {
     console.error("[gmail/parse]", e.message);
   }
@@ -2292,45 +2485,125 @@ app.post("/auth/gmail/scan", async (req, res) => {
   }
 });
 
-// Parse a pasted email body and store any trips found
+// Parse a pasted email/confirmation body using the same LLM pipeline as Gmail
 async function parsePastedEmailBody(userEmail, body, source) {
-  const flightPattern = /(?:flight|flt)[:\s#]*([A-Z]{2}\d{3,4})/gi;
-  const routePattern  = /([A-Z]{3})\s*(?:to|→|->)\s*([A-Z]{3})/g;
-  const datePattern   = /(?:departs?|departure)[:\s]*([A-Za-z]+ \d{1,2},? \d{4}|\d{1,2}\/\d{1,2}\/\d{4})/gi;
+  if (!body || body.trim().length < 20) return 0;
 
-  const flights = [...body.matchAll(flightPattern)].map(m => m[1]);
-  const routes  = [...body.matchAll(routePattern)].map(m => ({ origin: m[1], destination: m[2] }));
-  const dates   = [...body.matchAll(datePattern)].map(m => m[1]);
+  const prompt = `You are a travel booking parser. Extract ALL structured data from this booking confirmation text.
+Return ONLY valid JSON — no markdown, no explanation, no code fences.
 
-  if (routes.length === 0 && flights.length === 0) return 0;
+Text: ${body.slice(0, 4000)}
 
-  const route = routes[0] || {};
-  const tripTitle = route.destination ? `Trip to ${route.destination}` : "Imported Trip";
+Rules:
+- "is_travel_booking" = true ONLY for confirmed bookings, NOT promotional emails or newsletters
+- "type" must be one of: flight | hotel | airbnb | car | train | ferry | cruise | activity | transfer | other
+- "destination_city" = the city the traveller is visiting (e.g. "Edinburgh", "New York", "Tokyo")
+- "trip_title" = the destination city name only (e.g. "Edinburgh") — used to group all bookings for the same trip
+- For hotels/Airbnb: "departs_at" = check-in datetime, "arrives_at" = check-out datetime, "nights" = number of nights
+- For trains: "station_from" and "station_to" are the station names
+- For cars: "pickup_location" = city or airport where car is collected, "dropoff_location" = return location
+- For flights: "flight_number" = IATA code, "origin" = departure IATA or city, "destination" = arrival IATA or city
+- "carrier" = airline, hotel property name, car rental company, train operator, etc.
+- "price_total" = total cost as a number, "currency" = 3-letter ISO code
+- "guests" = number of guests/passengers as integer
+- "confirmation" = booking reference or confirmation number
 
-  const tripRows = await sql`
-    INSERT INTO trips (user_email, title, source)
-    VALUES (${userEmail}, ${tripTitle}, ${source})
-    RETURNING id
-  `;
-  if (tripRows.length === 0) return 0;
-  const tripId = tripRows[0].id;
+Return this exact JSON structure:
+{
+  "is_travel_booking": true or false,
+  "type": "flight|hotel|airbnb|car|train|ferry|cruise|activity|transfer|other",
+  "trip_title": "destination city name only",
+  "destination_city": "city the traveller is visiting",
+  "carrier": "airline, hotel, car company, train operator, etc.",
+  "confirmation": "booking reference or null",
+  "origin": "departure city, airport code, or station (null for hotels/Airbnb)",
+  "destination": "arrival city, airport code, or station",
+  "departs_at": "ISO 8601 datetime or null",
+  "arrives_at": "ISO 8601 datetime or null",
+  "nights": null or integer,
+  "guests": null or integer,
+  "flight_number": "IATA flight number or null",
+  "station_from": "departure station name or null",
+  "station_to": "arrival station name or null",
+  "pickup_location": "car pickup city/airport or null",
+  "dropoff_location": "car dropoff city/airport or null",
+  "vehicle_class": "car class or null",
+  "property_address": "hotel/Airbnb address or null",
+  "price_total": null or number,
+  "currency": "3-letter ISO currency code or null",
+  "seat": "seat number or null",
+  "cabin_class": "Economy|Premium Economy|Business|First or null"
+}`;
 
-  for (let i = 0; i < Math.max(flights.length, 1); i++) {
-    const f = flights[i] || null;
-    await sql`
-      INSERT INTO trip_legs (trip_id, type, carrier, flight_number, origin, destination, departs_at)
-      VALUES (
-        ${tripId}, 'flight',
-        ${f ? f.slice(0, 2) : null},
-        ${f ? f.slice(2) : null},
-        ${routes[i]?.origin || route.origin || null},
-        ${routes[i]?.destination || route.destination || null},
-        ${dates[i] || dates[0] || null}
-      )
-    `;
+  let parsed;
+  try {
+    const claudeResp = await getAnthropic().messages.create({
+      model: "claude-3-5-haiku-20241022",
+      max_tokens: 700,
+      messages: [{ role: "user", content: prompt }],
+    });
+    const raw = claudeResp.content[0].text.trim();
+    const jsonStr = raw.replace(/^```json\n?/, "").replace(/\n?```$/, "").trim();
+    parsed = JSON.parse(jsonStr);
+  } catch (e) {
+    console.error("[paste/parse] LLM or JSON error:", e.message);
+    return 0;
   }
 
-  await logActivity(userEmail, "import", `Imported: ${tripTitle}`, `Booking pasted manually.`, tripId);
+  if (!parsed.is_travel_booking) return 0;
+
+  // Use the same grouping engine as Gmail
+  const groupResult = await findOrCreateGroupedTrip(userEmail, parsed, null, source || 'paste');
+  if (!groupResult) return 0;
+  const { tripId, isNew, tripTitle } = groupResult;
+  const legTitle = tripTitle || parsed.trip_title || parsed.destination_city || parsed.destination || "Trip";
+
+  await sql`
+    INSERT INTO trip_legs (
+      trip_id, type, carrier, flight_number, origin, destination, destination_city,
+      departs_at, arrives_at, confirmation, raw_data,
+      nights, guests, station_from, station_to,
+      pickup_location, dropoff_location, vehicle_class,
+      property_address, price_total, currency, seat, cabin_class
+    ) VALUES (
+      ${tripId},
+      ${parsed.type || "flight"},
+      ${parsed.carrier || null},
+      ${parsed.flight_number || null},
+      ${parsed.origin || null},
+      ${parsed.destination || null},
+      ${parsed.destination_city || null},
+      ${parsed.departs_at || null},
+      ${parsed.arrives_at  || null},
+      ${parsed.confirmation || null},
+      ${JSON.stringify(parsed)},
+      ${parsed.nights    || null},
+      ${parsed.guests    || null},
+      ${parsed.station_from || null},
+      ${parsed.station_to   || null},
+      ${parsed.pickup_location  || null},
+      ${parsed.dropoff_location || null},
+      ${parsed.vehicle_class    || null},
+      ${parsed.property_address || null},
+      ${parsed.price_total != null ? parsed.price_total : null},
+      ${parsed.currency || null},
+      ${parsed.seat         || null},
+      ${parsed.cabin_class  || null}
+    )
+  `;
+
+  const typeLabel = {
+    flight: "Flight", hotel: "Hotel", airbnb: "Airbnb", car: "Car rental",
+    train: "Train", ferry: "Ferry", cruise: "Cruise", activity: "Activity",
+    transfer: "Transfer", other: "Booking"
+  }[parsed.type] || "Booking";
+
+  await logActivity(
+    userEmail, "import",
+    `${typeLabel} imported: ${parsed.carrier || legTitle}`,
+    isNew ? `New trip created: ${legTitle}.` : `Added to your ${legTitle} trip.`,
+    tripId
+  );
   return 1;
 }
 
@@ -2380,13 +2653,47 @@ app.get("/trips", async (req, res) => {
   if (!email) return res.status(401).json({ error: "unauthorized" });
   try {
     const trips = await sql`
-      SELECT t.*, 
-        json_agg(tl.* ORDER BY tl.departs_at ASC NULLS LAST) FILTER (WHERE tl.id IS NOT NULL) as legs
+      SELECT t.*,
+        MIN(tl.departs_at) AS trip_start,
+        MAX(COALESCE(tl.arrives_at, tl.departs_at)) AS trip_end,
+        json_agg(
+          json_build_object(
+            'id',               tl.id,
+            'type',             tl.type,
+            'carrier',          tl.carrier,
+            'flight_number',    tl.flight_number,
+            'origin',           tl.origin,
+            'destination',      tl.destination,
+            'destination_city', tl.destination_city,
+            'departs_at',       tl.departs_at,
+            'arrives_at',       tl.arrives_at,
+            'confirmation',     tl.confirmation,
+            'status',           tl.status,
+            'nights',           tl.nights,
+            'guests',           tl.guests,
+            'station_from',     tl.station_from,
+            'station_to',       tl.station_to,
+            'pickup_location',  tl.pickup_location,
+            'dropoff_location', tl.dropoff_location,
+            'vehicle_class',    tl.vehicle_class,
+            'property_address', tl.property_address,
+            'price_total',      tl.price_total,
+            'currency',         tl.currency,
+            'seat',             tl.seat,
+            'cabin_class',      tl.cabin_class,
+            'raw_data',         tl.raw_data
+          )
+          ORDER BY tl.departs_at ASC NULLS LAST
+        ) FILTER (WHERE tl.id IS NOT NULL) AS legs
       FROM trips t
       LEFT JOIN trip_legs tl ON tl.trip_id = t.id
       WHERE t.user_email = ${email}
       GROUP BY t.id
-      ORDER BY t.created_at DESC
+      ORDER BY
+        -- Upcoming trips first (sorted by next departure), then past trips (sorted by most recent)
+        CASE WHEN MIN(tl.departs_at) >= NOW() OR MIN(tl.departs_at) IS NULL THEN 0 ELSE 1 END ASC,
+        CASE WHEN MIN(tl.departs_at) >= NOW() OR MIN(tl.departs_at) IS NULL THEN MIN(tl.departs_at) ELSE NULL END ASC NULLS LAST,
+        CASE WHEN MIN(tl.departs_at) < NOW() THEN MIN(tl.departs_at) ELSE NULL END DESC NULLS LAST
     `;
     res.json({ trips });
   } catch (e) {
