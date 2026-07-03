@@ -2492,7 +2492,7 @@ app.post("/auth/gmail/scan", async (req, res) => {
 //                         trips_updated, legs_added, breakdown_by_type }
 // ---------------------------------------------------------------------------
 app.post("/auth/gmail/rescan", auth, async (req, res) => {
-  const email = req.user?.email;
+  const email = req.email;
   if (!email) return res.status(401).json({ error: "unauthorized" });
 
   // Rate-limit: one full rescan per 10 minutes per user
