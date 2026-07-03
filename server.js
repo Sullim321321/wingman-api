@@ -2218,10 +2218,10 @@ Return ONLY valid JSON — no markdown, no explanation, no code fences.
 
 Subject: ${subject}
 From: ${from}
-Body (first 4000 chars): ${(body || snippet).slice(0, 4000)}
+Body (up to 8000 chars): ${(body || snippet).slice(0, 8000)}
 
 Rules:
-- "is_travel_booking" = true ONLY for confirmed bookings, NOT promotional emails or newsletters
+- "is_travel_booking" = true for any email containing a confirmed booking, reservation, or itinerary — including emails from loyalty programmes (TrueBlue, MileagePlus, SkyMiles, Avios, etc.) and OTAs (Expedia, Booking.com, TrueBlue Travel, etc.) that contain booking details. Set false ONLY for pure promotional emails, newsletters, or points statements with NO booking details.
 - "type" must be one of: flight | hotel | airbnb | car | train | ferry | cruise | activity | transfer | other
 - "destination_city" = the city the traveller is visiting (e.g. "Edinburgh", "New York", "Tokyo") — extract this even for flights (use arrival city)
 - "trip_title" = the destination city name only (e.g. "Edinburgh", "New York") — used to group all bookings for the same trip. NEVER include carrier/airline/hotel name here.
@@ -2607,7 +2607,7 @@ Return ONLY valid JSON — no markdown, no explanation, no code fences.
 Text: ${body.slice(0, 4000)}
 
 Rules:
-- "is_travel_booking" = true ONLY for confirmed bookings, NOT promotional emails or newsletters
+- "is_travel_booking" = true for any email containing a confirmed booking, reservation, or itinerary — including emails from loyalty programmes (TrueBlue, MileagePlus, SkyMiles, Avios, etc.) and OTAs (Expedia, Booking.com, TrueBlue Travel, etc.) that contain booking details. Set false ONLY for pure promotional emails, newsletters, or points statements with NO booking details.
 - "type" must be one of: flight | hotel | airbnb | car | train | ferry | cruise | activity | transfer | other
 - "destination_city" = the city the traveller is visiting (e.g. "Edinburgh", "New York", "Tokyo")
 - "trip_title" = the destination city name only (e.g. "Edinburgh") — used to group all bookings for the same trip
@@ -8768,5 +8768,60 @@ app.get("/privacy", (req, res) => {
     console.warn("[migration] data_deletion_log:", e.message);
   }
 })();
+
+
+// ---------------------------------------------------------------------------
+// BACKGROUND GMAIL SCAN — runs every 30 minutes, scans all connected accounts
+// Automatically detects new booking confirmation emails without user action
+// ---------------------------------------------------------------------------
+cron.schedule("*/30 * * * *", async () => {
+  console.log("[cron] background gmail scan starting");
+  try {
+    // Get all users with connected Gmail accounts
+    const connectedUsers = await sql`
+      SELECT DISTINCT user_email FROM gmail_tokens
+    `;
+    let scanned = 0;
+    let newTrips = 0;
+    for (const { user_email } of connectedUsers) {
+      try {
+        // Run the full multi-account scan for this user (reuses existing scanGmailForTrips)
+        await scanGmailForTrips(user_email);
+        scanned++;
+      } catch (userErr) {
+        console.error("[bg-scan] error for", user_email, userErr.message);
+      }
+    }
+    console.log(`[cron] background gmail scan complete — ${scanned} accounts scanned`);
+  } catch (e) {
+    console.error("[bg-scan cron] fatal:", e.message);
+  }
+});
+
+// BACKGROUND CALENDAR SYNC — runs every 60 minutes, syncs Apple/Google Calendar events
+cron.schedule("5 * * * *", async () => {
+  console.log("[cron] background calendar sync starting");
+  try {
+    // Calendar sync is triggered client-side; this cron checks for stale trip statuses
+    // and updates any trips that have passed their departure date
+    const now = new Date().toISOString();
+    const updated = await sql`
+      UPDATE trips
+      SET status = 'past'
+      WHERE status = 'upcoming'
+        AND id IN (
+          SELECT DISTINCT trip_id FROM trip_legs
+          WHERE departs_at IS NOT NULL AND departs_at < ${now}::TIMESTAMPTZ
+          AND type = 'flight'
+        )
+      RETURNING id
+    `;
+    if (updated.length > 0) {
+      console.log(`[cron] marked ${updated.length} trips as past`);
+    }
+  } catch (e) {
+    console.error("[calendar-sync cron] error:", e.message);
+  }
+});
 
 app.listen(PORT, () => console.log("Wingman API on http://localhost:" + PORT));
