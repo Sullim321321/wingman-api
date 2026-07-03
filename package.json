@@ -27,5 +27,8 @@
     "resend": "^6.14.0",
     "stripe": "^22.3.0",
     "validator": "^13.15.35"
+  },
+  "devDependencies": {
+    "dotenv": "^17.4.2"
   }
 }

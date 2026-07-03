@@ -2485,6 +2485,91 @@ app.post("/auth/gmail/scan", async (req, res) => {
   }
 });
 
+// ---------------------------------------------------------------------------
+// POST /auth/gmail/rescan — full re-scan with progress summary
+// Unlike /auth/gmail/scan (fire-and-forget background), this waits and returns
+// a structured summary: { accounts_scanned, emails_processed, trips_created,
+//                         trips_updated, legs_added, breakdown_by_type }
+// ---------------------------------------------------------------------------
+app.post("/auth/gmail/rescan", auth, async (req, res) => {
+  const email = req.user?.email;
+  if (!email) return res.status(401).json({ error: "unauthorized" });
+
+  // Rate-limit: one full rescan per 10 minutes per user
+  const lastScan = rescanCooldowns.get(email);
+  if (lastScan && Date.now() - lastScan < 10 * 60 * 1000) {
+    const waitSecs = Math.ceil((10 * 60 * 1000 - (Date.now() - lastScan)) / 1000);
+    return res.status(429).json({ error: `Please wait ${waitSecs}s before rescanning again.` });
+  }
+  rescanCooldowns.set(email, Date.now());
+
+  try {
+    const accountRows = await sql`SELECT account_email FROM gmail_tokens WHERE user_email = ${email}`;
+    if (accountRows.length === 0) {
+      return res.status(400).json({ error: "No Gmail account connected. Connect Gmail in Settings first." });
+    }
+
+    // Snapshot trip/leg counts before scan
+    const before = await sql`
+      SELECT
+        (SELECT COUNT(*) FROM trips WHERE user_email = ${email}) AS trip_count,
+        (SELECT COUNT(*) FROM trip_legs tl JOIN trips t ON t.id = tl.trip_id WHERE t.user_email = ${email}) AS leg_count
+    `;
+    const tripsBefore = Number(before[0].trip_count);
+    const legsBefore  = Number(before[0].leg_count);
+
+    // Run the full scan synchronously (awaited) so we can return a summary
+    for (const accountRow of accountRows) {
+      await scanGmailAccountForTrips(email, accountRow.account_email);
+    }
+
+    // Snapshot after scan
+    const after = await sql`
+      SELECT
+        (SELECT COUNT(*) FROM trips WHERE user_email = ${email}) AS trip_count,
+        (SELECT COUNT(*) FROM trip_legs tl JOIN trips t ON t.id = tl.trip_id WHERE t.user_email = ${email}) AS leg_count
+    `;
+    const tripsAfter = Number(after[0].trip_count);
+    const legsAfter  = Number(after[0].leg_count);
+
+    // Breakdown by leg type for the new legs
+    const breakdown = await sql`
+      SELECT tl.type, COUNT(*) AS count
+      FROM trip_legs tl
+      JOIN trips t ON t.id = tl.trip_id
+      WHERE t.user_email = ${email}
+        AND tl.created_at >= NOW() - INTERVAL '5 minutes'
+      GROUP BY tl.type
+      ORDER BY count DESC
+    `;
+
+    const summary = {
+      ok: true,
+      accounts_scanned: accountRows.length,
+      trips_before: tripsBefore,
+      trips_after: tripsAfter,
+      trips_created: Math.max(0, tripsAfter - tripsBefore),
+      legs_added: Math.max(0, legsAfter - legsBefore),
+      breakdown_by_type: breakdown.reduce((acc, r) => { acc[r.type] = Number(r.count); return acc; }, {}),
+      message: tripsAfter > tripsBefore
+        ? `Found ${tripsAfter - tripsBefore} new trip${tripsAfter - tripsBefore !== 1 ? 's' : ''} and ${legsAfter - legsBefore} new booking${legsAfter - legsBefore !== 1 ? 's' : ''}.`
+        : legsAfter > legsBefore
+          ? `Added ${legsAfter - legsBefore} new booking${legsAfter - legsBefore !== 1 ? 's' : ''} to existing trips.`
+          : "Inbox scanned — everything is already up to date.",
+    };
+
+    console.log(`[rescan] ${email}: ${JSON.stringify(summary)}`);
+    res.json(summary);
+  } catch (e) {
+    console.error("[rescan]", e.message);
+    res.status(500).json({ error: e.message });
+  }
+});
+
+// In-memory cooldown map (resets on server restart — acceptable for rate-limiting)
+const rescanCooldowns = new Map();
+
+// ---------------------------------------------------------------------------
 // Parse a pasted email/confirmation body using the same LLM pipeline as Gmail
 async function parsePastedEmailBody(userEmail, body, source) {
   if (!body || body.trim().length < 20) return 0;
