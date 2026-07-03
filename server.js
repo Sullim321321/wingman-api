@@ -803,7 +803,7 @@ async function sendHotelPreferenceEmail(userEmail, parsedBooking, tripTitle) {
     if (hotelEmail) {
       // Send directly to the hotel AND CC the user
       await resend.emails.send({
-        from: "Wingman <noreply@welcometothefight.club>",
+        from: "Wingman <hello@wingmantravel.app>",
         to: hotelEmail,
         cc: userEmail,
         reply_to: userEmail,
@@ -825,7 +825,7 @@ async function sendHotelPreferenceEmail(userEmail, parsedBooking, tripTitle) {
         ? `<p style="background:#f5f5f5;padding:12px;border-radius:8px;font-size:13px"><strong>Note from Wingman:</strong> We could not find a direct email for ${hotelName}. You can forward this email or call them at <strong>${hotelPhone}</strong>${hotelWebsite ? ` or visit <a href="${hotelWebsite}">${hotelWebsite}</a>` : ""}.</p>`
         : `<p style="background:#f5f5f5;padding:12px;border-radius:8px;font-size:13px"><strong>Note from Wingman:</strong> We could not find a direct email for ${hotelName}. Please forward this to the hotel's concierge or front desk.</p>`;
       await resend.emails.send({
-        from: "Wingman <noreply@welcometothefight.club>",
+        from: "Wingman <hello@wingmantravel.app>",
         to: userEmail,
         subject: `[Draft] Pre-arrival preferences for your stay at ${hotelName}`,
         html: fallbackNote + emailBody,
@@ -1075,7 +1075,7 @@ app.post("/auth/request", authLimiter, async (req, res) => {
     const hasResend = resendKey && resendKey !== "re_placeholder" && resendKey.startsWith("re_");
     if (hasResend) {
       await resend.emails.send({
-        from: "Wingman <noreply@welcometothefight.club>",
+        from: "Wingman <hello@wingmantravel.app>",
         to: email,
         subject: "Your Wingman sign-in code: " + code,
         html: `<div style="font-family:sans-serif;max-width:400px;margin:0 auto;padding:32px">
@@ -6346,7 +6346,7 @@ app.post('/trips/:tripId/companions/invite', auth, async (req, res) => {
     if (invitee_email) {
       try {
         await resend.emails.send({
-          from: 'Wingman <noreply@welcometothefight.club>',
+          from: 'Wingman <hello@wingmantravel.app>',
           to: invitee_email,
           subject: `${req.email} invited you to a trip on Wingman`,
           html: `<p>You've been invited to join the trip "${tripRows[0].title}" on Wingman.</p><p><a href="${inviteUrl}">Accept invitation</a></p>`,
