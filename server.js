@@ -1921,6 +1921,9 @@ async function scanGmailAccountForTrips(userEmail, accountEmail) {
     "from:turo.com",
     // Airline loyalty programs (emails come from program domains, not airline domains)
     "from:trueblue.jetblue.com",
+    "from:jetbluetravel.com",
+    "from:vacations.jetblue.com",
+    "from:jetblue.com subject:(hotel OR vacation OR resort OR confirmation)",
     "from:mileageplus.united.com",
     "from:skymiles.delta.com",
     "from:aadvantage.aa.com",
