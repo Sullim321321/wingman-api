@@ -2812,6 +2812,78 @@ app.get("/trips", async (req, res) => {
 });
 
 // ---------------------------------------------------------------------------
+// POST /inbound/email — inbound email webhook (Resend / SendGrid inbound)
+// ---------------------------------------------------------------------------
+// How it works:
+//   1. User forwards any booking confirmation to import@wingmantravel.app
+//   2. Resend (or SendGrid) inbound routing POSTs the parsed email here
+//   3. We match the sender's email address to a Wingman account
+//   4. Parse the body with the same LLM pipeline as Gmail scan
+//   5. Create / group the trip using findOrCreateGroupedTrip
+//
+// Resend inbound payload shape:
+//   { from, to, subject, text, html, headers }
+// SendGrid inbound payload shape (multipart/form-data):
+//   req.body.from, req.body.subject, req.body.text, req.body.html
+// ---------------------------------------------------------------------------
+app.post("/inbound/email", async (req, res) => {
+  // Accept both JSON (Resend) and form-encoded (SendGrid)
+  const from    = req.body?.from    || req.body?.envelope?.from || "";
+  const subject = req.body?.subject || "";
+  const text    = req.body?.text    || req.body?.plain || "";
+  const html    = req.body?.html    || "";
+
+  // Extract the sender email address
+  const senderMatch = from.match(/[a-zA-Z0-9._%+\-]+@[a-zA-Z0-9.\-]+\.[a-zA-Z]{2,}/);
+  const senderEmail = senderMatch ? senderMatch[0].toLowerCase() : null;
+
+  if (!senderEmail) {
+    console.warn("[inbound/email] no sender email found in from:", from);
+    return res.status(200).json({ ok: false, reason: "no sender email" });
+  }
+
+  // Look up the Wingman user by sender email
+  // We check both the primary account email and connected Gmail accounts
+  let userEmail = null;
+  try {
+    const userRows = await sql`
+      SELECT user_email FROM gmail_tokens WHERE account_email = ${senderEmail}
+      UNION
+      SELECT email AS user_email FROM users WHERE email = ${senderEmail}
+      LIMIT 1
+    `;
+    if (userRows.length > 0) {
+      userEmail = userRows[0].user_email;
+    }
+  } catch (e) {
+    console.error("[inbound/email] user lookup error:", e.message);
+  }
+
+  if (!userEmail) {
+    // Unknown sender — still return 200 so the webhook doesn't retry
+    console.warn(`[inbound/email] unknown sender: ${senderEmail}`);
+    return res.status(200).json({ ok: false, reason: "unknown sender" });
+  }
+
+  // Build the body to parse — prefer plain text, fall back to HTML stripped of tags
+  const body = text.trim() ||
+    html.replace(/<[^>]+>/g, " ").replace(/\s{2,}/g, " ").trim();
+
+  if (body.length < 20) {
+    return res.status(200).json({ ok: false, reason: "body too short" });
+  }
+
+  try {
+    const count = await parsePastedEmailBody(userEmail, `Subject: ${subject}\n\n${body}`, "email_forward");
+    console.log(`[inbound/email] ${senderEmail} → ${userEmail}: ${count} booking(s) created`);
+    return res.status(200).json({ ok: true, bookings_created: count });
+  } catch (e) {
+    console.error("[inbound/email] parse error:", e.message);
+    return res.status(200).json({ ok: false, reason: e.message });
+  }
+});
+
+// ---------------------------------------------------------------------------
 // POST /trips — manually create a trip
 // ---------------------------------------------------------------------------
 app.post("/trips", async (req, res) => {
