@@ -4250,6 +4250,38 @@ app.get("/debug/concierge", async (req, res) => {
 });
 
 // ---------------------------------------------------------------------------
+// GET /debug/anthropic-test — test which Anthropic models are available
+// ---------------------------------------------------------------------------
+app.get("/debug/anthropic-test", async (req, res) => {
+  const h = req.headers.authorization || "";
+  const t = h.startsWith("Bearer ") ? h.slice(7) : null;
+  if (!t) return res.status(401).json({ error: "no token" });
+  try { jwt.verify(t, JWT_SECRET); } catch(e) { return res.status(401).json({ error: "bad token" }); }
+  const modelsToTest = [
+    "claude-3-haiku-20240307",
+    "claude-3-5-haiku-20241022",
+    "claude-3-sonnet-20240229",
+    "claude-3-opus-20240229",
+    "claude-opus-4-5",
+    "claude-sonnet-4-5",
+  ];
+  const results = {};
+  const anthropic = getAnthropic();
+  for (const model of modelsToTest) {
+    try {
+      const r = await anthropic.messages.create({
+        model,
+        max_tokens: 10,
+        messages: [{ role: "user", content: "Hi" }],
+      });
+      results[model] = "OK: " + (r.content[0]?.text?.slice(0, 30) || "(empty)");
+    } catch(e) {
+      results[model] = "FAIL: " + e.message.slice(0, 80);
+    }
+  }
+  res.json(results);
+});
+// ---------------------------------------------------------------------------
 // Weather — geolocated current conditions for HomeScreen widget
 // ---------------------------------------------------------------------------
 app.get("/weather", async (req, res) => {
