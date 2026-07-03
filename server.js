@@ -729,7 +729,7 @@ Return ONLY valid JSON:
   }
 }`;
     const resp = await getAnthropic().messages.create({
-      model: "claude-3-5-haiku-20241022",
+      model: "claude-3-haiku-20240307",
       max_tokens: 300,
       messages: [{ role: "user", content: prompt }],
     });
@@ -2264,7 +2264,7 @@ Return this exact JSON structure:
     let claudeResp;
     try {
       claudeResp = await getAnthropic().messages.create({
-        model: "claude-3-5-haiku-20241022",
+        model: "claude-3-haiku-20240307",
         max_tokens: 700,
         messages: [{ role: "user", content: prompt }],
       });
@@ -2647,7 +2647,7 @@ Return this exact JSON structure:
   let parsed;
   try {
     const claudeResp = await getAnthropic().messages.create({
-      model: "claude-3-5-haiku-20241022",
+      model: "claude-3-haiku-20240307",
       max_tokens: 700,
       messages: [{ role: "user", content: prompt }],
     });
@@ -3435,7 +3435,7 @@ LOGISTICS & PLANNING
     const systemMsg = messages.find(m => m.role === "system")?.content || "";
     const chatMessages = messages.filter(m => m.role !== "system");
         const claudeResp = await getAnthropic().messages.create({
-      model: "claude-3-5-haiku-20241022",
+      model: "claude-3-haiku-20240307",
       max_tokens: 1000,
       system: systemMsg,
       messages: chatMessages,
@@ -3878,7 +3878,7 @@ Return a JSON object with exactly this structure (no markdown, raw JSON only):
 Provide 2 neighborhoods, 3 hotels, 4 restaurants, 4 activities, 3 local tips, 3 concierge prompts.
 ${tasteSection ? "Filter recommendations through the user taste profile above." : ""}`;
     const resp = await getAnthropic().messages.create({
-      model: "claude-3-5-haiku-20241022",
+      model: "claude-3-haiku-20240307",
       max_tokens: 1200,
       messages: [{ role: "user", content: prompt }],
     });
@@ -4311,6 +4311,135 @@ app.get("/env-status", auth, (_req, res) => {
       points_expiry:      "every 6 hr",
     },
   });
+});
+
+// ---------------------------------------------------------------------------
+// Train Status Service — National Rail Darwin (OpenLDBWS) via direct SOAP/JSON
+// Uses the Darwin Public API with DARWIN_API_TOKEN env var.
+// Falls back to Huxley2 community demo if no token is set (no uptime guarantee).
+// ---------------------------------------------------------------------------
+
+// CRS code cache: station name → 3-letter CRS code
+const crsCache = new Map();
+
+async function lookupCRS(stationName) {
+  if (!stationName) return null;
+  const upper = stationName.toUpperCase().trim();
+  // If it's already a 3-letter CRS code, return it directly
+  if (/^[A-Z]{3}$/.test(upper)) return upper;
+  if (crsCache.has(upper)) return crsCache.get(upper);
+  try {
+    const huxleyBase = process.env.HUXLEY2_URL || "https://huxley2.azurewebsites.net";
+    const encoded = encodeURIComponent(stationName.toLowerCase());
+    const r = await fetch(`${huxleyBase}/crs/${encoded}`, { signal: AbortSignal.timeout(5000) });
+    if (!r.ok) return null;
+    const data = await r.json();
+    if (!data || data.length === 0) return null;
+    // Prefer exact name match, otherwise take first result
+    const exact = data.find(s => s.stationName?.toLowerCase() === stationName.toLowerCase());
+    const crs = (exact || data[0]).crsCode;
+    crsCache.set(upper, crs);
+    return crs;
+  } catch (e) {
+    console.error("[crs-lookup]", e.message);
+    return null;
+  }
+}
+
+// Fetch live departure status for a specific train service
+// stationFrom / stationTo can be CRS codes or full station names
+// departsAt is an ISO datetime string — we find the matching service in a ±15 min window
+async function getTrainStatus(stationFrom, stationTo, departsAt) {
+  try {
+    const token = process.env.DARWIN_API_TOKEN;
+    const huxleyBase = process.env.HUXLEY2_URL || "https://huxley2.azurewebsites.net";
+
+    const [fromCRS, toCRS] = await Promise.all([
+      lookupCRS(stationFrom),
+      lookupCRS(stationTo),
+    ]);
+    if (!fromCRS) return { status: "Unknown", error: "Station not found: " + stationFrom };
+
+    // Build the Huxley2 / Darwin URL
+    // Use /departures/{from}/to/{to} if we have a destination, else /departures/{from}
+    const destPart = toCRS ? `/to/${toCRS}` : "";
+    const tokenParam = token ? `?accessToken=${token}` : "";
+    const url = `${huxleyBase}/departures/${fromCRS}${destPart}/20${tokenParam}`;
+
+    const r = await fetch(url, { signal: AbortSignal.timeout(8000) });
+    if (!r.ok) return { status: "Unknown", error: `Darwin API returned ${r.status}` };
+    const board = await r.json();
+
+    const services = board.trainServices || [];
+    if (services.length === 0) return { status: "No services", from: fromCRS, to: toCRS };
+
+    // Find the service matching the scheduled departure time (±15 min window)
+    let targetService = null;
+    if (departsAt) {
+      const targetTime = new Date(departsAt);
+      const targetHHMM = targetTime.toTimeString().slice(0, 5); // "HH:MM"
+      // First try exact match on std (scheduled time)
+      targetService = services.find(s => s.std === targetHHMM);
+      // If no exact match, find closest within 15 minutes
+      if (!targetService) {
+        const targetMins = targetTime.getHours() * 60 + targetTime.getMinutes();
+        let minDiff = Infinity;
+        for (const s of services) {
+          if (!s.std) continue;
+          const [h, m] = s.std.split(":").map(Number);
+          const diff = Math.abs((h * 60 + m) - targetMins);
+          if (diff < minDiff && diff <= 15) { minDiff = diff; targetService = s; }
+        }
+      }
+    }
+    // Fall back to first service if no time match
+    if (!targetService) targetService = services[0];
+
+    // Interpret the Darwin etd field
+    const etd = targetService.etd || "";
+    const std = targetService.std || "";
+    const isCancelled = targetService.isCancelled === true || etd === "Cancelled";
+    const isDelayed = !isCancelled && etd && etd !== "On time" && etd !== std;
+    let delayMins = null;
+    if (isDelayed && etd && std && /^\d{2}:\d{2}$/.test(etd) && /^\d{2}:\d{2}$/.test(std)) {
+      const [eh, em] = etd.split(":").map(Number);
+      const [sh, sm] = std.split(":").map(Number);
+      delayMins = (eh * 60 + em) - (sh * 60 + sm);
+      if (delayMins < 0) delayMins += 1440; // overnight wrap
+    }
+
+    return {
+      status: isCancelled ? "Cancelled" : isDelayed ? "Delayed" : "On Time",
+      std,
+      etd: isCancelled ? "Cancelled" : etd || "On time",
+      platform: targetService.platform || null,
+      operator: targetService.operator || null,
+      delayMins,
+      delayReason: targetService.delayReason || null,
+      cancelReason: targetService.cancelReason || null,
+      from: fromCRS,
+      to: toCRS,
+      serviceId: targetService.serviceIdUrlSafe || null,
+    };
+  } catch (e) {
+    console.error("[train-status]", e.message);
+    return { status: "Unknown", error: e.message };
+  }
+}
+
+// GET /trains/status?from=EDB&to=KGX&departs_at=2026-07-03T09:30:00Z
+// Returns live departure status for a specific train leg
+app.get("/trains/status", async (req, res) => {
+  const email = await verifyAccessToken(req);
+  if (!email) return res.status(401).json({ error: "unauthorized" });
+  const { from, to, departs_at } = req.query;
+  if (!from) return res.status(400).json({ error: "from station required" });
+  try {
+    const status = await getTrainStatus(from, to, departs_at);
+    res.json(status);
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
 });
 
 // ---------------------------------------------------------------------------
@@ -7238,7 +7367,7 @@ Available transport options: ${ranked.map(o => `${o.name} (${o.type}, ~${o.durat
 Give a 2-sentence recommendation of the BEST option for this traveler, mentioning the option name and one key reason. Be specific and practical. Respond in ${userLocale === "fr" ? "French" : userLocale === "ja" ? "Japanese" : userLocale === "ar" ? "Arabic" : userLocale === "de" ? "German" : userLocale === "es" ? "Spanish" : "English"}.`;
 
       const msg = await anthropic.messages.create({
-        model: "claude-3-5-haiku-20241022",
+        model: "claude-3-haiku-20240307",
         max_tokens: 150,
         messages: [{ role: "user", content: prompt }],
       });
