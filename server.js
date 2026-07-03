@@ -729,7 +729,7 @@ Return ONLY valid JSON:
   }
 }`;
     const resp = await getAnthropic().messages.create({
-      model: "claude-3-haiku-20240307",
+      model: "claude-sonnet-4-5",
       max_tokens: 300,
       messages: [{ role: "user", content: prompt }],
     });
@@ -2264,7 +2264,7 @@ Return this exact JSON structure:
     let claudeResp;
     try {
       claudeResp = await getAnthropic().messages.create({
-        model: "claude-3-haiku-20240307",
+        model: "claude-sonnet-4-5",
         max_tokens: 700,
         messages: [{ role: "user", content: prompt }],
       });
@@ -2647,7 +2647,7 @@ Return this exact JSON structure:
   let parsed;
   try {
     const claudeResp = await getAnthropic().messages.create({
-      model: "claude-3-haiku-20240307",
+      model: "claude-sonnet-4-5",
       max_tokens: 700,
       messages: [{ role: "user", content: prompt }],
     });
@@ -3435,7 +3435,7 @@ LOGISTICS & PLANNING
     const systemMsg = messages.find(m => m.role === "system")?.content || "";
     const chatMessages = messages.filter(m => m.role !== "system");
         const claudeResp = await getAnthropic().messages.create({
-      model: "claude-3-haiku-20240307",
+      model: "claude-sonnet-4-5",
       max_tokens: 1000,
       system: systemMsg,
       messages: chatMessages,
@@ -3878,7 +3878,7 @@ Return a JSON object with exactly this structure (no markdown, raw JSON only):
 Provide 2 neighborhoods, 3 hotels, 4 restaurants, 4 activities, 3 local tips, 3 concierge prompts.
 ${tasteSection ? "Filter recommendations through the user taste profile above." : ""}`;
     const resp = await getAnthropic().messages.create({
-      model: "claude-3-haiku-20240307",
+      model: "claude-sonnet-4-5",
       max_tokens: 1200,
       messages: [{ role: "user", content: prompt }],
     });
@@ -3924,7 +3924,7 @@ app.post("/trips/draft", auth, async (req, res) => {
   try {
     const anthropic = getAnthropic();
     const msg = await anthropic.messages.create({
-      model: "claude-3-haiku-20240307",
+      model: "claude-sonnet-4-5",
       max_tokens: 400,
       messages: [{
         role: "user",
@@ -4258,12 +4258,9 @@ app.get("/debug/anthropic-test", async (req, res) => {
   if (!t) return res.status(401).json({ error: "no token" });
   try { jwt.verify(t, JWT_SECRET); } catch(e) { return res.status(401).json({ error: "bad token" }); }
   const modelsToTest = [
-    "claude-3-haiku-20240307",
-    "claude-3-5-haiku-20241022",
-    "claude-3-sonnet-20240229",
-    "claude-3-opus-20240229",
-    "claude-opus-4-5",
     "claude-sonnet-4-5",
+    "claude-opus-4-5",
+    "claude-haiku-4-5",
   ];
   const results = {};
   const anthropic = getAnthropic();
@@ -6981,7 +6978,7 @@ app.post("/auth/gmail/import", auth, async (req, res) => {
         try {
           const anthropic = getAnthropic();
           const parseResp = await anthropic.messages.create({
-            model: "claude-3-haiku-20240307",
+            model: "claude-sonnet-4-5",
             max_tokens: 400,
             messages: [{ role: "user", content: `Extract booking details from this email subject and sender. Return JSON only with fields: type (flight/hotel/car), origin, destination, departs_at (ISO), arrives_at (ISO), carrier, flight_number, confirmation, title. Subject: "${subject}" From: "${from}" Date: "${date}"` }]
           });
@@ -7017,7 +7014,7 @@ app.post("/plan", auth, async (req, res) => {
     // Step 1: Use Anthropic to parse the trip intent into structured legs
     const anthropic = getAnthropic();
     const parseResp = await anthropic.messages.create({
-      model: "claude-3-haiku-20240307",
+      model: "claude-sonnet-4-5",
       max_tokens: 600,
       messages: [{ role: "user", content: `Parse this travel request into a structured multi-city itinerary. Return JSON only with: { title, legs: [{ origin, destination, depart_date (YYYY-MM-DD), type: 'flight'|'hotel', nights (for hotel), notes }] }. Request: "${prompt}"` }]
     });
@@ -7047,7 +7044,7 @@ app.post("/plan", auth, async (req, res) => {
     }
     // Step 3: Generate a natural language summary
     const summaryResp = await anthropic.messages.create({
-      model: "claude-3-haiku-20240307",
+      model: "claude-sonnet-4-5",
       max_tokens: 300,
       messages: [{ role: "user", content: `Write a 2-sentence excited summary of this trip plan for the user: ${JSON.stringify(plan)}. Be specific about cities and dates. Sound like a knowledgeable travel companion.` }]
     });
@@ -7399,7 +7396,7 @@ Available transport options: ${ranked.map(o => `${o.name} (${o.type}, ~${o.durat
 Give a 2-sentence recommendation of the BEST option for this traveler, mentioning the option name and one key reason. Be specific and practical. Respond in ${userLocale === "fr" ? "French" : userLocale === "ja" ? "Japanese" : userLocale === "ar" ? "Arabic" : userLocale === "de" ? "German" : userLocale === "es" ? "Spanish" : "English"}.`;
 
       const msg = await anthropic.messages.create({
-        model: "claude-3-haiku-20240307",
+        model: "claude-sonnet-4-5",
         max_tokens: 150,
         messages: [{ role: "user", content: prompt }],
       });
@@ -7473,7 +7470,7 @@ Return JSON: { "terminal_overview": "1-2 sentence summary", "picks": [ { "name":
 Include 6-8 picks. Prioritize quality sit-down options over fast food. Include at least one bar/lounge if available.`;
     const ai = getAnthropic();
     const msg = await ai.messages.create({
-      model: "claude-3-haiku-20240307",
+      model: "claude-sonnet-4-5",
       max_tokens: 1200,
       messages: [{ role: "user", content: prompt }],
     });
@@ -7610,7 +7607,7 @@ app.get("/airports/:iata/city-transport", auth, async (req, res) => {
   try {
     const ai = getAnthropic();
     const msg = await ai.messages.create({
-      model: "claude-3-haiku-20240307",
+      model: "claude-sonnet-4-5",
       max_tokens: 900,
       messages: [{ role: "user", content: `For a traveler arriving at ${iata} (${city}), what are the best ways to get around the city during their stay?
 Return JSON: { "city": string, "overview": string, "options": [ { "mode": string, "name": string, "description": string, "cost_per_trip": string, "app": string|null, "deep_link_ios": string|null, "tip": string } ] }
@@ -8301,7 +8298,7 @@ app.post("/trips/:tripId/cascade/restaurant-reschedule", auth, requirePro, async
     try {
       const anthropic = getAnthropic();
       const aiResp = await anthropic.messages.create({
-        model: "claude-3-haiku-20240307",
+        model: "claude-sonnet-4-5",
         max_tokens: 200,
         messages: [{
           role: "user",
