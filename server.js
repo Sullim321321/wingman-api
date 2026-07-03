@@ -2192,23 +2192,34 @@ app.post("/trips/rename-unknown", auth, async (req, res) => {
   }
 });
 
-// POST /trips/reparse-unknown — delete Unknown Trip records and re-trigger Gmail scan
+// POST /trips/reparse-unknown — delete poorly-titled gmail trips and re-trigger Gmail scan
 // ---------------------------------------------------------------------------
 app.post("/trips/reparse-unknown", async (req, res) => {
   const email = await verifyAccessToken(req);
   if (!email) return res.status(401).json({ error: "unauthorized" });
   try {
-    // Delete trips with "Unknown Trip" title so they can be re-parsed
+    // Delete all poorly-titled gmail trips so they can be re-parsed with improved prompt
     const deleted = await sql`
       DELETE FROM trips
       WHERE user_email = ${email}
-        AND (title = 'Unknown Trip' OR title = 'Unknown' OR title LIKE 'Unknown%Trip')
+        AND source = 'gmail'
+        AND (
+          title = 'Unknown Trip'
+          OR title = 'Unknown'
+          OR title LIKE 'Unknown%Trip'
+          OR title = 'Trip'
+          OR title LIKE '% Airlines Booking'
+          OR title LIKE '% Airlines Flight'
+          OR title LIKE '% Booking'
+          OR title LIKE '% Flight'
+          OR title = 'Imported Trip'
+        )
       RETURNING id
     `;
-    console.log(`[reparse] Deleted ${deleted.length} unknown trips for ${email}`);
-    // Re-trigger Gmail scan in background
+    console.log(`[reparse] Deleted ${deleted.length} poorly-titled gmail trips for ${email}`);
+    // Re-trigger Gmail scan in background — improved Claude prompt will produce better titles
     scanGmailForTrips(email).catch(e => console.error("[reparse scan]", e.message));
-    res.json({ ok: true, deleted: deleted.length, message: "Unknown trips cleared, re-scanning Gmail now" });
+    res.json({ ok: true, deleted: deleted.length, message: `Cleared ${deleted.length} trips, re-scanning Gmail with improved parser now` });
   } catch (e) {
     console.error("[reparse-unknown]", e.message);
     res.status(500).json({ error: e.message });
