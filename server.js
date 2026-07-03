@@ -4295,7 +4295,7 @@ app.get("/env-status", auth, (_req, res) => {
       stripe_pro_price: { configured: !!(process.env.STRIPE_PRO_PRICE_ID && !process.env.STRIPE_PRO_PRICE_ID.startsWith('price_pro')), label: "Stripe Pro price ID (real product)" },
       stripe_elite_price: { configured: !!(process.env.STRIPE_ELITE_PRICE_ID && !process.env.STRIPE_ELITE_PRICE_ID.startsWith('price_elite')), label: "Stripe Elite price ID (real product)" },
       stripe_webhook: { configured: !!process.env.STRIPE_WEBHOOK_SECRET,  label: "Stripe webhook signature verification" },
-      anthropic:      { configured: !!process.env.ANTHROPIC_API_KEY,       label: "Anthropic Claude (concierge + passport OCR)" },
+      anthropic:      { configured: !!process.env.ANTHROPIC_API_KEY, key_prefix: process.env.ANTHROPIC_API_KEY ? process.env.ANTHROPIC_API_KEY.slice(0,12) + '...' : null, label: "Anthropic Claude (concierge + passport OCR)" },
       google_oauth:   { configured: !!(process.env.GOOGLE_CLIENT_ID && process.env.GOOGLE_CLIENT_SECRET), label: "Google OAuth (Gmail import)" },
       resend:         { configured: !!(process.env.RESEND_API_KEY && !process.env.RESEND_API_KEY.startsWith('re_placeholder')), label: "Resend (transactional email)" },
       database:       { configured: !!(process.env.DATABASE_URL && !process.env.DATABASE_URL.includes('placeholder')), label: "Neon PostgreSQL" },
