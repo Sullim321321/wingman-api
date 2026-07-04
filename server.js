@@ -630,7 +630,18 @@ async function bootstrapDB() {
       console.error("[db] rename error:", e.message);
     }
 
-    console.log("[db] tables ready");
+    // ── Persistent memory: user instructions ──────────────────────────────
+    await sql`
+      CREATE TABLE IF NOT EXISTS user_instructions (
+        id SERIAL PRIMARY KEY,
+        user_email TEXT NOT NULL,
+        instruction TEXT NOT NULL,
+        source TEXT DEFAULT 'chat',
+        created_at TIMESTAMPTZ DEFAULT NOW()
+      )
+    `;
+    await sql`CREATE INDEX IF NOT EXISTS idx_user_instructions_email ON user_instructions(user_email, created_at DESC)`;
+        console.log("[db] tables ready");
   } catch (e) {
     console.error("[db] bootstrap error:", e.message);
   }
@@ -3174,12 +3185,13 @@ app.post("/concierge", conciergeLimiter, async (req, res) => {
   const message = scrubPII(rawMessage);
   try {
     // Fetch user preferences (taste graph), trips, loyalty accounts, and hotel affinity in parallel
-    const [userRows, rawTrips, rawLegs, loyaltyAccounts, hotelAffinity] = await Promise.all([
+    const [userRows, rawTrips, rawLegs, loyaltyAccounts, hotelAffinity, savedInstructions] = await Promise.all([
       sql`SELECT preferences, COALESCE(revealed_preferences, '{}') as revealed_preferences FROM users WHERE email = ${email}`,
       sql`SELECT id, title, status, mode, created_at FROM trips WHERE user_email = ${email} ORDER BY created_at DESC LIMIT 10`,
       sql`SELECT tl.* FROM trip_legs tl INNER JOIN trips t ON tl.trip_id = t.id WHERE t.user_email = ${email} ORDER BY tl.departs_at ASC NULLS LAST`,
       sql`SELECT program, points_balance, elite_status, elite_level_next, points_to_next_level, nights_ytd, segments_ytd FROM loyalty_accounts WHERE user_email = ${email} ORDER BY program ASC`,
-      sql`SELECT property_name, brand, city, country, tier, attributes, stay_count, last_stayed FROM hotel_affinity WHERE user_email = ${email} ORDER BY stay_count DESC, last_stayed DESC LIMIT 20`
+      sql`SELECT property_name, brand, city, country, tier, attributes, stay_count, last_stayed FROM hotel_affinity WHERE user_email = ${email} ORDER BY stay_count DESC, last_stayed DESC LIMIT 20`,
+      sql`SELECT instruction FROM user_instructions WHERE user_email = ${email} ORDER BY created_at DESC LIMIT 20`
     ]);
     // Assemble trips with legs (avoids json_agg ORDER BY Neon compatibility issue)
     const legsByTrip = {};
@@ -3340,11 +3352,19 @@ app.post("/concierge", conciergeLimiter, async (req, res) => {
         }).join("\n")
       : null;
 
+    // Build saved instructions section
+    const instructionsSection = savedInstructions && savedInstructions.length > 0
+      ? `=== STANDING INSTRUCTIONS FROM USER ===
+These are preferences and rules the user has explicitly told you to always follow. Treat them as hard constraints:
+${savedInstructions.map(r => `  - ${r.instruction}`).join("\n")}
+`
+      : "";
+
     const systemPrompt = `You are Wingman — a world-class AI travel concierge and destination intelligence engine. You combine the knowledge of a seasoned luxury travel editor, a Michelin-starred restaurant scout, a hotel critic, and a local fixer in every city on earth. You have real-time access to the user's trips, live flight statuses, and weather disruption risk scores. You know this user's personal taste profile and editorial preferences — use them to give recommendations that feel like they came from a trusted friend with impeccable taste and deep local knowledge, not a generic algorithm.
 
 Today's date/time: ${today}
 User: ${email}
-${tasteSection ? `=== USER'S TASTE PROFILE ===\n${tasteSection}\n` : ""}
+${instructionsSection}${tasteSection ? `=== USER'S TASTE PROFILE ===\n${tasteSection}\n` : ""}
 ${loyaltySummary ? `=== USER'S LOYALTY ACCOUNTS ===\n${loyaltySummary}\n\nWhen recommending hotels, always factor in which programs the user has status with and suggest properties where their status will be recognized. When advising on flights, factor in their airline status and miles balance — suggest using miles for upgrades when the balance is high.\n` : ""}
 ${locationContext ? `=== USER'S CURRENT LOCATION ===\n${locationContext}\nUse this to give hyper-local recommendations. If the user asks "what should I do" or "where should I eat" without specifying a city, assume they mean right now, right here.\n` : ""}
 ${liveWeather ? `=== LIVE WEATHER AT USER'S LOCATION ===\nCurrently ${liveWeather.temp}\u00b0C (feels like ${liveWeather.feels}\u00b0C), ${liveWeather.desc}${liveWeather.windKph ? `, wind ${liveWeather.windKph} km/h` : ''}${liveWeather.humidity ? `, humidity ${liveWeather.humidity}%` : ''}.\nUse this when the user asks about weather, what to wear, or whether to go outside.\n` : ""}
@@ -3445,6 +3465,22 @@ LOGISTICS & PLANNING
     });
     // Strip any markdown that slips through — render as plain text on mobile
     const rawReply = claudeResp.content[0].text;
+
+    // ── Persistent memory: detect instruction phrases and save them ──────
+    const instructionPhrases = [
+      /\b(?:always|never|every time|from now on|please always|please never|remember that|remember to|don't forget|make sure you always|make sure you never)\b.{5,120}/gi,
+    ];
+    for (const pattern of instructionPhrases) {
+      const matches = rawMessage.match(pattern);
+      if (matches) {
+        for (const match of matches) {
+          const cleaned = match.trim().replace(/[.!?]+$/, '').trim();
+          if (cleaned.length > 10) {
+            sql`INSERT INTO user_instructions (user_email, instruction, source) VALUES (${email}, ${cleaned}, 'chat') ON CONFLICT DO NOTHING`.catch(() => {});
+          }
+        }
+      }
+    }
     // Extract ACTION tag before stripping
     let bookingAction = null;
     const actionMatch = rawReply.match(/ACTION:(\{[^\n]+\})/m);
@@ -4785,6 +4821,8 @@ async function pollDisruptions() {
         pushBody = `You've landed at ${leg.destination}. Wingman is arranging your ride.`;
         // Auto-dispatch Uber based on trip mode
         dispatchUberOnLanding(leg).catch(e => console.error("[uber-dispatch]", e.message));
+        // Auto-activate return trip watch on landing
+        activateReturnTripWatch(leg).catch(e => console.error("[return-watch]", e.message));
       } else {
         activityTitle = `${ident} status: ${newStatus}`;
         activityBody = `${leg.origin} → ${leg.destination}`;
@@ -4862,6 +4900,62 @@ const AIRPORT_COORDS = {
   SIN: { lat: 1.3644, lng: 103.9915 }, DXB: { lat: 25.2532, lng: 55.3657 },
   SYD: { lat: -33.9399, lng: 151.1753 }, GRU: { lat: -23.4356, lng: -46.4731 },
 };
+
+// ---------------------------------------------------------------------------
+// Return Trip Watch — automatically set the return leg to "Watching" on landing
+// Called when a flight lands. Finds the return leg for the same trip and
+// sets its status to "Watching" so the flight monitor starts tracking it.
+// ---------------------------------------------------------------------------
+async function activateReturnTripWatch(leg) {
+  try {
+    // Get all legs for this trip
+    const tripLegs = await sql`
+      SELECT tl.* FROM trip_legs tl
+      WHERE tl.trip_id = ${leg.trip_id}
+        AND tl.type = 'flight'
+        AND tl.status NOT IN ('Cancelled', 'Landed')
+      ORDER BY tl.departs_at ASC
+    `;
+    if (!tripLegs.length) return;
+
+    // Find legs that depart from this leg's destination (return legs)
+    const returnLegs = tripLegs.filter(l =>
+      l.origin === leg.destination &&
+      new Date(l.departs_at).getTime() > new Date(leg.arrives_at || leg.departs_at).getTime()
+    );
+    if (!returnLegs.length) return;
+
+    // Activate watching on the first return leg
+    const returnLeg = returnLegs[0];
+    await sql`
+      UPDATE trip_legs SET status = 'Watching'
+      WHERE id = ${returnLeg.id} AND status NOT IN ('Cancelled', 'Landed', 'Watching')
+    `;
+
+    // Log to activity feed
+    const ident = (returnLeg.carrier || "") + (returnLeg.flight_number || "");
+    await logActivity(
+      leg.user_email,
+      "return_watch_activated",
+      `Watching ${ident} for your return`,
+      `${returnLeg.origin} → ${returnLeg.destination} — I'm now monitoring your return flight.`,
+      leg.trip_id,
+      returnLeg.id,
+      {}
+    );
+
+    // Send a push notification
+    await sendPushToUser(leg.user_email, {
+      title: `Watching ${ident}`,
+      body: `Your return flight ${returnLeg.origin} → ${returnLeg.destination} is now being monitored.`,
+      data: { type: "return_watch", trip_id: String(leg.trip_id), leg_id: String(returnLeg.id) }
+    });
+
+    console.log(`[return-watch] activated for ${ident} (leg ${returnLeg.id})`);
+  } catch (err) {
+    console.error("[activateReturnTripWatch] error:", err.message);
+  }
+}
 
 // Dispatch Uber on landing via deep link push notification
 // No API key required — opens the Uber app pre-filled with airport pickup
@@ -8433,6 +8527,11 @@ app.get("/me/home-state", async (req, res) => {
       LIMIT 10
     `;
 
+    // Fetch user taste profile for restaurant suggestions
+    const userPrefsRow = await sql`SELECT preferences, taste_profile FROM users WHERE email = ${email} LIMIT 1`;
+    const userTaste = userPrefsRow[0]?.taste_profile || {};
+    const userPrefs = userPrefsRow[0]?.preferences || {};
+
     // Find the most relevant flight leg
     let activeLeg = null, activeTrip = null, state = "no_trip";
     let hoursToDepart = null;
@@ -8538,6 +8637,41 @@ app.get("/me/home-state", async (req, res) => {
       suggestions.push({ label: "I'm somewhere new", icon: "📍", route: "Concierge", prefill: "I'm somewhere new — what should I know?" });
     }
 
+    // Restaurant suggestion for at_destination state
+    let restaurantSuggestion = null;
+    if (state === "at_destination" && activeTrip) {
+      try {
+        const destCity = activeTrip.destination_city || activeLeg?.destination;
+        if (destCity) {
+          const PLACES_KEY = process.env.GOOGLE_PLACES_API_KEY;
+          if (PLACES_KEY) {
+            // Build keyword from taste profile
+            const cuisinePrefs = userTaste.cuisines || [];
+            const foodPrefs = userTaste.dietary || [];
+            const keyword = cuisinePrefs.length > 0 ? cuisinePrefs[0] : "restaurant";
+            const searchUrl = `https://maps.googleapis.com/maps/api/place/textsearch/json?query=${encodeURIComponent(keyword + " restaurant " + destCity)}&type=restaurant&key=${PLACES_KEY}`;
+            const placesResp = await fetch(searchUrl, { signal: AbortSignal.timeout(5000) });
+            if (placesResp.ok) {
+              const placesData = await placesResp.json();
+              const topPlace = placesData.results?.[0];
+              if (topPlace) {
+                restaurantSuggestion = {
+                  name: topPlace.name,
+                  address: topPlace.formatted_address || topPlace.vicinity,
+                  rating: topPlace.rating,
+                  price_level: topPlace.price_level,
+                  place_id: topPlace.place_id,
+                  maps_url: `https://www.google.com/maps/place/?q=place_id:${topPlace.place_id}`,
+                };
+              }
+            }
+          }
+        }
+      } catch (e) {
+        console.error("[restaurant-suggestion]", e.message);
+      }
+    }
+
     // Find hotel leg for the active trip (current stay or next check-in within 7 days)
     let hotelLeg = null;
     if (activeTrip) {
@@ -8591,6 +8725,7 @@ app.get("/me/home-state", async (req, res) => {
         destination: hotelLeg.destination,
       } : null,
       suggestions,
+      restaurant_suggestion: restaurantSuggestion,
     });
   } catch (e) {
     console.error("[home-state]", e.message);
@@ -9177,6 +9312,45 @@ cron.schedule("* * * * *", async () => {
 });
 
 // ---------------------------------------------------------------------------
+// GET /me/instructions — return all saved user instructions
+app.get("/me/instructions", auth, async (req, res) => {
+  try {
+    const rows = await sql`SELECT id, instruction, source, created_at FROM user_instructions WHERE user_email = ${req.email} ORDER BY created_at DESC`;
+    res.json({ instructions: rows });
+  } catch (e) {
+    console.error("[GET /me/instructions]", e.message);
+    res.status(500).json({ error: "server error" });
+  }
+});
+
+// POST /me/instructions — manually add a user instruction
+app.post("/me/instructions", auth, async (req, res) => {
+  const { instruction } = req.body || {};
+  if (!instruction || typeof instruction !== "string") return res.status(400).json({ error: "instruction required" });
+  try {
+    const [row] = await sql`
+      INSERT INTO user_instructions (user_email, instruction, source)
+      VALUES (${req.email}, ${instruction.trim()}, 'manual')
+      RETURNING id, instruction, created_at
+    `;
+    res.json({ ok: true, instruction: row });
+  } catch (e) {
+    console.error("[POST /me/instructions]", e.message);
+    res.status(500).json({ error: "server error" });
+  }
+});
+
+// DELETE /me/instructions/:id — remove a saved instruction
+app.delete("/me/instructions/:id", auth, async (req, res) => {
+  try {
+    await sql`DELETE FROM user_instructions WHERE id = ${req.params.id} AND user_email = ${req.email}`;
+    res.json({ ok: true });
+  } catch (e) {
+    console.error("[DELETE /me/instructions]", e.message);
+    res.status(500).json({ error: "server error" });
+  }
+});
+
 // POST /me/briefing-time — set preferred morning briefing time
 // Body: { hour: 7, min: 0 }  (UTC hour 0-23)
 // ---------------------------------------------------------------------------
