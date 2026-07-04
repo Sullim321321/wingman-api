@@ -3125,9 +3125,20 @@ async function getLiveWeather(location) {
     const temp = Math.round(d.main?.temp);
     const feels = Math.round(d.main?.feels_like);
     const desc = d.weather?.[0]?.description || 'clear';
-    const city = d.name || null;
     const humidity = d.main?.humidity;
     const windKph = d.wind?.speed ? Math.round(d.wind.speed * 3.6) : null;
+    // Use OWM reverse geocoding to get the proper city name (not sub-neighbourhood)
+    let city = d.name || null;
+    try {
+      const geoUrl = `https://api.openweathermap.org/geo/1.0/reverse?lat=${lat}&lon=${lng}&limit=1&appid=${apiKey}`;
+      const geoResp = await fetch(geoUrl, { signal: AbortSignal.timeout(3000) });
+      if (geoResp.ok) {
+        const geoData = await geoResp.json();
+        if (Array.isArray(geoData) && geoData[0]?.name) {
+          city = geoData[0].name;
+        }
+      }
+    } catch { /* fall back to d.name */ }
     return { temp, feels, desc, city, humidity, windKph };
   } catch (e) {
     console.error('[weather]', e.message);
