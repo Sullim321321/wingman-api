@@ -4494,6 +4494,73 @@ async function sendPushToUser(userEmail, title, body, data = {}) {
 }
 
 // ---------------------------------------------------------------------------
+// Cascade Check — proactively check downstream impacts of a disruption
+// Called when a flight is cancelled or delayed 60+ minutes.
+// Checks: connecting flights, hotel check-in, restaurant reservations
+// Sends proactive push notifications for each impacted item.
+// ---------------------------------------------------------------------------
+async function triggerCascadeCheck(leg, eventType, delayMins) {
+  try {
+    const userRows = await sql`SELECT id, preferences, push_token FROM users WHERE email = ${leg.user_email}`;
+    if (!userRows[0]) return;
+    const user = userRows[0];
+    const prefs = user.preferences || {};
+    const pushToken = user.push_token;
+
+    // Find the trip this leg belongs to
+    const tripRows = await sql`
+      SELECT t.id, t.destination, t.legs FROM trips t
+      WHERE t.user_id = ${user.id}
+      AND EXISTS (
+        SELECT 1 FROM jsonb_array_elements(t.legs) AS l
+        WHERE l->>'flight_number' = ${leg.flight_number}
+      )
+    `;
+    if (!tripRows[0]) return;
+    const trip = tripRows[0];
+    const legs = trip.legs || [];
+
+    // Check for connecting flights in the same trip
+    const legIndex = legs.findIndex(l => l.flight_number === leg.flight_number);
+    if (legIndex >= 0 && legIndex < legs.length - 1) {
+      const nextLeg = legs[legIndex + 1];
+      const impact = eventType === "cancelled"
+        ? `Your connecting flight ${nextLeg.flight_number} may be affected. I'm checking alternatives.`
+        : `Your connection to ${nextLeg.flight_number} is at risk with a ${delayMins}m delay. I'm monitoring.`;
+      if (pushToken) {
+        await sendPushToUser(user.id, {
+          title: "Connection at risk",
+          body: impact,
+          data: { type: "cascade_connection", trip_id: trip.id }
+        });
+      }
+    }
+
+    // Check for hotel check-in on arrival day
+    const signals = await sql`
+      SELECT * FROM signals
+      WHERE user_id = ${user.id}
+      AND type = 'hotel'
+      AND data->>'trip_id' = ${String(trip.id)}
+    `;
+    if (signals.length > 0 && pushToken) {
+      const hotelName = signals[0].data?.hotel_name || "your hotel";
+      const hotelMsg = eventType === "cancelled"
+        ? `I'll contact ${hotelName} about your check-in if you need to rebook.`
+        : `Your check-in at ${hotelName} may be affected by the delay. I'm keeping an eye on it.`;
+      await sendPushToUser(user.id, {
+        title: "Hotel check-in",
+        body: hotelMsg,
+        data: { type: "cascade_hotel", trip_id: trip.id }
+      });
+    }
+
+  } catch (err) {
+    console.error("[triggerCascadeCheck] error:", err.message);
+  }
+}
+
+// ---------------------------------------------------------------------------
 // Silent Autonomy — auto-rebook when user has fully_auto mode enabled
 // Triggered from pollDisruptions when a flight is cancelled or severely delayed.
 // Only acts when:
@@ -4680,19 +4747,21 @@ async function pollDisruptions() {
       let pushTitle, pushBody, activityTitle, activityBody, activityType;
 
       if (newStatus === "Cancelled") {
-        pushTitle = `✈ ${ident} Cancelled`;
-        pushBody = `Your flight from ${leg.origin} to ${leg.destination} has been cancelled. Tap to see options.`;
+        pushTitle = `${ident} is cancelled`;
+        pushBody = `${leg.origin} → ${leg.destination} cancelled. I'm already looking for alternatives — tap to rebook.`;
         activityTitle = `${ident} cancelled`;
-        activityBody = `Your ${leg.origin} → ${leg.destination} flight was cancelled. Open Wingman for rebooking help.`;
+        activityBody = `Your ${leg.origin} → ${leg.destination} flight was cancelled. Wingman is finding alternatives.`;
         activityType = "disruption";
+        triggerCascadeCheck(leg, "cancelled", 0).catch(e => console.error("[cascade]", e.message));
       } else if (newStatus === "Delayed") {
         const delayMins = live.delay ? Math.round(live.delay / 60) : null;
         const delayStr = delayMins ? ` by ${delayMins}m` : "";
-        pushTitle = `⏱ ${ident} Delayed${delayStr}`;
-        pushBody = `Your ${leg.origin} → ${leg.destination} flight is delayed${delayStr}.${live.gate ? ` Gate ${live.gate}.` : ""}`;
+        pushTitle = `${ident} is delayed${delayStr}`;
+        pushBody = `${leg.origin} → ${leg.destination} delayed${delayStr}.${live.gate ? ` Gate ${live.gate}.` : ""}`;
         activityTitle = `${ident} delayed${delayStr}`;
         activityBody = `Your ${leg.origin} → ${leg.destination} flight is delayed${delayStr}.${live.gate ? ` Gate ${live.gate}.` : ""}`;
         activityType = "delay";
+        if (delayMins && delayMins >= 60) { triggerCascadeCheck(leg, "delayed", delayMins).catch(e => console.error("[cascade]", e.message)); }
       } else if (newStatus === "On Time" && ["Delayed", "Watching"].includes(prevStatus)) {
         pushTitle = `✅ ${ident} Back on Time`;
         pushBody = `Your ${leg.origin} → ${leg.destination} flight is now showing on time.`;
@@ -8967,5 +9036,165 @@ app.get("/today-events", auth, async (req, res) => {
   }
 });
 
+
+
+// ---------------------------------------------------------------------------
+// MORNING BRIEFING PUSH NOTIFICATION — runs every minute, checks each user's
+// preferred briefing time (stored in preferences.briefing_hour, default 7)
+// and sends a personalised push with weather + flights + calendar summary
+// ---------------------------------------------------------------------------
+cron.schedule("* * * * *", async () => {
+  const nowUTC = new Date();
+  const nowHour = nowUTC.getUTCHours();
+  const nowMin  = nowUTC.getUTCMinutes();
+  try {
+    // Fetch all users with push tokens who have morning briefing enabled
+    const users = await sql`
+      SELECT email, first_name, push_token, preferences, cabin_preference, seat_preference
+      FROM users
+      WHERE push_token IS NOT NULL
+        AND (preferences->>'briefing_enabled')::boolean IS NOT FALSE
+    `;
+    for (const user of users) {
+      try {
+        const prefs = user.preferences || {};
+        // Default briefing hour: 7 AM UTC (user can override via preferences.briefing_hour)
+        const briefingHour = parseInt(prefs.briefing_hour ?? 7);
+        const briefingMin  = parseInt(prefs.briefing_min  ?? 0);
+        if (nowHour !== briefingHour || nowMin !== briefingMin) continue;
+        // Dedup: only send once per day
+        const dedupKey = `morning_briefing_${new Date().toISOString().slice(0,10)}`;
+        if (prefs[dedupKey]) continue;
+
+        // Build briefing content: active trips + weather
+        const trips = await sql`
+          SELECT t.id, t.title, t.destination_city,
+                 json_agg(tl ORDER BY tl.departs_at NULLS LAST) as legs
+          FROM trips t
+          LEFT JOIN trip_legs tl ON tl.trip_id = t.id
+          WHERE t.user_email = ${user.email} AND t.archived = false
+          GROUP BY t.id ORDER BY t.created_at DESC LIMIT 5
+        `;
+
+        // Find next upcoming flight
+        const now2 = new Date();
+        let nextFlight = null;
+        for (const trip of trips) {
+          for (const leg of (trip.legs || [])) {
+            if (leg?.type !== "flight" || !leg.departs_at) continue;
+            const dep = new Date(leg.departs_at);
+            if (dep > now2) {
+              if (!nextFlight || dep < new Date(nextFlight.departs_at)) {
+                nextFlight = { ...leg, trip_title: trip.title, destination_city: trip.destination_city };
+              }
+            }
+          }
+        }
+
+        // Fetch today's calendar events
+        const todayStart = new Date(); todayStart.setHours(0,0,0,0);
+        const todayEnd   = new Date(); todayEnd.setHours(23,59,59,999);
+        const calEvents = await sql`
+          SELECT title, start_time FROM calendar_events
+          WHERE user_email = ${user.email}
+            AND start_time >= ${todayStart.toISOString()}
+            AND start_time <= ${todayEnd.toISOString()}
+          ORDER BY start_time ASC LIMIT 3
+        `.catch(() => []);
+
+        // Build notification title and body
+        const firstName = user.first_name || "there";
+        const hour = nowHour;
+        const greet = hour < 12 ? "Morning" : hour < 17 ? "Afternoon" : "Evening";
+
+        let title = `${greet}, ${firstName}.`;
+        let bodyParts = [];
+
+        if (nextFlight) {
+          const dep = new Date(nextFlight.departs_at);
+          const diffH = Math.round((dep - now2) / 3600000);
+          const diffD = Math.floor(diffH / 24);
+          const timeStr = diffH < 24
+            ? `in ${diffH}h`
+            : diffD === 1 ? "tomorrow"
+            : `in ${diffD} days`;
+          // Get live status
+          try {
+            const ident = (nextFlight.carrier || "") + (nextFlight.flight_number || "");
+            const status = await getFlightStatus(ident).catch(() => null);
+            if (status?.delay > 300) {
+              bodyParts.push(`${ident} is running ${Math.round(status.delay/60)} mins late.`);
+            } else {
+              bodyParts.push(`${ident} to ${nextFlight.destination} departs ${timeStr}.`);
+            }
+          } catch {
+            bodyParts.push(`${nextFlight.destination} departs ${timeStr}.`);
+          }
+        }
+
+        if (calEvents.length > 0) {
+          const evStr = calEvents.slice(0,2).map(e => {
+            const t = e.start_time ? new Date(e.start_time).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" }) : null;
+            return t ? `${t} ${e.title}` : e.title;
+          }).join(" · ");
+          bodyParts.push(evStr);
+        }
+
+        if (bodyParts.length === 0) {
+          bodyParts.push("How can I help today?");
+        }
+
+        const body = bodyParts.join(" ");
+
+        // Send push
+        await fetch("https://exp.host/--/api/v2/push/send", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({
+            to: user.push_token,
+            title,
+            body,
+            data: { type: "morning_briefing", screen: "Home" },
+            sound: "default",
+            priority: "normal",
+          }),
+        });
+
+        // Mark as sent for today (write to preferences to avoid double-send)
+        await sql`
+          UPDATE users
+          SET preferences = preferences || ${JSON.stringify({ [dedupKey]: true })}::jsonb
+          WHERE email = ${user.email}
+        `;
+        console.log(`[morning-briefing] sent to \${user.email}`);
+      } catch (userErr) {
+        console.error(`[morning-briefing] error for \${user.email}:`, userErr.message);
+      }
+    }
+  } catch (e) {
+    console.error("[morning-briefing cron] error:", e.message);
+  }
+});
+
+// ---------------------------------------------------------------------------
+// POST /me/briefing-time — set preferred morning briefing time
+// Body: { hour: 7, min: 0 }  (UTC hour 0-23)
+// ---------------------------------------------------------------------------
+app.post("/me/briefing-time", auth, async (req, res) => {
+  const { hour, min } = req.body || {};
+  const h = parseInt(hour ?? 7);
+  const m = parseInt(min  ?? 0);
+  if (h < 0 || h > 23 || m < 0 || m > 59) return res.status(400).json({ error: "invalid time" });
+  try {
+    await sql`
+      UPDATE users
+      SET preferences = preferences || ${JSON.stringify({ briefing_hour: h, briefing_min: m, briefing_enabled: true })}::jsonb
+      WHERE email = ${req.email}
+    `;
+    res.json({ ok: true, briefing_hour: h, briefing_min: m });
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
 
 app.listen(PORT, () => console.log("Wingman API on http://localhost:" + PORT));
