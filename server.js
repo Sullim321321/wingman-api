@@ -3468,12 +3468,17 @@ LOGISTICS & PLANNING
     // Claude requires system prompt separate from messages array
     const systemMsg = messages.find(m => m.role === "system")?.content || "";
     const chatMessages = messages.filter(m => m.role !== "system");
-        const claudeResp = await getAnthropic().messages.create({
-      model: "claude-sonnet-4-5",
-      max_tokens: 1000,
-      system: systemMsg,
-      messages: chatMessages,
-    });
+        const claudeResp = await Promise.race([
+      getAnthropic().messages.create({
+        model: "claude-sonnet-4-5",
+        max_tokens: 1000,
+        system: systemMsg,
+        messages: chatMessages,
+      }),
+      new Promise((_, reject) =>
+        setTimeout(() => reject(Object.assign(new Error("Concierge LLM timeout after 25s"), { name: "TimeoutError" })), 25000)
+      ),
+    ]);
     // Strip any markdown that slips through — render as plain text on mobile
     const rawReply = claudeResp.content[0].text;
 
