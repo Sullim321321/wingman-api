@@ -5598,6 +5598,33 @@ function getDuffel() {
   return new Duffel({ token: process.env.DUFFEL_API_KEY });
 }
 
+// GET /airports/search?q=London — airport autocomplete using Duffel Places
+app.get("/airports/search", async (req, res) => {
+  try {
+    const user = await verifyAccessToken(req);
+    if (!user) return res.status(401).json({ error: "Unauthorized" });
+    const q = (req.query.q || "").trim();
+    if (!q || q.length < 2) return res.json({ airports: [] });
+    const duffel = getDuffel();
+    const result = await duffel.suggestions.list({ query: q });
+    const airports = (result.data || [])
+      .filter(p => p.type === "airport" || p.type === "city")
+      .slice(0, 8)
+      .map(p => ({
+        iata: p.iata_code || p.iata_city_code,
+        name: p.name,
+        city: p.city_name || p.name,
+        country: p.country_name,
+        type: p.type,
+      }));
+    res.json({ airports });
+  } catch (e) {
+    console.error("[airports-search]", e.message);
+    // Fallback: return empty so the UI degrades gracefully
+    res.json({ airports: [] });
+  }
+});
+
 // POST /flights/search
 // Body: { origin, destination, departure_date, return_date?, cabin_class?, passengers? }
 app.post("/flights/search", async (req, res) => {
@@ -5657,12 +5684,13 @@ app.post("/flights/search", async (req, res) => {
         baggages: o.slices?.[0]?.segments?.[0]?.passengers?.[0]?.baggages || [],
       }));
     res.json({ offers, offer_request_id: offerRequest.data.id });
-  } catch (e) {
-    console.error("[duffel-search]", e.message);
-    res.status(500).json({ error: e.message });
+    } catch (e) {
+    console.error("[duffel-search]", e.message, e?.errors);
+    // Surface the real Duffel error message to the client
+    const msg = e?.errors?.[0]?.message || e?.errors?.[0]?.title || e.message || "Flight search failed";
+    res.status(500).json({ error: msg });
   }
 });
-
 // GET /flights/offer/:offerId — get full offer details before booking
 app.get("/flights/offer/:offerId", async (req, res) => {
   try {
