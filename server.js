@@ -4001,10 +4001,13 @@ app.get("/policy", auth, async (req, res) => {
         quiet_hours: rows[0]?.quiet_hours !== false,
         locale: rows[0]?.locale || 'en',
         currency: rows[0]?.currency || 'USD',
+        briefing_hour: prefs.briefing_hour ?? 7,
+        briefing_min: prefs.briefing_min ?? 0,
+        briefing_enabled: prefs.briefing_enabled !== false,
       },
     });
   } catch (e) {
-    res.json({ policy: { autonomy_mode: "always_ask", threshold: 500, payment_preference: "best_value", cabin_preference: "economy", notify_on_action: true, weather_alerts: true, price_alerts: true, quiet_hours: true } });
+    res.json({ policy: { autonomy_mode: "always_ask", threshold: 500, payment_preference: "best_value", cabin_preference: "economy", notify_on_action: true, weather_alerts: true, price_alerts: true, quiet_hours: true, briefing_hour: 7, briefing_min: 0, briefing_enabled: true } });
   }
 });
 
@@ -9354,6 +9357,22 @@ app.delete("/me/instructions/:id", auth, async (req, res) => {
 // POST /me/briefing-time — set preferred morning briefing time
 // Body: { hour: 7, min: 0 }  (UTC hour 0-23)
 // ---------------------------------------------------------------------------
+app.patch("/me/briefing-time", auth, async (req, res) => {
+  const { briefing_hour, briefing_min } = req.body || {};
+  const h = parseInt(briefing_hour ?? 7);
+  const m = parseInt(briefing_min  ?? 0);
+  if (h < 0 || h > 23 || m < 0 || m > 59) return res.status(400).json({ error: "invalid time" });
+  try {
+    await sql`
+      UPDATE users
+      SET preferences = preferences || ${JSON.stringify({ briefing_hour: h, briefing_min: m, briefing_enabled: true })}::jsonb
+      WHERE email = ${req.email}
+    `;
+    res.json({ ok: true, briefing_hour: h, briefing_min: m });
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
 app.post("/me/briefing-time", auth, async (req, res) => {
   const { hour, min } = req.body || {};
   const h = parseInt(hour ?? 7);
