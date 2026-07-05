@@ -547,6 +547,9 @@ async function bootstrapDB() {
     await sql`ALTER TABLE trips ADD COLUMN IF NOT EXISTS companions_count INTEGER DEFAULT 1`;
     await sql`ALTER TABLE trips ADD COLUMN IF NOT EXISTS companion_names JSONB DEFAULT '[]'`;
     await sql`ALTER TABLE trips ADD COLUMN IF NOT EXISTS event_legs JSONB DEFAULT '[]'`;
+    await sql`ALTER TABLE trips ADD COLUMN IF NOT EXISTS destination_city TEXT`;
+    await sql`ALTER TABLE trips ADD COLUMN IF NOT EXISTS destination_country TEXT`;
+    await sql`ALTER TABLE trips ADD COLUMN IF NOT EXISTS archived BOOLEAN DEFAULT false`;
     // ── Pre-trip checklist ──────────────────────────────────────────────────
     await sql`
       CREATE TABLE IF NOT EXISTS trip_checklist (
@@ -4433,13 +4436,13 @@ app.post("/auth/refresh", authLimiter, async (req, res) => {
   }
 });
 
-app.get("/health", (_req, res) => res.json({ ok: true, ts: Date.now(), version: "2.16.0" }));
+app.get("/health", (_req, res) => res.json({ ok: true, ts: Date.now(), version: "2.17.0" }));
 
 // GET /env-status — internal diagnostic (auth required, non-sensitive)
 // Shows which optional API integrations are configured without exposing key values
 app.get("/env-status", auth, (_req, res) => {
   res.json({
-    version: "2.16.0",
+    version: "2.17.0",
     integrations: {
       flightaware:    { configured: !!process.env.FLIGHTAWARE_API_KEY,    label: "FlightAware AeroAPI (primary flight status)" },
       aviationstack:  { configured: !!process.env.AVIATIONSTACK_API_KEY,  label: "AviationStack (fallback flight status, free tier)" },
@@ -8925,6 +8928,72 @@ app.get("/trips/:tripId/show-nights", auth, async (req, res) => {
 });
 
 // ===========================================================================
+// TRAVEL STATS — GET /me/stats
+app.get("/me/stats", async (req, res) => {
+  const email = await verifyAccessToken(req);
+  if (!email) return res.status(401).json({ error: "unauthorized" });
+  try {
+    const year = new Date().getFullYear();
+    const yearStart = new Date(`${year}-01-01T00:00:00Z`);
+
+    // Trips this year
+    const tripsThisYear = await sql`
+      SELECT COUNT(*) as cnt FROM trips
+      WHERE user_email = ${email}
+        AND created_at >= ${yearStart}
+        AND archived = false
+    `;
+
+    // Miles flown this year — estimate from flight legs
+    // We don't store distance, so we count legs and estimate 800mi average per leg
+    const flightLegsThisYear = await sql`
+      SELECT COUNT(*) as cnt FROM trip_legs tl
+      JOIN trips t ON t.id = tl.trip_id
+      WHERE t.user_email = ${email}
+        AND tl.type = 'flight'
+        AND tl.departs_at >= ${yearStart}
+    `;
+    const estimatedMiles = Math.round(parseInt(flightLegsThisYear[0]?.cnt || 0) * 800);
+
+    // Nights away this year — sum from hotel legs
+    const nightsAway = await sql`
+      SELECT COALESCE(SUM(tl.nights), 0) as total FROM trip_legs tl
+      JOIN trips t ON t.id = tl.trip_id
+      WHERE t.user_email = ${email}
+        AND tl.type = 'hotel'
+        AND tl.departs_at >= ${yearStart}
+    `;
+
+    // Countries visited this year
+    const countries = await sql`
+      SELECT COUNT(DISTINCT t.destination_country) as cnt FROM trips t
+      WHERE t.user_email = ${email}
+        AND t.created_at >= ${yearStart}
+        AND t.destination_country IS NOT NULL
+        AND t.archived = false
+    `;
+
+    // All-time trips
+    const totalTrips = await sql`
+      SELECT COUNT(*) as cnt FROM trips
+      WHERE user_email = ${email} AND archived = false
+    `;
+
+    res.json({
+      ok: true,
+      year,
+      trips_this_year: parseInt(tripsThisYear[0]?.cnt || 0),
+      miles_this_year: estimatedMiles,
+      nights_away_this_year: parseInt(nightsAway[0]?.total || 0),
+      countries_this_year: parseInt(countries[0]?.cnt || 0),
+      total_trips: parseInt(totalTrips[0]?.cnt || 0),
+    });
+  } catch (e) {
+    console.error("[stats]", e.message);
+    res.status(500).json({ error: "stats_error" });
+  }
+});
+
 // HOME STATE — GET /me/home-state
 // Returns the user's current travel state for the contextual home screen
 // States: no_trip | pre_departure | at_airport | in_transit | at_destination
