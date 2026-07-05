@@ -4434,13 +4434,13 @@ app.post("/auth/refresh", authLimiter, async (req, res) => {
   }
 });
 
-app.get("/health", (_req, res) => res.json({ ok: true, ts: Date.now(), version: "2.14.0" }));
+app.get("/health", (_req, res) => res.json({ ok: true, ts: Date.now(), version: "2.15.0" }));
 
 // GET /env-status — internal diagnostic (auth required, non-sensitive)
 // Shows which optional API integrations are configured without exposing key values
 app.get("/env-status", auth, (_req, res) => {
   res.json({
-    version: "2.14.0",
+    version: "2.15.0",
     integrations: {
       flightaware:    { configured: !!process.env.FLIGHTAWARE_API_KEY,    label: "FlightAware AeroAPI (primary flight status)" },
       aviationstack:  { configured: !!process.env.AVIATIONSTACK_API_KEY,  label: "AviationStack (fallback flight status, free tier)" },
@@ -10382,7 +10382,12 @@ app.post("/trips/import/pdf-ocr", auth, pdfOcrUpload.single("pdf"), async (req, 
     const anthropic = getAnthropic();
     // Convert PDF/image to base64 for Claude vision
     const base64Data = req.file.buffer.toString("base64");
-    const mediaType = req.file.mimetype.includes("pdf") ? "application/pdf" : req.file.mimetype;
+    const isPdf = req.file.mimetype === "application/pdf" || (req.file.originalname || "").toLowerCase().endsWith(".pdf");
+    const mediaType = isPdf ? "application/pdf" : req.file.mimetype;
+    // Claude uses 'document' type for PDFs, 'image' type for image files (jpeg/png/gif/webp)
+    const fileBlock = isPdf
+      ? { type: "document", source: { type: "base64", media_type: "application/pdf", data: base64Data } }
+      : { type: "image",    source: { type: "base64", media_type: mediaType,           data: base64Data } };
 
     const extraction = await anthropic.messages.create({
       model: "claude-sonnet-4-5",
@@ -10390,10 +10395,7 @@ app.post("/trips/import/pdf-ocr", auth, pdfOcrUpload.single("pdf"), async (req, 
       messages: [{
         role: "user",
         content: [
-          {
-            type: "document",
-            source: { type: "base64", media_type: mediaType, data: base64Data },
-          },
+          fileBlock,
           {
             type: "text",
             text: `Extract all travel booking information from this document. Return a JSON object:
