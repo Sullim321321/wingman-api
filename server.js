@@ -2393,14 +2393,12 @@ Return this exact JSON structure:
 
     // Hotel-specific features
     if (parsed.type === "hotel" || parsed.type === "airbnb") {
-      if (parsed.type === "hotel") {
-        sendHotelPreferenceEmail(userEmail, parsed, legTitle).catch(e =>
-          console.error("[hotel-pref-email]", e.message)
-        );
+// DISABLED-AUTO-EMAIL:       if (parsed.type === "hotel") {
+// DISABLED-AUTO-EMAIL:         sendHotelPreferenceEmail(userEmail, parsed, legTitle).catch(e =>
+// DISABLED-AUTO-EMAIL:           console.error("[hotel-pref-email]", e.message)
         extractAndStoreHotelAffinity(userEmail, parsed).catch(e =>
           console.error("[hotel-affinity]", e.message)
         );
-      }
     }
     console.log(`[gmail] stored ${parsed.type} leg for trip "${legTitle}" (id=${tripId}, new=${isNew}) for ${userEmail}`);
   } catch (e) {
