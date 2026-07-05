@@ -2852,10 +2852,14 @@ app.get("/trips", async (req, res) => {
         AND t.archived = false
       GROUP BY t.id
       HAVING
-        -- Default: upcoming only (latest leg is in the future, or trip has no legs yet)
-        -- Pass ?all=true to include past trips
+        -- Default: show active + upcoming trips (or trips with no legs yet)
+        -- Use MAX(COALESCE(arrives_at, departs_at)) so active hotel stays are included:
+        --   hotel leg: departs_at = check-in (past), arrives_at = check-out (future) → shown
+        --   flight: departs_at = departure, arrives_at = arrival → shown if either is future
+        -- Pass ?all=true to include fully-past trips
         (${showAll} = TRUE)
-        OR (MAX(tl.departs_at) IS NULL OR MAX(tl.departs_at) >= NOW())
+        OR (MAX(COALESCE(tl.arrives_at, tl.departs_at)) IS NULL
+            OR MAX(COALESCE(tl.arrives_at, tl.departs_at)) >= NOW())
       ORDER BY
         CASE WHEN MIN(tl.departs_at) >= NOW() OR MIN(tl.departs_at) IS NULL THEN 0 ELSE 1 END ASC,
         CASE WHEN MIN(tl.departs_at) >= NOW() OR MIN(tl.departs_at) IS NULL THEN MIN(tl.departs_at) ELSE NULL END ASC NULLS LAST,
