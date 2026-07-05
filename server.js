@@ -2811,6 +2811,7 @@ app.get("/uber/deeplink", async (req, res) => {
 app.get("/trips", async (req, res) => {
   const email = await verifyAccessToken(req);
   if (!email) return res.status(401).json({ error: "unauthorized" });
+  const showAll = req.query.all === "true"; // ?all=true to include past trips
   try {
     const trips = await sql`
       SELECT t.*,
@@ -2848,9 +2849,14 @@ app.get("/trips", async (req, res) => {
       FROM trips t
       LEFT JOIN trip_legs tl ON tl.trip_id = t.id
       WHERE t.user_email = ${email}
+        AND t.archived = false
       GROUP BY t.id
+      HAVING
+        -- Default: upcoming only (latest leg is in the future, or trip has no legs yet)
+        -- Pass ?all=true to include past trips
+        (${showAll} = TRUE)
+        OR (MAX(tl.departs_at) IS NULL OR MAX(tl.departs_at) >= NOW())
       ORDER BY
-        -- Upcoming trips first (sorted by next departure), then past trips (sorted by most recent)
         CASE WHEN MIN(tl.departs_at) >= NOW() OR MIN(tl.departs_at) IS NULL THEN 0 ELSE 1 END ASC,
         CASE WHEN MIN(tl.departs_at) >= NOW() OR MIN(tl.departs_at) IS NULL THEN MIN(tl.departs_at) ELSE NULL END ASC NULLS LAST,
         CASE WHEN MIN(tl.departs_at) < NOW() THEN MIN(tl.departs_at) ELSE NULL END DESC NULLS LAST
