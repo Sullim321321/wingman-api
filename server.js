@@ -2234,16 +2234,17 @@ async function findOrCreateGroupedTrip(userEmail, parsed, emailId, source) {
     }
   }
 
+  // Manual duplicate check — avoids ON CONFLICT on partial index (not supported by PostgreSQL)
+  if (emailId) {
+    const dup = await sql`SELECT id FROM trips WHERE user_email = ${userEmail} AND raw_email_id = ${emailId} LIMIT 1`;
+    if (dup.length > 0) return null;
+  }
   const tripRows = await sql`
     INSERT INTO trips (user_email, title, source, raw_email_id)
     VALUES (${userEmail}, ${tripTitle}, ${source || 'gmail'}, ${emailId || null})
-    ON CONFLICT (user_email, raw_email_id) DO NOTHING
     RETURNING id
   `;
-  if (tripRows.length === 0) {
-    // Conflict — already processed this email
-    return null;
-  }
+  if (tripRows.length === 0) return null;
   return { tripId: tripRows[0].id, isNew: true, tripTitle };
 }
 
@@ -4434,13 +4435,13 @@ app.post("/auth/refresh", authLimiter, async (req, res) => {
   }
 });
 
-app.get("/health", (_req, res) => res.json({ ok: true, ts: Date.now(), version: "2.15.0" }));
+app.get("/health", (_req, res) => res.json({ ok: true, ts: Date.now(), version: "2.16.0" }));
 
 // GET /env-status — internal diagnostic (auth required, non-sensitive)
 // Shows which optional API integrations are configured without exposing key values
 app.get("/env-status", auth, (_req, res) => {
   res.json({
-    version: "2.15.0",
+    version: "2.16.0",
     integrations: {
       flightaware:    { configured: !!process.env.FLIGHTAWARE_API_KEY,    label: "FlightAware AeroAPI (primary flight status)" },
       aviationstack:  { configured: !!process.env.AVIATIONSTACK_API_KEY,  label: "AviationStack (fallback flight status, free tier)" },
@@ -6461,20 +6462,14 @@ app.post("/concierge/thread", auth, async (req, res) => {
     if (!Array.isArray(messages)) return res.status(400).json({ error: "messages array required" });
     const tripId = trip_id ? Number(trip_id) : null;
     const trimmed = messages.slice(-50);
+    const msgJson = JSON.stringify(trimmed);
+    // DELETE + INSERT avoids ON CONFLICT on expression index (not supported by PostgreSQL)
     if (tripId) {
-      await sql`
-        INSERT INTO concierge_threads (user_email, trip_id, messages, updated_at)
-        VALUES (${req.user.email}, ${tripId}, ${JSON.stringify(trimmed)}, NOW())
-        ON CONFLICT (user_email, COALESCE(trip_id, -1))
-        DO UPDATE SET messages = ${JSON.stringify(trimmed)}, updated_at = NOW()
-      `;
+      await sql`DELETE FROM concierge_threads WHERE user_email = ${req.user.email} AND trip_id = ${tripId}`;
+      await sql`INSERT INTO concierge_threads (user_email, trip_id, messages, updated_at) VALUES (${req.user.email}, ${tripId}, ${msgJson}, NOW())`;
     } else {
-      await sql`
-        INSERT INTO concierge_threads (user_email, trip_id, messages, updated_at)
-        VALUES (${req.user.email}, NULL, ${JSON.stringify(trimmed)}, NOW())
-        ON CONFLICT (user_email, COALESCE(trip_id, -1))
-        DO UPDATE SET messages = ${JSON.stringify(trimmed)}, updated_at = NOW()
-      `;
+      await sql`DELETE FROM concierge_threads WHERE user_email = ${req.user.email} AND trip_id IS NULL`;
+      await sql`INSERT INTO concierge_threads (user_email, trip_id, messages, updated_at) VALUES (${req.user.email}, NULL, ${msgJson}, NOW())`;
     }
     res.json({ ok: true });
   } catch (e) {
