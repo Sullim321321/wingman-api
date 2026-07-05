@@ -9805,4 +9805,291 @@ app.post("/me/briefing-time", auth, async (req, res) => {
   }
 });
 
+// ---------------------------------------------------------------------------
+// PATCH /trips/:tripId/legs/:legId — edit a single leg
+// ---------------------------------------------------------------------------
+app.patch("/trips/:tripId/legs/:legId", auth, async (req, res) => {
+  const email = await verifyAccessToken(req);
+  if (!email) return res.status(401).json({ error: "unauthorized" });
+  const { tripId, legId } = req.params;
+  const updates = req.body || {};
+  try {
+    // Verify ownership
+    const tripRows = await sql`SELECT id FROM trips WHERE id = ${tripId} AND user_email = ${email}`;
+    if (!tripRows.length) return res.status(404).json({ error: "trip not found" });
+    // Build safe update — only allow known columns
+    const allowed = ["type","carrier","flight_number","origin","destination","departs_at","arrives_at","confirmation","property_name","property_address","station_from","station_to","pickup_location","dropoff_location","vehicle_class","cabin_class","seat","nights","guests","price_total","currency"];
+    const fields = Object.keys(updates).filter(k => allowed.includes(k));
+    if (!fields.length) return res.status(400).json({ error: "no valid fields" });
+    // Use dynamic update via sql template
+    for (const field of fields) {
+      await sql`UPDATE trip_legs SET ${sql(field)} = ${updates[field] || null} WHERE id = ${legId} AND trip_id = ${tripId}`;
+    }
+    const updated = await sql`SELECT * FROM trip_legs WHERE id = ${legId}`;
+    res.json({ ok: true, leg: updated[0] });
+  } catch (e) {
+    console.error("[legs/edit]", e.message);
+    res.status(500).json({ error: e.message });
+  }
+});
+
+// ---------------------------------------------------------------------------
+// DELETE /trips/:tripId/legs/:legId — delete a single leg
+// ---------------------------------------------------------------------------
+app.delete("/trips/:tripId/legs/:legId", auth, async (req, res) => {
+  const email = await verifyAccessToken(req);
+  if (!email) return res.status(401).json({ error: "unauthorized" });
+  const { tripId, legId } = req.params;
+  try {
+    const tripRows = await sql`SELECT id FROM trips WHERE id = ${tripId} AND user_email = ${email}`;
+    if (!tripRows.length) return res.status(404).json({ error: "trip not found" });
+    await sql`DELETE FROM trip_legs WHERE id = ${legId} AND trip_id = ${tripId}`;
+    res.json({ ok: true });
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
+// ---------------------------------------------------------------------------
+// POST /trips/:tripId/legs — add a single leg to an existing trip
+// ---------------------------------------------------------------------------
+app.post("/trips/:tripId/legs", auth, async (req, res) => {
+  const email = await verifyAccessToken(req);
+  if (!email) return res.status(401).json({ error: "unauthorized" });
+  const { tripId } = req.params;
+  const leg = req.body || {};
+  try {
+    const tripRows = await sql`SELECT id FROM trips WHERE id = ${tripId} AND user_email = ${email}`;
+    if (!tripRows.length) return res.status(404).json({ error: "trip not found" });
+    const inserted = await sql`
+      INSERT INTO trip_legs (
+        trip_id, type, carrier, flight_number, origin, destination,
+        departs_at, arrives_at, confirmation, property_name, property_address,
+        station_from, station_to, pickup_location, dropoff_location,
+        vehicle_class, cabin_class, seat, nights, guests, price_total, currency
+      ) VALUES (
+        ${tripId}, ${leg.type || "flight"}, ${leg.carrier || null}, ${leg.flight_number || null},
+        ${leg.origin || null}, ${leg.destination || null},
+        ${leg.departs_at || null}, ${leg.arrives_at || null}, ${leg.confirmation || null},
+        ${leg.property_name || null}, ${leg.property_address || null},
+        ${leg.station_from || null}, ${leg.station_to || null},
+        ${leg.pickup_location || null}, ${leg.dropoff_location || null},
+        ${leg.vehicle_class || null}, ${leg.cabin_class || null}, ${leg.seat || null},
+        ${leg.nights || null}, ${leg.guests || null},
+        ${leg.price_total || null}, ${leg.currency || null}
+      ) RETURNING *
+    `;
+    res.json({ ok: true, leg: inserted[0] });
+  } catch (e) {
+    console.error("[legs/add]", e.message);
+    res.status(500).json({ error: e.message });
+  }
+});
+
+// ---------------------------------------------------------------------------
+// POST /trips/import/paste — parse a pasted itinerary into structured legs
+// ---------------------------------------------------------------------------
+app.post("/trips/import/paste", auth, async (req, res) => {
+  const email = await verifyAccessToken(req);
+  if (!email) return res.status(401).json({ error: "unauthorized" });
+  const { text, companions_count, companion_names } = req.body || {};
+  if (!text || text.trim().length < 20) return res.status(400).json({ error: "text too short" });
+  try {
+    const extractionPrompt = `You are a travel data extractor. Parse the following itinerary text and extract ALL bookings into a structured JSON object.
+
+Return ONLY valid JSON in this exact format:
+{
+  "title": "short trip title (e.g. Asia Tour 2026, Tokyo Business Trip)",
+  "legs": [
+    {
+      "type": "flight|hotel|airbnb|train|car|ferry|activity|event",
+      "carrier": "airline/operator code or name",
+      "flight_number": "flight number if flight",
+      "origin": "IATA code if flight, city/station if train",
+      "destination": "IATA code if flight, city/station if train",
+      "property_name": "hotel/venue name if hotel/event",
+      "property_address": "address if available",
+      "departs_at": "ISO 8601 datetime or null",
+      "arrives_at": "ISO 8601 datetime or null",
+      "confirmation": "booking reference if present",
+      "cabin_class": "economy/premium economy/business/first if flight",
+      "nights": number or null,
+      "guests": number or null
+    }
+  ]
+}
+
+Rules:
+- Extract EVERY booking — flights, hotels, trains, cars, shows, activities
+- For events/shows: use type="event", put venue in property_name, address in property_address
+- For hotels: use type="hotel", put hotel name in property_name
+- Infer year from context if not stated (use current year ${new Date().getFullYear()} or next if past)
+- If a field is unknown, use null
+- Return ONLY the JSON object, no explanation
+
+Itinerary text:
+${text.substring(0, 8000)}`;
+
+    const response = await anthropic.messages.create({
+      model: "claude-sonnet-4-5",
+      max_tokens: 4000,
+      messages: [{ role: "user", content: extractionPrompt }]
+    });
+    const raw = response.content[0].text.trim();
+    // Strip markdown code fences if present
+    const jsonStr = raw.replace(/^```(?:json)?\n?/i, "").replace(/\n?```$/i, "").trim();
+    let parsed;
+    try {
+      parsed = JSON.parse(jsonStr);
+    } catch (parseErr) {
+      return res.status(422).json({ error: "Could not parse itinerary — try pasting a cleaner version", raw: raw.substring(0, 500) });
+    }
+    if (!parsed.legs || !Array.isArray(parsed.legs)) {
+      return res.status(422).json({ error: "No bookings found in the text" });
+    }
+    res.json({ ok: true, title: parsed.title || "Imported Trip", legs: parsed.legs, leg_count: parsed.legs.length });
+  } catch (e) {
+    console.error("[import/paste]", e.message);
+    if (e.status === 400 && e.message?.includes("credit")) {
+      return res.status(503).json({ error: "service_unavailable", message: "AI service temporarily unavailable" });
+    }
+    res.status(500).json({ error: e.message });
+  }
+});
+
+// ---------------------------------------------------------------------------
+// POST /trips/:tripId/saved-options — save a hotel/flight option from concierge
+// ---------------------------------------------------------------------------
+app.post("/trips/:tripId/saved-options", auth, async (req, res) => {
+  const email = await verifyAccessToken(req);
+  if (!email) return res.status(401).json({ error: "unauthorized" });
+  const { tripId } = req.params;
+  const { option } = req.body || {};
+  if (!option) return res.status(400).json({ error: "option required" });
+  try {
+    const tripRows = await sql`SELECT id FROM trips WHERE id = ${tripId} AND user_email = ${email}`;
+    if (!tripRows.length) return res.status(404).json({ error: "trip not found" });
+    // Store as a JSONB array in trip metadata
+    await sql`
+      UPDATE trips
+      SET raw_data = COALESCE(raw_data, '{}'::jsonb) || jsonb_build_object('saved_options',
+        COALESCE(raw_data->'saved_options', '[]'::jsonb) || ${JSON.stringify([option])}::jsonb
+      )
+      WHERE id = ${tripId}
+    `;
+    res.json({ ok: true });
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
+// ---------------------------------------------------------------------------
+// GET /trips/:tripId/saved-options — retrieve saved options for a trip
+// ---------------------------------------------------------------------------
+app.get("/trips/:tripId/saved-options", auth, async (req, res) => {
+  const email = await verifyAccessToken(req);
+  if (!email) return res.status(401).json({ error: "unauthorized" });
+  const { tripId } = req.params;
+  try {
+    const rows = await sql`SELECT raw_data FROM trips WHERE id = ${tripId} AND user_email = ${email}`;
+    if (!rows.length) return res.status(404).json({ error: "trip not found" });
+    const options = rows[0].raw_data?.saved_options || [];
+    res.json({ ok: true, options });
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
+// ---------------------------------------------------------------------------
+// GET /trips/:tripId/calendar.ics — export trip as iCalendar file
+// ---------------------------------------------------------------------------
+app.get("/trips/:tripId/calendar.ics", auth, async (req, res) => {
+  const email = await verifyAccessToken(req);
+  if (!email) return res.status(401).json({ error: "unauthorized" });
+  const { tripId } = req.params;
+  try {
+    const tripRows = await sql`SELECT * FROM trips WHERE id = ${tripId} AND user_email = ${email}`;
+    if (!tripRows.length) return res.status(404).json({ error: "trip not found" });
+    const trip = tripRows[0];
+    const legs = await sql`SELECT * FROM trip_legs WHERE trip_id = ${tripId} ORDER BY COALESCE(departs_at, arrives_at) ASC NULLS LAST`;
+    const formatDT = (dt) => {
+      if (!dt) return null;
+      const d = new Date(dt);
+      return d.toISOString().replace(/[-:]/g, "").replace(/\.\d{3}/, "");
+    };
+    const uid = () => `${Date.now()}-${Math.random().toString(36).slice(2)}@wingmantravel.app`;
+    const escICS = (s) => (s || "").replace(/[\\;,]/g, c => "\\" + c).replace(/\n/g, "\\n");
+    let events = [];
+    for (const leg of legs) {
+      const start = formatDT(leg.departs_at);
+      const end = formatDT(leg.arrives_at || leg.departs_at);
+      if (!start) continue;
+      let summary = "";
+      let description = "";
+      let location = "";
+      if (leg.type === "flight") {
+        summary = `${leg.carrier || ""}${leg.flight_number || ""} ${leg.origin || ""} → ${leg.destination || ""}`;
+        description = `Flight${leg.cabin_class ? " (" + leg.cabin_class + ")" : ""}${leg.seat ? ", Seat " + leg.seat : ""}${leg.confirmation ? ", Ref: " + leg.confirmation : ""}`;
+        location = leg.origin || "";
+      } else if (leg.type === "hotel" || leg.type === "airbnb") {
+        summary = `Check-in: ${leg.property_name || leg.carrier || "Hotel"}`;
+        description = `${leg.nights ? leg.nights + " nights" : ""}${leg.confirmation ? ", Ref: " + leg.confirmation : ""}`;
+        location = leg.property_address || leg.destination || "";
+      } else if (leg.type === "event") {
+        summary = leg.property_name || "Event";
+        description = `${leg.confirmation ? "Ref: " + leg.confirmation : ""}`;
+        location = leg.property_address || "";
+      } else if (leg.type === "train") {
+        summary = `Train: ${leg.station_from || ""} → ${leg.station_to || ""}`;
+        description = `${leg.carrier || ""}${leg.confirmation ? ", Ref: " + leg.confirmation : ""}`;
+        location = leg.station_from || "";
+      } else {
+        summary = `${leg.type}: ${leg.carrier || leg.destination || "Booking"}`;
+        description = leg.confirmation ? `Ref: ${leg.confirmation}` : "";
+      }
+      events.push(`BEGIN:VEVENT\r\nUID:${uid()}\r\nDTSTAMP:${formatDT(new Date())}Z\r\nDTSTART:${start}Z\r\nDTEND:${end}Z\r\nSUMMARY:${escICS(summary)}\r\nDESCRIPTION:${escICS(description)}\r\nLOCATION:${escICS(location)}\r\nEND:VEVENT`);
+    }
+    const ics = `BEGIN:VCALENDAR\r\nVERSION:2.0\r\nPRODID:-//Wingman Travel//EN\r\nCALSCALE:GREGORIAN\r\nX-WR-CALNAME:${escICS(trip.title)}\r\n${events.join("\r\n")}\r\nEND:VCALENDAR`;
+    res.setHeader("Content-Type", "text/calendar; charset=utf-8");
+    res.setHeader("Content-Disposition", `attachment; filename="${trip.title.replace(/[^a-z0-9]/gi, '_')}.ics"`);
+    res.send(ics);
+  } catch (e) {
+    console.error("[calendar/ics]", e.message);
+    res.status(500).json({ error: e.message });
+  }
+});
+
+// ---------------------------------------------------------------------------
+// GET /me/offline-snapshot — returns all data needed for offline mode
+// ---------------------------------------------------------------------------
+app.get("/me/offline-snapshot", auth, async (req, res) => {
+  const email = await verifyAccessToken(req);
+  if (!email) return res.status(401).json({ error: "unauthorized" });
+  try {
+    const [userRows, trips, legs, loyalty, checklist] = await Promise.all([
+      sql`SELECT email, preferences, home_airport_code, cabin_class FROM users WHERE email = ${email}`,
+      sql`SELECT * FROM trips WHERE user_email = ${email} AND status != 'past' ORDER BY created_at DESC LIMIT 20`,
+      sql`SELECT tl.* FROM trip_legs tl JOIN trips t ON t.id = tl.trip_id WHERE t.user_email = ${email} AND t.status != 'past' ORDER BY tl.departs_at ASC NULLS LAST`,
+      sql`SELECT * FROM loyalty_accounts WHERE user_email = ${email}`,
+      sql`SELECT tc.* FROM trip_checklist tc JOIN trips t ON t.id = tc.trip_id WHERE t.user_email = ${email} AND tc.done = false`
+    ]);
+    const legsByTrip = {};
+    for (const leg of legs) {
+      if (!legsByTrip[leg.trip_id]) legsByTrip[leg.trip_id] = [];
+      legsByTrip[leg.trip_id].push(leg);
+    }
+    const tripsWithLegs = trips.map(t => ({ ...t, legs: legsByTrip[t.id] || [] }));
+    res.json({
+      ok: true,
+      snapshot_at: new Date().toISOString(),
+      user: userRows[0] || null,
+      trips: tripsWithLegs,
+      loyalty,
+      pending_checklist: checklist,
+    });
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
 app.listen(PORT, () => console.log("Wingman API on http://localhost:" + PORT));
