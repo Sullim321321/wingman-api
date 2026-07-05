@@ -1697,6 +1697,10 @@ app.get("/auth/gmail/callback", async (req, res) => {
       const oauth2Api = google.oauth2({ version: "v2", auth: oauth2 });
       const info = await oauth2Api.userinfo.get();
       if (info.data?.email) accountEmail = info.data.email;
+      // Save given_name to users.first_name if not already set
+      if (info.data?.given_name) {
+        await sql`UPDATE users SET first_name = ${info.data.given_name} WHERE email = ${userEmail} AND first_name IS NULL`;
+      }
     } catch (e) {
       console.warn("[gmail/callback] could not fetch account email:", e.message);
     }
@@ -3034,9 +3038,19 @@ async function getLiveWeather(location) {
     const desc = d.weather?.[0]?.description || 'clear';
     const humidity = d.main?.humidity;
     const windKph = d.wind?.speed ? Math.round(d.wind.speed * 3.6) : null;
-    // d.name from OWM current weather is already city-level (e.g. "London", "New York")
-    // The geo/1.0/reverse API returns sub-neighbourhoods ("Hammersmith") — do NOT use it
-    const city = d.name || null;
+    // OWM d.name returns sub-neighbourhoods for dense cities (e.g. "Hammersmith" not "London").
+    // Use BigDataCloud reverse geocoding (free, no key) to get the proper city name.
+    let city = d.name || null;
+    try {
+      const geoResp = await fetch(
+        `https://api.bigdatacloud.net/data/reverse-geocode-client?latitude=${lat}&longitude=${lng}&localityLanguage=en`,
+        { signal: AbortSignal.timeout(4000) }
+      );
+      if (geoResp.ok) {
+        const geo = await geoResp.json();
+        city = geo.city || geo.locality || city;
+      }
+    } catch { /* fall back to OWM d.name */ }
     return { temp, feels, desc, city, humidity, windKph };
   } catch (e) {
     console.error('[weather]', e.message);
