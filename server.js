@@ -262,6 +262,7 @@ async function bootstrapDB() {
     await sql`ALTER TABLE users ADD COLUMN IF NOT EXISTS min_connection_mins INTEGER DEFAULT 60`;
     await sql`ALTER TABLE users ADD COLUMN IF NOT EXISTS notify_journey BOOLEAN DEFAULT true`;
     await sql`ALTER TABLE users ADD COLUMN IF NOT EXISTS last_weekly_digest TIMESTAMPTZ`;
+    await sql`ALTER TABLE users ADD COLUMN IF NOT EXISTS last_opened_at TIMESTAMPTZ`;
     // ── Wingman Points ────────────────────────────────────────────────────────
     await sql`
       CREATE TABLE IF NOT EXISTS wingman_points (
@@ -1695,6 +1696,8 @@ app.get("/me", async (req, res) => {
   try {
     const rows = await sql`SELECT email, first_name, push_token, preferences, created_at FROM users WHERE email = ${email}`;
     if (!rows[0]) return res.status(404).json({ error: "user not found" });
+    // Track last app open for re-engagement logic
+    await sql`UPDATE users SET last_opened_at = NOW() WHERE email = ${email}`.catch(() => {});
     // Return all connected Google accounts
     const gmailRows = await sql`SELECT id, account_email, account_label, updated_at FROM gmail_tokens WHERE user_email = ${email} ORDER BY id ASC`;
     const connected_accounts = gmailRows.map(r => ({
@@ -4248,9 +4251,10 @@ app.get("/insights/roi", auth, async (req, res) => {
       const m = typeof row.metadata === "string" ? JSON.parse(row.metadata || "{}") : (row.metadata || {});
       if (m.value_saved) totalSaved += Number(m.value_saved) || 0;
     }
-    // Trip streak count
-    const tripCount = await sql`SELECT COUNT(DISTINCT id) as cnt FROM trips WHERE user_email = ${req.user.email}`;
+    // Trip streak count + protected since date
+    const tripCount = await sql`SELECT COUNT(DISTINCT id) as cnt, MIN(created_at) as first_trip_at FROM trips WHERE user_email = ${req.user.email}`;
     const tripsTotal = Number(tripCount[0]?.cnt || 0);
+    const protectedSince = tripCount[0]?.first_trip_at || null;
     // Best rescue
     const bestRescueRows = await sql`
       SELECT metadata FROM activity_events
@@ -4267,6 +4271,7 @@ app.get("/insights/roi", auth, async (req, res) => {
       avg_time_saved_minutes: disruptionsHandled > 0 ? 23 : null,
       prediction_accuracy_pct: null,
       trips_total: tripsTotal,
+      protected_since: protectedSince,
       best_rescue_value: bestM.value_saved || null,
       best_rescue_flight: bestM.flight || null,
       period,
@@ -6378,12 +6383,13 @@ app.get("/concierge/thread", auth, async (req, res) => {
   try {
     const tripId = req.query.trip_id ? Number(req.query.trip_id) : null;
     const rows = tripId
-      ? await sql`SELECT messages FROM concierge_threads WHERE user_email = ${req.user.email} AND trip_id = ${tripId}`
-      : await sql`SELECT messages FROM concierge_threads WHERE user_email = ${req.user.email} AND trip_id IS NULL`;
+      ? await sql`SELECT messages, updated_at FROM concierge_threads WHERE user_email = ${req.user.email} AND trip_id = ${tripId}`
+      : await sql`SELECT messages, updated_at FROM concierge_threads WHERE user_email = ${req.user.email} AND trip_id IS NULL`;
     const messages = rows[0]?.messages || [];
-    res.json({ messages });
+    const updated_at = rows[0]?.updated_at || null;
+    res.json({ messages, updated_at });
   } catch (e) {
-    res.json({ messages: [] });
+    res.json({ messages: [], updated_at: null });
   }
 });
 
@@ -6579,10 +6585,15 @@ async function runPostTripDebriefCron() {
       try {
         const already = await sql`SELECT id FROM debrief_push_log WHERE user_email = ${trip.user_email} AND trip_id = ${trip.trip_id}`;
         if (already.length > 0) continue;
+        // Build a personalised debrief push with value hook
+        const debriefTitle = trip.destination
+          ? `Landed in ${trip.destination} ✓`
+          : `You've landed ✓`;
+        const debriefBody = `How did ${trip.title} go? Tap to rate the trip and see what Wingman protected.`;
         await sendPushToUser(
           trip.user_email,
-          `You've landed in ${trip.destination || "your destination"} ✓`,
-          `How did your trip go? Tap to rate and see the value Wingman protected.`,
+          debriefTitle,
+          debriefBody,
           { route: "TripDetail", tripId: String(trip.trip_id) }
         );
         await sql`INSERT INTO debrief_push_log (user_email, trip_id) VALUES (${trip.user_email}, ${trip.trip_id}) ON CONFLICT DO NOTHING`;
@@ -7857,9 +7868,21 @@ setInterval(async () => {
   if (now.getUTCMinutes() > 15) return;
   try {
     const users = await sql`
-      SELECT email, first_name, push_token FROM users
-      WHERE push_token IS NOT NULL
-        AND (last_weekly_digest IS NULL OR last_weekly_digest < NOW() - INTERVAL '6 days')
+      SELECT u.email, u.first_name, u.push_token FROM users u
+      WHERE u.push_token IS NOT NULL
+        AND (u.last_weekly_digest IS NULL OR u.last_weekly_digest < NOW() - INTERVAL '6 days')
+        AND (
+          -- Dormant: hasn't opened in 5+ days (or never opened)
+          u.last_opened_at IS NULL
+          OR u.last_opened_at < NOW() - INTERVAL '5 days'
+          -- OR has an upcoming trip (always re-engage active travellers)
+          OR EXISTS (
+            SELECT 1 FROM trips t
+            JOIN trip_legs tl ON tl.trip_id = t.id
+            WHERE t.user_email = u.email
+              AND tl.departs_at > NOW()
+          )
+        )
     `;
     for (const user of users) {
       try {
@@ -7879,18 +7902,29 @@ setInterval(async () => {
           ORDER BY tl.departs_at ASC LIMIT 1
         `;
         const next = nextRows[0];
-        let body;
+        let pushTitle, body;
         if (next) {
           const days = Math.round((new Date(next.departs_at) - now) / 86400000);
-          body = `Next up: ${next.origin} → ${next.destination} in ${days} day${days !== 1 ? 's' : ''}. Wingman is watching.`;
+          if (days <= 1) {
+            pushTitle = `Your flight is ${days === 0 ? 'today' : 'tomorrow'} ✈`;
+            body = `${next.origin} → ${next.destination}. Wingman has your briefing ready.`;
+          } else if (days <= 7) {
+            pushTitle = `${days} days to ${next.destination} ✈`;
+            body = `I'm watching disruption risk and will brief you the morning of departure.`;
+          } else {
+            pushTitle = `Good morning${user.first_name ? `, ${user.first_name}` : ''} ✈`;
+            body = `${next.origin} → ${next.destination} in ${days} days. I'm watching it.`;
+          }
         } else if (tripCount > 0) {
-          body = `${tripCount} trip${tripCount !== 1 ? 's' : ''} tracked this year. Ready for your next adventure?`;
+          pushTitle = `Good morning${user.first_name ? `, ${user.first_name}` : ''} ✈`;
+          body = `${tripCount} trip${tripCount !== 1 ? 's' : ''} protected this year. Where are you headed next?`;
         } else {
-          body = `Add your first trip and Wingman will watch it around the clock.`;
+          pushTitle = `Good morning${user.first_name ? `, ${user.first_name}` : ''} ✈`;
+          body = `Add your first trip and Wingman will watch it around the clock — free.`;
         }
         await sendPushToUser(
           user.email,
-          `Good morning${user.first_name ? `, ${user.first_name}` : ''} ✈`,
+          pushTitle,
           body,
           { screen: 'Home' }
         );
