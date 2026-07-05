@@ -3220,7 +3220,7 @@ app.post("/concierge", conciergeLimiter, async (req, res) => {
     // Fetch user preferences (taste graph), trips, loyalty accounts, and hotel affinity in parallel
     const [userRows, rawTrips, rawLegs, loyaltyAccounts, hotelAffinity, savedInstructions] = await Promise.all([
       sql`SELECT preferences, COALESCE(revealed_preferences, '{}') as revealed_preferences FROM users WHERE email = ${email}`,
-      sql`SELECT id, title, status, mode, created_at FROM trips WHERE user_email = ${email} ORDER BY created_at DESC LIMIT 10`,
+      sql`SELECT id, title, status, mode, created_at, companions_count, companion_names FROM trips WHERE user_email = ${email} ORDER BY created_at DESC LIMIT 10`,
       sql`SELECT tl.* FROM trip_legs tl INNER JOIN trips t ON tl.trip_id = t.id WHERE t.user_email = ${email} ORDER BY tl.departs_at ASC NULLS LAST`,
       sql`SELECT program, points_balance, elite_status, elite_level_next, points_to_next_level, nights_ytd, segments_ytd FROM loyalty_accounts WHERE user_email = ${email} ORDER BY program ASC`,
       sql`SELECT property_name, brand, city, country, tier, attributes, stay_count, last_stayed FROM hotel_affinity WHERE user_email = ${email} ORDER BY stay_count DESC, last_stayed DESC LIMIT 20`,
@@ -3307,7 +3307,10 @@ app.post("/concierge", conciergeLimiter, async (req, res) => {
             return `  - ${leg.type}: ${leg.carrier || leg.destination || "Booking"}`;
           }).join("\n");
           const modeLabel = trip.mode === "client" ? " [CLIENT TRIP]" : trip.mode === "partner" ? " [PARTNER/LEISURE TRIP]" : "";
-          return `Trip: "${trip.title}"${modeLabel}\n${legLines || "  (no legs)"}`.trim();
+          const companionsLabel = trip.companions_count > 0
+            ? ` [${trip.companions_count + 1} travellers, ${trip.companions_count + 1} rooms${trip.companion_names ? ` — ${trip.companion_names}` : ""}]`
+            : "";
+          return `Trip: "${trip.title}"${modeLabel}${companionsLabel}\n${legLines || "  (no legs)"}`.trim();
         }).join("\n\n");
 
         // Build taste profile section from user preferences
