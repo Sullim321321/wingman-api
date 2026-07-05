@@ -687,68 +687,8 @@ bootstrapDB();
 // ---------------------------------------------------------------------------
 // ---------------------------------------------------------------------------
 // Hotel pre-arrival preference email helper
-// ---------------------------------------------------------------------------
-// ---------------------------------------------------------------------------
-// Look up hotel contact email via Google Places API
-// Returns { email, phone, website, placeId } or null
-// ---------------------------------------------------------------------------
-async function lookupHotelContact(hotelName, city) {
-  try {
-    const apiKey = process.env.GOOGLE_PLACES_API_KEY;
-    if (!apiKey) return null;
-    const query = encodeURIComponent(`${hotelName} hotel ${city || ""}`);
-    // Step 1: Find Place from Text
-    const findUrl = `https://maps.googleapis.com/maps/api/place/findplacefromtext/json?input=${query}&inputtype=textquery&fields=place_id,name,formatted_address&key=${apiKey}`;
-    const findResp = await fetch(findUrl);
-    const findData = await findResp.json();
-    const placeId = findData.candidates?.[0]?.place_id;
-    if (!placeId) return null;
-    // Step 2: Get Place Details (website + phone)
-    const detailUrl = `https://maps.googleapis.com/maps/api/place/details/json?place_id=${placeId}&fields=name,formatted_phone_number,website,url&key=${apiKey}`;
-    const detailResp = await fetch(detailUrl);
-    const detailData = await detailResp.json();
-    const result = detailData.result || {};
-    const website = result.website || null;
-    const phone = result.formatted_phone_number || null;
-    // Step 3: Try to extract email from hotel website's contact page
-    let email = null;
-    if (website) {
-      try {
-        const contactUrls = [
-          website.replace(/\/$/, "") + "/contact",
-          website.replace(/\/$/, "") + "/contact-us",
-          website.replace(/\/$/, "") + "/en/contact",
-          website,
-        ];
-        for (const contactUrl of contactUrls) {
-          const pageResp = await fetch(contactUrl, {
-            headers: { "User-Agent": "Mozilla/5.0 (compatible; Wingman/1.0; +https://wingmantravel.app)" },
-            signal: AbortSignal.timeout(6000),
-          });
-          const html = await pageResp.text();
-          // Extract email addresses from HTML
-          const emailMatches = html.match(/[a-zA-Z0-9._%+\-]+@[a-zA-Z0-9.\-]+\.[a-zA-Z]{2,}/g) || [];
-          // Filter out generic/noreply addresses and prefer concierge/reservations/info
-          const preferred = emailMatches.find(e =>
-            /concierge|reservations|front.?desk|info|contact|guest/i.test(e) &&
-            !/noreply|no-reply|donotreply|example|test/i.test(e)
-          );
-          const fallback = emailMatches.find(e =>
-            !/noreply|no-reply|donotreply|example|test/i.test(e)
-          );
-          email = preferred || fallback || null;
-          if (email) break;
-        }
-      } catch (scrapeErr) {
-        console.log("[hotel-contact] website scrape failed:", scrapeErr.message);
-      }
-    }
-    return { email, phone, website, placeId };
-  } catch (e) {
-    console.error("[hotel-contact] lookup error:", e.message);
-    return null;
-  }
-}
+// lookupHotelContact — REMOVED. sendHotelPreferenceEmail — REMOVED.
+// Autonomous outbound emails to hotels are permanently disabled.
 
 // ── Revealed-preference: extract hotel DNA and store affinity ─────────────────
 async function extractAndStoreHotelAffinity(userEmail, parsedBooking) {
@@ -807,89 +747,9 @@ Return ONLY valid JSON:
   }
 }
 
-async function sendHotelPreferenceEmail(userEmail, parsedBooking, tripTitle) {
-  try {
-    // Fetch user preferences
-    const userRows = await sql`SELECT preferences FROM users WHERE email = ${userEmail}`;
-    const prefs = userRows[0]?.preferences || {};
-    const hotelPrefs = prefs.hotel_prefs || [];
-    const foodPrefs = prefs.food_prefs || [];
-    if (hotelPrefs.length === 0 && foodPrefs.length === 0) return; // nothing to send
-    const HOTEL_LABELS = {
-      high_floor: "a high floor room", quiet_room: "a quiet room away from street noise",
-      away_elevator: "a room away from the elevator", bathtub: "a room with a bathtub (not just a shower)",
-      firm_pillow: "firm pillows", late_checkout: "late checkout if possible",
-      room_service: "24-hour room service availability", fast_wifi: "high-speed Wi-Fi",
-      no_resort_fee: "waiver of resort fees if possible", gym: "gym access",
-    };
-    const prefLines = [
-      ...hotelPrefs.map(p => HOTEL_LABELS[p] || p),
-      ...foodPrefs.length > 0 ? [`dietary requirements: ${foodPrefs.join(", ")}`] : [],
-    ];
-    const hotelName = parsedBooking.carrier || parsedBooking.destination || "the hotel";
-    const city = parsedBooking.destination || "";
-    const checkIn = parsedBooking.departs_at
-      ? new Date(parsedBooking.departs_at).toLocaleDateString("en-US", { weekday: "long", year: "numeric", month: "long", day: "numeric" })
-      : "my upcoming stay";
-    // Try to find the hotel's direct email
-    const hotelContact = await lookupHotelContact(hotelName, city);
-    const hotelEmail = hotelContact?.email || null;
-    const hotelPhone = hotelContact?.phone || null;
-    const hotelWebsite = hotelContact?.website || null;
-    const emailBody = `
-<div style="font-family:sans-serif;max-width:560px;margin:0 auto;padding:32px;color:#222">
-  <p>Dear ${hotelName} Team,</p>
-  <p>I have an upcoming reservation (confirmation: ${parsedBooking.confirmation || "on file"}) checking in ${checkIn}. I wanted to reach out in advance to share a few preferences for my stay:</p>
-  <ul style="line-height:1.8">
-    ${prefLines.map(p => `<li>${p}</li>`).join("\n    ")}
-  </ul>
-  <p>I would be very grateful if the team could accommodate these where possible. Please let me know if you need any additional information.</p>
-  <p>Thank you in advance — I look forward to my stay.</p>
-  <p style="color:#666;font-size:12px;margin-top:24px">This message was sent automatically by <strong>Wingman</strong>, a travel assistant acting on behalf of ${userEmail}.</p>
-</div>`;
-    if (hotelEmail) {
-      // Send directly to the hotel AND CC the user
-      await resend.emails.send({
-        from: "Wingman <hello@wingmantravel.app>",
-        to: hotelEmail,
-        cc: userEmail,
-        reply_to: userEmail,
-        subject: `Pre-arrival preferences — ${userEmail} — checking in ${checkIn}`,
-        html: emailBody,
-      });
-      // Log activity
-      await logActivity(
-        userEmail, "hotel_email",
-        `Pre-arrival email sent to ${hotelName}`,
-        `Wingman sent your room preferences directly to ${hotelName} (${hotelEmail}). You were CC'd. Preferences: ${prefLines.slice(0, 3).join("; ")}.`,
-        null, null,
-        { hotelName, hotelEmail, hotelPhone, hotelWebsite, sentDirect: true }
-      );
-      console.log("[hotel-pref-email] sent directly to hotel:", hotelEmail);
-    } else {
-      // Fallback: send to user as a draft with hotel contact info
-      const fallbackNote = hotelPhone
-        ? `<p style="background:#f5f5f5;padding:12px;border-radius:8px;font-size:13px"><strong>Note from Wingman:</strong> We could not find a direct email for ${hotelName}. You can forward this email or call them at <strong>${hotelPhone}</strong>${hotelWebsite ? ` or visit <a href="${hotelWebsite}">${hotelWebsite}</a>` : ""}.</p>`
-        : `<p style="background:#f5f5f5;padding:12px;border-radius:8px;font-size:13px"><strong>Note from Wingman:</strong> We could not find a direct email for ${hotelName}. Please forward this to the hotel's concierge or front desk.</p>`;
-      await resend.emails.send({
-        from: "Wingman <hello@wingmantravel.app>",
-        to: userEmail,
-        subject: `[Draft] Pre-arrival preferences for your stay at ${hotelName}`,
-        html: fallbackNote + emailBody,
-      });
-      await logActivity(
-        userEmail, "hotel_email",
-        `Pre-arrival draft ready for ${hotelName}`,
-        `Wingman prepared your room preferences for ${hotelName} but could not find a direct email. ${hotelPhone ? `Hotel phone: ${hotelPhone}.` : ""} Check your email to forward it.`,
-        null, null,
-        { hotelName, hotelEmail: null, hotelPhone, hotelWebsite, sentDirect: false }
-      );
-      console.log("[hotel-pref-email] no hotel email found, sent draft to user");
-    }
-  } catch (e) {
-    console.error("[hotel-pref-email] error:", e.message);
-  }
-}
+// sendHotelPreferenceEmail — PERMANENTLY DELETED.
+// Wingman will never autonomously send emails to hotels or any third party.
+// Hotel preference sharing must be an explicit, user-initiated action.
 
 // Activity helpers
 // ---------------------------------------------------------------------------
@@ -3174,18 +3034,9 @@ async function getLiveWeather(location) {
     const desc = d.weather?.[0]?.description || 'clear';
     const humidity = d.main?.humidity;
     const windKph = d.wind?.speed ? Math.round(d.wind.speed * 3.6) : null;
-    // Use OWM reverse geocoding to get the proper city name (not sub-neighbourhood)
-    let city = d.name || null;
-    try {
-      const geoUrl = `https://api.openweathermap.org/geo/1.0/reverse?lat=${lat}&lon=${lng}&limit=1&appid=${apiKey}`;
-      const geoResp = await fetch(geoUrl, { signal: AbortSignal.timeout(3000) });
-      if (geoResp.ok) {
-        const geoData = await geoResp.json();
-        if (Array.isArray(geoData) && geoData[0]?.name) {
-          city = geoData[0].name;
-        }
-      }
-    } catch { /* fall back to d.name */ }
+    // d.name from OWM current weather is already city-level (e.g. "London", "New York")
+    // The geo/1.0/reverse API returns sub-neighbourhoods ("Hammersmith") — do NOT use it
+    const city = d.name || null;
     return { temp, feels, desc, city, humidity, windKph };
   } catch (e) {
     console.error('[weather]', e.message);
