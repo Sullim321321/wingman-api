@@ -650,6 +650,19 @@ async function bootstrapDB() {
       console.error("[db] rename error:", e.message);
     }
 
+    // ── Third-party integrations (TripIt iCal, TravelPerk OAuth, etc.) ────────
+    await sql`
+      CREATE TABLE IF NOT EXISTS user_integrations (
+        id SERIAL PRIMARY KEY,
+        user_email TEXT NOT NULL,
+        provider TEXT NOT NULL,
+        config JSONB DEFAULT '{}',
+        updated_at TIMESTAMPTZ DEFAULT NOW(),
+        UNIQUE(user_email, provider)
+      )
+    `;
+    await sql`CREATE INDEX IF NOT EXISTS idx_user_integrations_email ON user_integrations(user_email)`;
+
     // ── Persistent memory: user instructions ──────────────────────────────
     await sql`
       CREATE TABLE IF NOT EXISTS user_instructions (
@@ -4421,13 +4434,13 @@ app.post("/auth/refresh", authLimiter, async (req, res) => {
   }
 });
 
-app.get("/health", (_req, res) => res.json({ ok: true, ts: Date.now(), version: "2.13.0" }));
+app.get("/health", (_req, res) => res.json({ ok: true, ts: Date.now(), version: "2.14.0" }));
 
 // GET /env-status — internal diagnostic (auth required, non-sensitive)
 // Shows which optional API integrations are configured without exposing key values
 app.get("/env-status", auth, (_req, res) => {
   res.json({
-    version: "2.13.0",
+    version: "2.14.0",
     integrations: {
       flightaware:    { configured: !!process.env.FLIGHTAWARE_API_KEY,    label: "FlightAware AeroAPI (primary flight status)" },
       aviationstack:  { configured: !!process.env.AVIATIONSTACK_API_KEY,  label: "AviationStack (fallback flight status, free tier)" },
@@ -10091,6 +10104,368 @@ app.get("/me/offline-snapshot", auth, async (req, res) => {
     res.status(500).json({ error: e.message });
   }
 });
+
+// ===========================================================================
+// TripIt iCal Sync — parse user's TripIt calendar feed URL
+// ===========================================================================
+// POST /integrations/tripit/sync — user provides their TripIt iCal URL
+// TripIt's public API is closed to new integrations (Feb 2026), so we use
+// the iCal calendar feed that TripIt exposes per-user in their settings.
+app.post("/integrations/tripit/sync", auth, async (req, res) => {
+  const { ical_url } = req.body || {};
+  if (!ical_url || typeof ical_url !== "string") {
+    return res.status(400).json({ error: "ical_url required" });
+  }
+  // Validate it looks like a TripIt iCal URL
+  if (!ical_url.includes("tripit.com") && !ical_url.includes("ics")) {
+    return res.status(400).json({ error: "URL must be a TripIt iCal feed (from TripIt Settings → Publishing Options)" });
+  }
+  try {
+    // Fetch the iCal feed
+    const resp = await fetch(ical_url, { signal: AbortSignal.timeout(15000) });
+    if (!resp.ok) return res.status(502).json({ error: `Could not fetch iCal feed: HTTP ${resp.status}` });
+    const icalText = await resp.text();
+
+    // Parse iCal events into trip legs using Claude
+    const anthropic = getAnthropic();
+    const extraction = await anthropic.messages.create({
+      model: "claude-haiku-4-5",
+      max_tokens: 4000,
+      messages: [{
+        role: "user",
+        content: `Parse this TripIt iCal feed and extract all travel bookings. Return a JSON array of trips.
+Each trip: { title, legs: [{ type, carrier, flight_number, origin, destination, departs_at, arrives_at, confirmation }] }
+Types: flight, hotel, car, train, show, other.
+Return ONLY the JSON array, no other text.
+
+iCal data:
+${icalText.slice(0, 8000)}`
+      }],
+    });
+
+    let trips;
+    try {
+      const raw = extraction.content[0]?.text?.trim();
+      const jsonStart = raw.indexOf("[");
+      const jsonEnd = raw.lastIndexOf("]") + 1;
+      trips = JSON.parse(raw.slice(jsonStart, jsonEnd));
+    } catch {
+      return res.status(422).json({ error: "Could not parse iCal data", raw: extraction.content[0]?.text?.slice(0, 200) });
+    }
+
+    // Save parsed trips to DB
+    let created = 0;
+    for (const trip of trips) {
+      if (!trip.title || !Array.isArray(trip.legs) || trip.legs.length === 0) continue;
+      const [newTrip] = await sql`
+        INSERT INTO trips (user_email, title, status, source)
+        VALUES (${req.email}, ${trip.title.slice(0, 200)}, 'upcoming', 'tripit')
+        RETURNING id
+      `;
+      for (const leg of trip.legs) {
+        await sql`
+          INSERT INTO trip_legs (trip_id, type, carrier, flight_number, origin, destination, departs_at, arrives_at, confirmation)
+          VALUES (
+            ${newTrip.id},
+            ${(leg.type || "other").slice(0, 50)},
+            ${leg.carrier ? leg.carrier.slice(0, 100) : null},
+            ${leg.flight_number ? leg.flight_number.slice(0, 20) : null},
+            ${leg.origin ? leg.origin.slice(0, 100) : null},
+            ${leg.destination ? leg.destination.slice(0, 100) : null},
+            ${leg.departs_at || null},
+            ${leg.arrives_at || null},
+            ${leg.confirmation ? leg.confirmation.slice(0, 50) : null}
+          )
+        `;
+      }
+      created++;
+    }
+
+    // Save the iCal URL for future auto-sync
+    await sql`
+      INSERT INTO user_integrations (user_email, provider, config, updated_at)
+      VALUES (${req.email}, 'tripit_ical', ${JSON.stringify({ ical_url })}, NOW())
+      ON CONFLICT (user_email, provider) DO UPDATE SET config = EXCLUDED.config, updated_at = NOW()
+    `;
+
+    res.json({ ok: true, trips_created: created, trips_found: trips.length });
+  } catch (e) {
+    console.error("[tripit/sync]", e.message);
+    res.status(500).json({ error: e.message });
+  }
+});
+
+// GET /integrations/tripit/status — check if TripIt iCal is connected
+app.get("/integrations/tripit/status", auth, async (req, res) => {
+  try {
+    const rows = await sql`
+      SELECT config, updated_at FROM user_integrations
+      WHERE user_email = ${req.email} AND provider = 'tripit_ical'
+    `;
+    if (!rows.length) return res.json({ connected: false });
+    res.json({ connected: true, last_synced: rows[0].updated_at });
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
+// DELETE /integrations/tripit — disconnect TripIt iCal
+app.delete("/integrations/tripit", auth, async (req, res) => {
+  try {
+    await sql`DELETE FROM user_integrations WHERE user_email = ${req.email} AND provider = 'tripit_ical'`;
+    res.json({ ok: true });
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
+// ===========================================================================
+// TravelPerk OAuth 2.0 Sync
+// ===========================================================================
+// GET /integrations/travelperk/connect — initiate OAuth flow
+app.get("/integrations/travelperk/connect", auth, async (req, res) => {
+  if (!process.env.TRAVELPERK_CLIENT_ID || !process.env.TRAVELPERK_CLIENT_SECRET) {
+    return res.status(503).json({
+      error: "TravelPerk OAuth not configured",
+      hint: "Set TRAVELPERK_CLIENT_ID and TRAVELPERK_CLIENT_SECRET in Render environment variables."
+    });
+  }
+  const redirectUri = process.env.TRAVELPERK_REDIRECT_URI || "https://wingman-api-y39a.onrender.com/integrations/travelperk/callback";
+  const state = Buffer.from(req.email).toString("base64");
+  const url = `https://app.travelperk.com/oauth2/authorize?client_id=${encodeURIComponent(process.env.TRAVELPERK_CLIENT_ID)}&redirect_uri=${encodeURIComponent(redirectUri)}&response_type=code&scope=trips:read+bookings:read&state=${state}`;
+  res.json({ url });
+});
+
+// GET /integrations/travelperk/callback — OAuth callback
+app.get("/integrations/travelperk/callback", async (req, res) => {
+  const { code, state, error } = req.query;
+  if (error) return res.status(400).send(`TravelPerk OAuth error: ${error}`);
+  if (!code || !state) return res.status(400).send("Missing code or state");
+  let userEmail;
+  try { userEmail = Buffer.from(state, "base64").toString("utf8"); } catch { return res.status(400).send("Invalid state"); }
+  const redirectUri = process.env.TRAVELPERK_REDIRECT_URI || "https://wingman-api-y39a.onrender.com/integrations/travelperk/callback";
+  try {
+    // Exchange code for tokens
+    const tokenResp = await fetch("https://app.travelperk.com/oauth2/token", {
+      method: "POST",
+      headers: { "Content-Type": "application/x-www-form-urlencoded" },
+      body: new URLSearchParams({
+        grant_type: "authorization_code",
+        code,
+        redirect_uri: redirectUri,
+        client_id: process.env.TRAVELPERK_CLIENT_ID,
+        client_secret: process.env.TRAVELPERK_CLIENT_SECRET,
+      }),
+    });
+    const tokens = await tokenResp.json();
+    if (!tokens.access_token) return res.status(502).send("Token exchange failed: " + JSON.stringify(tokens));
+
+    // Store tokens
+    await sql`
+      INSERT INTO user_integrations (user_email, provider, config, updated_at)
+      VALUES (${userEmail}, 'travelperk', ${JSON.stringify({
+        access_token: encryptField(tokens.access_token),
+        refresh_token: tokens.refresh_token ? encryptField(tokens.refresh_token) : null,
+        expires_at: tokens.expires_in ? Date.now() + tokens.expires_in * 1000 : null,
+      })}, NOW())
+      ON CONFLICT (user_email, provider) DO UPDATE SET config = EXCLUDED.config, updated_at = NOW()
+    `;
+
+    // Trigger initial sync
+    syncTravelPerkTrips(userEmail, tokens.access_token).catch(e => console.error("[travelperk initial sync]", e.message));
+
+    // Redirect back to app
+    res.send(`<html><body><script>window.location='wingman://integrations/travelperk/success'</script><p>TravelPerk connected! You can close this window.</p></body></html>`);
+  } catch (e) {
+    console.error("[travelperk/callback]", e.message);
+    res.status(500).send("OAuth callback failed: " + e.message);
+  }
+});
+
+// Helper: sync TravelPerk trips for a user
+async function syncTravelPerkTrips(userEmail, accessToken) {
+  const headers = { Authorization: `Bearer ${accessToken}`, "Accept": "application/json" };
+  // Fetch trips
+  const tripsResp = await fetch("https://app.travelperk.com/api/v2/trips?limit=50", { headers, signal: AbortSignal.timeout(20000) });
+  if (!tripsResp.ok) throw new Error(`TravelPerk trips API returned ${tripsResp.status}`);
+  const tripsData = await tripsResp.json();
+  const tpTrips = tripsData.results || tripsData.trips || [];
+
+  let created = 0;
+  for (const tpTrip of tpTrips) {
+    const title = tpTrip.name || tpTrip.title || `TravelPerk Trip ${tpTrip.id}`;
+    // Check if already imported
+    const existing = await sql`SELECT id FROM trips WHERE user_email = ${userEmail} AND source = 'travelperk' AND title = ${title}`;
+    if (existing.length) continue;
+
+    const [newTrip] = await sql`
+      INSERT INTO trips (user_email, title, status, source)
+      VALUES (${userEmail}, ${title.slice(0, 200)}, 'upcoming', 'travelperk')
+      RETURNING id
+    `;
+
+    // Fetch bookings for this trip
+    const bookingsResp = await fetch(`https://app.travelperk.com/api/v2/bookings?trip_id=${tpTrip.id}`, { headers, signal: AbortSignal.timeout(15000) });
+    if (!bookingsResp.ok) continue;
+    const bookingsData = await bookingsResp.json();
+    const bookings = bookingsData.results || bookingsData.bookings || [];
+
+    for (const booking of bookings) {
+      const legType = booking.type === "flight" ? "flight" : booking.type === "hotel" ? "hotel" : booking.type === "train" ? "train" : booking.type === "car" ? "car" : "other";
+      await sql`
+        INSERT INTO trip_legs (trip_id, type, carrier, flight_number, origin, destination, departs_at, arrives_at, confirmation)
+        VALUES (
+          ${newTrip.id},
+          ${legType},
+          ${booking.carrier || booking.airline || booking.hotel_name || null},
+          ${booking.flight_number || null},
+          ${booking.origin || booking.departure_city || null},
+          ${booking.destination || booking.arrival_city || null},
+          ${booking.departure_datetime || booking.check_in || null},
+          ${booking.arrival_datetime || booking.check_out || null},
+          ${booking.confirmation_code || booking.pnr || null}
+        )
+      `;
+    }
+    created++;
+  }
+  return created;
+}
+
+// POST /integrations/travelperk/sync — manual re-sync
+app.post("/integrations/travelperk/sync", auth, async (req, res) => {
+  try {
+    const rows = await sql`SELECT config FROM user_integrations WHERE user_email = ${req.email} AND provider = 'travelperk'`;
+    if (!rows.length) return res.status(404).json({ error: "TravelPerk not connected" });
+    const config = rows[0].config;
+    const accessToken = decryptField(config.access_token);
+    const created = await syncTravelPerkTrips(req.email, accessToken);
+    res.json({ ok: true, trips_created: created });
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
+// GET /integrations/travelperk/status
+app.get("/integrations/travelperk/status", auth, async (req, res) => {
+  try {
+    const rows = await sql`SELECT updated_at FROM user_integrations WHERE user_email = ${req.email} AND provider = 'travelperk'`;
+    res.json({ connected: rows.length > 0, last_synced: rows[0]?.updated_at || null });
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
+// DELETE /integrations/travelperk — disconnect
+app.delete("/integrations/travelperk", auth, async (req, res) => {
+  try {
+    await sql`DELETE FROM user_integrations WHERE user_email = ${req.email} AND provider = 'travelperk'`;
+    res.json({ ok: true });
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
+// ===========================================================================
+// PDF OCR — extract booking data from scanned/image PDFs using Claude vision
+// ===========================================================================
+// POST /trips/import/pdf-ocr — multipart upload of a PDF file
+const multer = require("multer");
+const pdfOcrUpload = multer({ storage: multer.memoryStorage(), limits: { fileSize: 10 * 1024 * 1024 } }); // 10MB
+
+app.post("/trips/import/pdf-ocr", auth, pdfOcrUpload.single("pdf"), async (req, res) => {
+  if (!req.file) return res.status(400).json({ error: "No PDF file uploaded" });
+  if (!req.file.mimetype.includes("pdf") && !req.file.mimetype.includes("image")) {
+    return res.status(400).json({ error: "File must be a PDF or image" });
+  }
+  try {
+    const anthropic = getAnthropic();
+    // Convert PDF/image to base64 for Claude vision
+    const base64Data = req.file.buffer.toString("base64");
+    const mediaType = req.file.mimetype.includes("pdf") ? "application/pdf" : req.file.mimetype;
+
+    const extraction = await anthropic.messages.create({
+      model: "claude-sonnet-4-5",
+      max_tokens: 3000,
+      messages: [{
+        role: "user",
+        content: [
+          {
+            type: "document",
+            source: { type: "base64", media_type: mediaType, data: base64Data },
+          },
+          {
+            type: "text",
+            text: `Extract all travel booking information from this document. Return a JSON object:
+{
+  "trip_title": "string",
+  "legs": [
+    {
+      "type": "flight|hotel|car|train|other",
+      "carrier": "string",
+      "flight_number": "string or null",
+      "origin": "string",
+      "destination": "string",
+      "departs_at": "ISO8601 datetime or null",
+      "arrives_at": "ISO8601 datetime or null",
+      "confirmation": "string or null"
+    }
+  ]
+}
+Return ONLY the JSON, no other text. If no booking data found, return { "trip_title": null, "legs": [] }.`
+          }
+        ]
+      }],
+    });
+
+    let parsed;
+    try {
+      const raw = extraction.content[0]?.text?.trim();
+      const jsonStart = raw.indexOf("{");
+      const jsonEnd = raw.lastIndexOf("}") + 1;
+      parsed = JSON.parse(raw.slice(jsonStart, jsonEnd));
+    } catch {
+      return res.status(422).json({ error: "Could not parse booking data from PDF", raw: extraction.content[0]?.text?.slice(0, 200) });
+    }
+
+    if (!parsed.trip_title || !parsed.legs?.length) {
+      return res.status(422).json({ error: "No booking data found in this PDF", parsed });
+    }
+
+    // Save to DB
+    const [newTrip] = await sql`
+      INSERT INTO trips (user_email, title, status, source)
+      VALUES (${req.email}, ${parsed.trip_title.slice(0, 200)}, 'upcoming', 'pdf_ocr')
+      RETURNING id
+    `;
+    for (const leg of parsed.legs) {
+      await sql`
+        INSERT INTO trip_legs (trip_id, type, carrier, flight_number, origin, destination, departs_at, arrives_at, confirmation)
+        VALUES (
+          ${newTrip.id},
+          ${(leg.type || "other").slice(0, 50)},
+          ${leg.carrier ? leg.carrier.slice(0, 100) : null},
+          ${leg.flight_number ? leg.flight_number.slice(0, 20) : null},
+          ${leg.origin ? leg.origin.slice(0, 100) : null},
+          ${leg.destination ? leg.destination.slice(0, 100) : null},
+          ${leg.departs_at || null},
+          ${leg.arrives_at || null},
+          ${leg.confirmation ? leg.confirmation.slice(0, 50) : null}
+        )
+      `;
+    }
+
+    res.json({ ok: true, trip_id: newTrip.id, trip_title: parsed.trip_title, legs_created: parsed.legs.length });
+  } catch (e) {
+    console.error("[pdf-ocr]", e.message);
+    res.status(500).json({ error: e.message });
+  }
+});
+
+// ===========================================================================
+// DB migration: ensure user_integrations table exists
+// ===========================================================================
+// (Runs at startup via bootstrapDB — add to bootstrap if not already there)
 
 // ---------------------------------------------------------------------------
 // Keep-alive: self-ping every 10 minutes to prevent Render free tier from sleeping
