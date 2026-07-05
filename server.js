@@ -3519,7 +3519,15 @@ LOGISTICS & PLANNING
     res.json({ ok: true, reply, places: placesResults.length > 0 ? placesResults : undefined, weather: liveWeather || undefined, action: bookingAction || undefined, transit: transitRoute || undefined });
   } catch (e) {
     console.error("[concierge]", e.message);
-    res.status(500).json({ error: "concierge error: " + e.message });
+    const isTimeout = e.name === "TimeoutError" || e.message?.includes("timeout");
+    const isCreditError = e.message?.includes("credit balance") || e.message?.includes("insufficient_quota");
+    const statusCode = isTimeout ? 504 : 500;
+    const clientMsg = isTimeout
+      ? "timeout"
+      : isCreditError
+      ? "service_unavailable"
+      : "concierge_error";
+    res.status(statusCode).json({ error: clientMsg, detail: e.message });
   }
 });
 
