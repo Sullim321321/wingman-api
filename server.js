@@ -544,6 +544,25 @@ async function bootstrapDB() {
     await sql`ALTER TABLE trips ADD COLUMN IF NOT EXISTS mode TEXT DEFAULT 'solo'`;
     await sql`ALTER TABLE trips ADD COLUMN IF NOT EXISTS raw_email_id TEXT`;
     await sql`ALTER TABLE trips ADD COLUMN IF NOT EXISTS updated_at TIMESTAMPTZ DEFAULT NOW()`;
+    await sql`ALTER TABLE trips ADD COLUMN IF NOT EXISTS companions_count INTEGER DEFAULT 1`;
+    await sql`ALTER TABLE trips ADD COLUMN IF NOT EXISTS companion_names JSONB DEFAULT '[]'`;
+    await sql`ALTER TABLE trips ADD COLUMN IF NOT EXISTS event_legs JSONB DEFAULT '[]'`;
+    // ── Pre-trip checklist ──────────────────────────────────────────────────
+    await sql`
+      CREATE TABLE IF NOT EXISTS trip_checklist (
+        id SERIAL PRIMARY KEY,
+        trip_id INTEGER NOT NULL REFERENCES trips(id) ON DELETE CASCADE,
+        user_email TEXT NOT NULL,
+        item TEXT NOT NULL,
+        category TEXT DEFAULT 'general',
+        due_date DATE,
+        completed BOOLEAN DEFAULT false,
+        auto_generated BOOLEAN DEFAULT true,
+        sort_order INTEGER DEFAULT 0,
+        created_at TIMESTAMPTZ DEFAULT NOW()
+      )
+    `;
+    await sql`CREATE INDEX IF NOT EXISTS idx_trip_checklist_trip ON trip_checklist(trip_id, sort_order)`;
     // ── Ensure all trip_legs columns exist ──
     await sql`ALTER TABLE trip_legs ADD COLUMN IF NOT EXISTS status TEXT DEFAULT 'upcoming'`;
     await sql`ALTER TABLE trip_legs ADD COLUMN IF NOT EXISTS raw_data JSONB`;
@@ -3455,7 +3474,14 @@ LOGISTICS & PLANNING
 - For restaurants: if the user wants to book, offer to open OpenTable, Resy, or the restaurant's direct site
 - For flights: offer to open the Wingman flight booking flow
 - End your response with: ACTION:{"type":"book","label":"<button label>","url":"<url>"} on its own line when a direct booking link is available — the app will render this as a tappable button. Only include one ACTION per response.
-- If no direct URL is available, say so honestly and suggest the best alternative (phone number, walk-in timing, etc.)`;
+- If no direct URL is available, say so honestly and suggest the best alternative (phone number, walk-in timing, etc.)
+
+=== TRIP PLANNING ===
+- When the user asks you to plan a trip, create an itinerary, or suggests visiting multiple cities, provide a detailed day-by-day plan in your reply.
+- After your full text reply, emit a PLAN tag on its own line with a compact JSON object (no newlines inside the JSON):
+  PLAN:{"title":"<trip name>","cities":["<city1>","<city2>",...],"nights":<total nights>,"legs":[{"from":"<city>","to":"<city>","date":"<YYYY-MM-DD>","type":"flight"},...],"highlights":["<key highlight 1>","<key highlight 2>","<key highlight 3>"]}
+- The PLAN tag allows the app to render a "Create this trip" button so the user can instantly add the trip to Wingman for monitoring.
+- Only emit one PLAN tag per response. Only emit it when you have actually planned a multi-city trip (not for single-destination or day-trip queries).`;
 
 
     // Scrub PII from history messages too
@@ -3506,8 +3532,20 @@ LOGISTICS & PLANNING
     if (actionMatch) {
       try { bookingAction = JSON.parse(actionMatch[1]); } catch {}
     }
+
+    // Extract PLAN tag — structured trip plan returned when Claude plans a multi-city trip
+    // Format: PLAN:{"title":"...","cities":[...],"nights":19,"legs":[...],"highlights":[...]}
+    let tripPlan = null;
+    const planMatch = rawReply.match(/PLAN:(\{[\s\S]+?\})(?:\n|$)/m);
+    if (planMatch) {
+      try { tripPlan = JSON.parse(planMatch[1]); } catch {}
+    }
+    // Also detect planning intent heuristically and ask Claude to emit a PLAN tag
+    const planningIntent = !tripPlan && /\b(plan|planning|itinerary|trip to|travel to|visit|tour|cities|nights?|days?)\b/i.test(rawMessage) && rawMessage.length > 40;
+    // (The system prompt instructs Claude to emit PLAN: when it detects trip planning; this is a fallback)
     const reply = rawReply
       .replace(/^ACTION:\{[^\n]+\}\s*$/gm, '') // remove ACTION line
+      .replace(/^PLAN:\{[\s\S]+?\}\s*$/gm, '') // remove PLAN line
       .replace(/^#{1,6}\s+/gm, '')              // remove # headings
       .replace(/\*\*([^*]+)\*\*/g, '$1')        // remove **bold**
       .replace(/\*([^*]+)\*/g, '$1')            // remove *italic*
@@ -3516,7 +3554,7 @@ LOGISTICS & PLANNING
       .trim();
     // Award points for first concierge message (idempotent)
     awardPoints(email, "concierge_first").catch(() => {});
-    res.json({ ok: true, reply, places: placesResults.length > 0 ? placesResults : undefined, weather: liveWeather || undefined, action: bookingAction || undefined, transit: transitRoute || undefined });
+    res.json({ ok: true, reply, places: placesResults.length > 0 ? placesResults : undefined, weather: liveWeather || undefined, action: bookingAction || undefined, transit: transitRoute || undefined, plan: tripPlan || undefined });
   } catch (e) {
     console.error("[concierge]", e.message);
     const isTimeout = e.name === "TimeoutError" || e.message?.includes("timeout");
@@ -8375,49 +8413,96 @@ app.get("/disruption/alternatives", async (req, res) => {
       }
     } catch {}
 
-    // Build cascade actions — what else is affected
+    // Build cascade actions — ALL downstream legs affected by this disruption
     const cascadeActions = [];
 
-    // Check for hotel check-in tonight
-    const hotelLegs = await sql`
-      SELECT * FROM trip_legs WHERE trip_id = ${tripId} AND type = 'hotel'
-      AND DATE(check_in) = DATE(${leg.departs_at || new Date().toISOString()})
-    `;
-    if (hotelLegs.length > 0) {
-      cascadeActions.push({
-        type: "hotel_delay",
-        label: `Notify ${hotelLegs[0].name || "hotel"} of late arrival`,
-        description: "Your hotel check-in may be affected. Wingman can notify them.",
-        actionable: true,
-        data: { legId: hotelLegs[0].id, hotelName: hotelLegs[0].name },
-      });
-    }
+    // Get trip companions count for personalized messaging
+    const [tripMeta] = await sql`SELECT companions_count, companion_names, title FROM trips WHERE id = ${tripId}`;
+    const companionsCount = tripMeta?.companions_count || 1;
+    const guestStr = companionsCount > 1 ? `${companionsCount} guests` : "1 guest";
 
-    // Check for restaurant reservations
-    const restLegs = await sql`
-      SELECT * FROM trip_legs WHERE trip_id = ${tripId} AND type = 'restaurant'
-      AND DATE(booking_time) = DATE(${leg.departs_at || new Date().toISOString()})
+    // Get ALL subsequent legs in this trip after the affected leg's departure time
+    const affectedTime = leg.departs_at ? new Date(leg.departs_at) : new Date();
+    const downstreamLegs = await sql`
+      SELECT * FROM trip_legs
+      WHERE trip_id = ${tripId}
+        AND id != ${leg.id}
+        AND (departs_at > ${affectedTime.toISOString()}::TIMESTAMPTZ OR arrives_at > ${affectedTime.toISOString()}::TIMESTAMPTZ)
+      ORDER BY COALESCE(departs_at, arrives_at) ASC
     `;
-    if (restLegs.length > 0) {
-      cascadeActions.push({
-        type: "restaurant_delay",
-        label: `Reschedule dinner at ${restLegs[0].name || "restaurant"}`,
-        description: "Your dinner reservation may need to be pushed back.",
-        actionable: true,
-        data: { legId: restLegs[0].id, restaurantName: restLegs[0].name },
-      });
+
+    // Severity: critical = show/event at risk, high = connecting flight, medium = hotel, low = restaurant
+    for (const dl of downstreamLegs) {
+      const dlTime = dl.departs_at ? new Date(dl.departs_at) : null;
+      const hoursUntil = dlTime ? (dlTime.getTime() - Date.now()) / 3600000 : null;
+
+      if (dl.type === "event" || dl.type === "show" || dl.type === "concert") {
+        const eventName = dl.carrier || dl.destination_city || "your event";
+        const eventDate = dl.departs_at ? new Date(dl.departs_at).toLocaleDateString("en-GB", { weekday: "short", month: "short", day: "numeric" }) : "";
+        cascadeActions.push({
+          type: "event_at_risk",
+          severity: "critical",
+          label: `${eventName} on ${eventDate} may be at risk`,
+          description: isCancelled
+            ? `This cancellation puts your ${eventName} booking at risk. Wingman can help find alternatives.`
+            : `A ${delayMins}+ minute delay may affect your arrival before ${eventName}.`,
+          actionable: true,
+          data: { legId: dl.id, eventName, eventDate },
+        });
+      } else if (dl.type === "flight") {
+        const connIdent = (dl.carrier || "") + (dl.flight_number || "");
+        const connRoute = dl.origin && dl.destination ? `${dl.origin}→${dl.destination}` : connIdent;
+        const bufferMins = dlTime ? Math.round((dlTime.getTime() - (affectedTime.getTime() + (delayMins || 0) * 60000)) / 60000) : null;
+        const isAtRisk = bufferMins !== null && bufferMins < 90;
+        cascadeActions.push({
+          type: isAtRisk ? "connection_at_risk" : "connection_monitor",
+          severity: isAtRisk ? "high" : "medium",
+          label: isAtRisk ? `Connection ${connRoute} at risk (${bufferMins}m buffer)` : `Monitoring connection ${connRoute}`,
+          description: isAtRisk
+            ? `With this delay, you'd have only ${bufferMins} minutes to make ${connIdent || connRoute}. Wingman recommends rebooking now.`
+            : `Your ${connIdent || connRoute} connection has ${bufferMins ? bufferMins + " minutes" : "some"} buffer. Wingman is watching it.`,
+          actionable: isAtRisk,
+          data: { legId: dl.id, flightIdent: connIdent, origin: dl.origin, destination: dl.destination, bufferMins },
+        });
+      } else if (dl.type === "hotel" || dl.type === "airbnb") {
+        const hotelName = dl.carrier || dl.destination_city || "your hotel";
+        const checkinDate = dl.departs_at ? new Date(dl.departs_at).toLocaleDateString("en-GB", { weekday: "short", month: "short", day: "numeric" }) : "";
+        cascadeActions.push({
+          type: "hotel_delay",
+          severity: "medium",
+          label: `Notify ${hotelName} of late arrival`,
+          description: `Check-in for ${guestStr} at ${hotelName}${checkinDate ? " on " + checkinDate : ""} may be affected. Wingman can contact them.`,
+          actionable: true,
+          data: { legId: dl.id, hotelName, checkinDate, companionsCount },
+        });
+      } else if (dl.type === "restaurant") {
+        const restName = dl.carrier || "your restaurant";
+        cascadeActions.push({
+          type: "restaurant_delay",
+          severity: "low",
+          label: `Reschedule dinner at ${restName}`,
+          description: `Your reservation at ${restName} for ${guestStr} may need to be pushed back. Wingman can draft the message.`,
+          actionable: true,
+          data: { legId: dl.id, restaurantName: restName, companionsCount },
+        });
+      }
     }
 
     // Lounge access while waiting
     if (isCancelled || delayMins >= 60) {
       cascadeActions.push({
         type: "lounge_access",
+        severity: "info",
         label: "Find lounge access while you wait",
-        description: "Check your card benefits for complimentary lounge access.",
+        description: `Check your card benefits for complimentary lounge access at ${leg.origin || "this airport"}.`,
         actionable: true,
         data: { iata: leg.origin },
       });
     }
+
+    // Sort by severity
+    const severityOrder = { critical: 0, high: 1, medium: 2, low: 3, info: 4 };
+    cascadeActions.sort((a, b) => (severityOrder[a.severity] ?? 5) - (severityOrder[b.severity] ?? 5));
 
     // Rights info
     const rightsInfo = isCancelled ? {
@@ -8585,6 +8670,247 @@ app.post("/trips/:tripId/cascade/restaurant-reschedule", auth, requirePro, async
     });
   } catch (e) {
     console.error("[cascade/restaurant-reschedule]", e.message);
+    res.status(500).json({ error: e.message });
+  }
+});
+
+// ===========================================================================
+// PRE-TRIP CHECKLIST
+// POST /trips/:tripId/checklist/generate — Claude generates a personalised checklist
+// GET  /trips/:tripId/checklist — return checklist items
+// PATCH /trips/:tripId/checklist/:itemId — mark item complete/incomplete
+// ===========================================================================
+
+app.post("/trips/:tripId/checklist/generate", auth, async (req, res) => {
+  const { tripId } = req.params;
+  try {
+    // Verify ownership
+    const [trip] = await sql`
+      SELECT t.*, u.first_name, u.cabin_preference, u.home_airports
+      FROM trips t JOIN users u ON u.email = t.user_email
+      WHERE t.id = ${tripId} AND t.user_email = ${req.email}
+    `;
+    if (!trip) return res.status(404).json({ error: "Trip not found" });
+
+    const legs = await sql`SELECT * FROM trip_legs WHERE trip_id = ${tripId} ORDER BY COALESCE(departs_at, arrives_at) ASC`;
+
+    // Build a concise trip summary for Claude
+    const flightLegs = legs.filter(l => l.type === "flight");
+    const countries = [...new Set(legs.map(l => l.destination_city || l.destination).filter(Boolean))];
+    const eventLegs = legs.filter(l => ["event", "show", "concert"].includes(l.type));
+    const firstDep = flightLegs[0]?.departs_at;
+    const lastArr = legs.reduce((latest, l) => {
+      const t = l.arrives_at || l.departs_at;
+      return t && (!latest || new Date(t) > new Date(latest)) ? t : latest;
+    }, null);
+    const daysAway = firstDep ? Math.ceil((new Date(firstDep).getTime() - Date.now()) / 86400000) : null;
+    const companionsCount = trip.companions_count || 1;
+    const companionNames = trip.companion_names || [];
+    const companionStr = companionsCount > 1
+      ? ` Travelling with ${companionNames.length > 0 ? companionNames.join(" and ") : (companionsCount - 1) + " companion" + (companionsCount > 2 ? "s" : "")}.`
+      : "";
+
+    const tripSummary = [
+      `Trip: ${trip.title}`,
+      firstDep ? `Departs: ${new Date(firstDep).toDateString()}` : "",
+      lastArr  ? `Returns: ${new Date(lastArr).toDateString()}`  : "",
+      daysAway != null ? `Days until departure: ${daysAway}` : "",
+      countries.length > 0 ? `Countries/cities: ${countries.join(", ")}` : "",
+      flightLegs.length > 0 ? `Flights: ${flightLegs.map(l => (l.carrier || "") + (l.flight_number || "") + " " + (l.origin || "") + "→" + (l.destination || "")).join(", ")}` : "",
+      eventLegs.length > 0 ? `Events/shows: ${eventLegs.map(l => l.carrier || l.destination_city || "event").join(", ")}` : "",
+      trip.cabin_preference ? `Cabin: ${trip.cabin_preference}` : "",
+      companionStr,
+    ].filter(Boolean).join("\n");
+
+    const anthropic = getAnthropic();
+    const aiResp = await anthropic.messages.create({
+      model: "claude-sonnet-4-5",
+      max_tokens: 1200,
+      messages: [{
+        role: "user",
+        content: `You are a premium travel concierge. Generate a pre-trip checklist for this trip. Return JSON only: { items: [{ item: string, category: "visa"|"health"|"money"|"tech"|"packing"|"booking"|"documents"|"general", due_days_before: number, priority: "critical"|"high"|"medium" }] }. Be specific — include visa/entry requirements for each country, any time-sensitive bookings (restaurants, bullet trains, etc), tech setup (VPN for China, local SIM, etc), and travel documents. Maximum 20 items. Trip details:\n${tripSummary}`,
+      }],
+    });
+
+    let parsed;
+    try {
+      parsed = JSON.parse(aiResp.content[0].text.replace(/```json\n?|```/g, "").trim());
+    } catch {
+      return res.status(422).json({ error: "Could not parse checklist", raw: aiResp.content[0].text });
+    }
+
+    // Clear existing auto-generated items and insert new ones
+    await sql`DELETE FROM trip_checklist WHERE trip_id = ${tripId} AND auto_generated = true AND user_email = ${req.email}`;
+
+    const items = (parsed.items || []).slice(0, 20);
+    for (let i = 0; i < items.length; i++) {
+      const it = items[i];
+      const dueDate = it.due_days_before != null && firstDep
+        ? new Date(new Date(firstDep).getTime() - it.due_days_before * 86400000).toISOString().split("T")[0]
+        : null;
+      await sql`
+        INSERT INTO trip_checklist (trip_id, user_email, item, category, due_date, auto_generated, sort_order)
+        VALUES (${tripId}, ${req.email}, ${it.item}, ${it.category || "general"}, ${dueDate}::DATE, true, ${i})
+      `;
+    }
+
+    const checklist = await sql`SELECT * FROM trip_checklist WHERE trip_id = ${tripId} AND user_email = ${req.email} ORDER BY sort_order ASC`;
+    res.json({ ok: true, checklist });
+  } catch (e) {
+    console.error("[checklist/generate]", e.message);
+    res.status(500).json({ error: e.message });
+  }
+});
+
+app.get("/trips/:tripId/checklist", auth, async (req, res) => {
+  const { tripId } = req.params;
+  try {
+    const [trip] = await sql`SELECT id FROM trips WHERE id = ${tripId} AND user_email = ${req.email}`;
+    if (!trip) return res.status(404).json({ error: "Trip not found" });
+    const checklist = await sql`SELECT * FROM trip_checklist WHERE trip_id = ${tripId} AND user_email = ${req.email} ORDER BY sort_order ASC, created_at ASC`;
+    res.json({ checklist });
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
+app.patch("/trips/:tripId/checklist/:itemId", auth, async (req, res) => {
+  const { tripId, itemId } = req.params;
+  const { completed } = req.body;
+  try {
+    const [updated] = await sql`
+      UPDATE trip_checklist SET completed = ${completed}
+      WHERE id = ${itemId} AND trip_id = ${tripId} AND user_email = ${req.email}
+      RETURNING *
+    `;
+    if (!updated) return res.status(404).json({ error: "Item not found" });
+    res.json({ ok: true, item: updated });
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
+app.post("/trips/:tripId/checklist", auth, async (req, res) => {
+  const { tripId } = req.params;
+  const { item, category } = req.body;
+  if (!item) return res.status(400).json({ error: "item required" });
+  try {
+    const [trip] = await sql`SELECT id FROM trips WHERE id = ${tripId} AND user_email = ${req.email}`;
+    if (!trip) return res.status(404).json({ error: "Trip not found" });
+    const [maxOrder] = await sql`SELECT COALESCE(MAX(sort_order), -1) as max FROM trip_checklist WHERE trip_id = ${tripId}`;
+    const [newItem] = await sql`
+      INSERT INTO trip_checklist (trip_id, user_email, item, category, auto_generated, sort_order)
+      VALUES (${tripId}, ${req.email}, ${item}, ${category || "general"}, false, ${(maxOrder?.max ?? -1) + 1})
+      RETURNING *
+    `;
+    res.json({ ok: true, item: newItem });
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
+// ===========================================================================
+// TRIP COMPANIONS METADATA — PATCH /trips/:tripId/companions/meta
+// Update companions_count and companion_names (quick-set without invite flow)
+// ===========================================================================
+app.patch("/trips/:tripId/companions/meta", auth, async (req, res) => {
+  const { tripId } = req.params;
+  const { companions_count, companion_names } = req.body;
+  try {
+    const [trip] = await sql`SELECT id FROM trips WHERE id = ${tripId} AND user_email = ${req.email}`;
+    if (!trip) return res.status(404).json({ error: "Trip not found" });
+    const [updated] = await sql`
+      UPDATE trips SET
+        companions_count = ${companions_count ?? 1},
+        companion_names  = ${JSON.stringify(companion_names ?? [])}::JSONB,
+        updated_at = NOW()
+      WHERE id = ${tripId} AND user_email = ${req.email}
+      RETURNING id, companions_count, companion_names
+    `;
+    res.json({ ok: true, trip: updated });
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
+// ===========================================================================
+// SHOW NIGHTS — GET /trips/:tripId/show-nights
+// Returns event/show legs with venue timing intel
+// ===========================================================================
+app.get("/trips/:tripId/show-nights", auth, async (req, res) => {
+  const { tripId } = req.params;
+  try {
+    const [trip] = await sql`SELECT * FROM trips WHERE id = ${tripId} AND user_email = ${req.email}`;
+    if (!trip) return res.status(404).json({ error: "Trip not found" });
+
+    // Get event/show legs
+    const eventLegs = await sql`
+      SELECT * FROM trip_legs
+      WHERE trip_id = ${tripId}
+        AND type IN ('event', 'show', 'concert', 'activity')
+      ORDER BY COALESCE(departs_at, arrives_at) ASC
+    `;
+
+    // Also get hotel legs to calculate travel time from hotel to venue
+    const hotelLegs = await sql`
+      SELECT * FROM trip_legs WHERE trip_id = ${tripId} AND type IN ('hotel', 'airbnb')
+      ORDER BY departs_at ASC
+    `;
+
+    // For each event, find the hotel the user is staying at on that night
+    const showNights = [];
+    for (const ev of eventLegs) {
+      const evDate = ev.departs_at ? new Date(ev.departs_at) : null;
+      // Find hotel that overlaps with this event date
+      const hotel = hotelLegs.find(h => {
+        if (!h.departs_at || !h.arrives_at) return false;
+        const checkIn  = new Date(h.departs_at);
+        const checkOut = new Date(h.arrives_at);
+        return evDate && evDate >= checkIn && evDate < checkOut;
+      });
+
+      const venueName = ev.carrier || ev.destination_city || "the venue";
+      const city = ev.destination_city || hotel?.destination_city || trip.title;
+      const showTime = ev.departs_at ? new Date(ev.departs_at).toLocaleTimeString("en-GB", { hour: "2-digit", minute: "2-digit" }) : null;
+
+      // Estimate travel time (rough heuristic — 30-45 min for most venues)
+      const estimatedTravelMins = 45;
+      const recommendedDepartureTime = ev.departs_at
+        ? new Date(new Date(ev.departs_at).getTime() - (estimatedTravelMins + 30) * 60000)
+            .toLocaleTimeString("en-GB", { hour: "2-digit", minute: "2-digit" })
+        : null;
+
+      showNights.push({
+        leg_id: ev.id,
+        event_name: venueName,
+        city,
+        date: ev.departs_at ? new Date(ev.departs_at).toLocaleDateString("en-GB", { weekday: "long", month: "long", day: "numeric" }) : null,
+        show_time: showTime,
+        recommended_departure: recommendedDepartureTime,
+        hotel_name: hotel ? (hotel.carrier || hotel.destination_city || "your hotel") : null,
+        travel_note: hotel
+          ? `Leave ${hotel.carrier || "your hotel"} by ${recommendedDepartureTime || "early"} to arrive before doors open.`
+          : `Allow 45+ minutes travel time to the venue.`,
+        tight_day: false, // will be set below
+      });
+    }
+
+    // Flag tight days (Oct 7 Osaka→Tokyo bullet train + same-day show type scenario)
+    const flightLegs = await sql`SELECT * FROM trip_legs WHERE trip_id = ${tripId} AND type = 'flight' ORDER BY departs_at ASC`;
+    for (const sn of showNights) {
+      const evDate = eventLegs.find(e => e.id === sn.leg_id)?.departs_at;
+      if (!evDate) continue;
+      const evDay = new Date(evDate).toDateString();
+      const sameDay = flightLegs.find(f => f.departs_at && new Date(f.departs_at).toDateString() === evDay);
+      if (sameDay) {
+        sn.tight_day = true;
+        sn.tight_day_note = `You have a flight (${(sameDay.carrier || "") + (sameDay.flight_number || "")} ${sameDay.origin}→${sameDay.destination}) on the same day as this event. Arrive early.`;
+      }
+    }
+
+    res.json({ show_nights: showNights });
+  } catch (e) {
+    console.error("[show-nights]", e.message);
     res.status(500).json({ error: e.message });
   }
 });
