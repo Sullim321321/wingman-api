@@ -8407,35 +8407,18 @@ app.get("/disruption/alternatives", async (req, res) => {
 // POST /trips/:tripId/cascade/restaurant-reschedule — AI-draft reschedule message
 // ===========================================================================
 
-// Helper: send an SMS via Twilio (reuses existing credentials)
-async function sendTwilioSMS(to, body) {
-  const accountSid = process.env.TWILIO_ACCOUNT_SID;
-  const authToken  = process.env.TWILIO_AUTH_TOKEN;
-  const fromNumber = process.env.TWILIO_FROM_NUMBER;
-  if (!accountSid || !authToken || !fromNumber) {
-    console.log("[twilio] credentials not set — SMS skipped:", body);
-    return { ok: false, reason: "twilio_not_configured" };
-  }
-  const url = `https://api.twilio.com/2010-04-01/Accounts/${accountSid}/Messages.json`;
-  const params = new URLSearchParams({ To: to, From: fromNumber, Body: body });
-  const r = await fetch(url, {
-    method: "POST",
-    headers: {
-      "Content-Type": "application/x-www-form-urlencoded",
-      "Authorization": "Basic " + Buffer.from(accountSid + ":" + authToken).toString("base64"),
-    },
-    body: params.toString(),
-  });
-  if (!r.ok) throw new Error("Twilio error: " + (await r.text()));
-  return { ok: true };
-}
+// sendTwilioSMS — PERMANENTLY DELETED.
+// Wingman never sends SMS to third parties (hotels, restaurants, or any travel partner).
+// The cascade endpoints below draft messages for the user to send themselves.
 
 // POST /trips/:tripId/cascade/hotel-notify
-// Sends an SMS or generates a call script to notify the hotel of a late arrival.
-// Body: { leg_id, delay_minutes, hotel_phone? }
+// Drafts a message to notify the hotel of a late arrival.
+// NOTE: Wingman never contacts third parties directly. This endpoint returns a
+// drafted message for the user to send themselves.
+// Body: { leg_id, delay_minutes }
 app.post("/trips/:tripId/cascade/hotel-notify", auth, requirePro, async (req, res) => {
   const { tripId } = req.params;
-  const { leg_id, delay_minutes, hotel_phone } = req.body || {};
+  const { leg_id, delay_minutes } = req.body || {};
   try {
     const legRows = await sql`
       SELECT tl.*, t.user_email FROM trip_legs tl
@@ -8453,29 +8436,22 @@ app.post("/trips/:tripId/cascade/hotel-notify", auth, requirePro, async (req, re
           .toLocaleTimeString("en-US", { hour: "2-digit", minute: "2-digit" })
       : "later than expected";
 
-    const message = `Hi, this is a message on behalf of a guest checking in tonight. Due to a flight delay, they will now arrive at approximately ${newArrival} instead of ${checkinTime}. Please hold the reservation. Thank you.`;
-
-    let smsResult = null;
-    if (hotel_phone) {
-      smsResult = await sendTwilioSMS(hotel_phone, message).catch(e => ({ ok: false, reason: e.message }));
-    }
+    const message = `Hi, I have a reservation tonight checking in at ${checkinTime}. Due to a flight delay, I'll now arrive at approximately ${newArrival}. Could you please hold my reservation? Thank you.`;
 
     await logActivity(
       req.user.email, "cascade_hotel_notify",
-      `Hotel notified: ${hotelName}`,
-      smsResult?.ok
-        ? `SMS sent to ${hotel_phone}: "${message}"`
-        : `Notification drafted (no phone number on file): "${message}"`,
+      `Hotel message drafted: ${hotelName}`,
+      `Message ready to send: "${message}"`,
       tripId, leg_id,
-      { hotel_name: hotelName, delay_minutes, hotel_phone, sms_sent: smsResult?.ok || false }
+      { hotel_name: hotelName, delay_minutes, sms_sent: false }
     );
 
     res.json({
       ok: true,
-      sms_sent: smsResult?.ok || false,
+      sms_sent: false,
       message_drafted: message,
       hotel_name: hotelName,
-      note: hotel_phone ? (smsResult?.ok ? "SMS sent" : "SMS failed — use drafted message") : "No phone number provided — copy the drafted message to contact the hotel directly",
+      note: "Message drafted — copy and send to the hotel directly (call, SMS, or email).",
     });
   } catch (e) {
     console.error("[cascade/hotel-notify]", e.message);
@@ -8485,10 +8461,12 @@ app.post("/trips/:tripId/cascade/hotel-notify", auth, requirePro, async (req, re
 
 // POST /trips/:tripId/cascade/restaurant-reschedule
 // Uses Claude to draft a polite reschedule message for a restaurant reservation.
-// Body: { leg_id, delay_minutes, restaurant_phone? }
+// NOTE: Wingman never contacts third parties directly. Returns a drafted message
+// for the user to send themselves.
+// Body: { leg_id, delay_minutes }
 app.post("/trips/:tripId/cascade/restaurant-reschedule", auth, requirePro, async (req, res) => {
   const { tripId } = req.params;
-  const { leg_id, delay_minutes, restaurant_phone } = req.body || {};
+  const { leg_id, delay_minutes } = req.body || {};
   try {
     const legRows = await sql`
       SELECT tl.*, t.user_email FROM trip_legs tl
@@ -8506,7 +8484,7 @@ app.post("/trips/:tripId/cascade/restaurant-reschedule", auth, requirePro, async
           .toLocaleTimeString("en-US", { hour: "2-digit", minute: "2-digit" })
       : "later";
 
-    // Use Claude to draft a polished message
+    // Use Claude to draft a polished message for the USER to send
     let draftMessage = `Hi ${restName}, I have a reservation tonight at ${resTime}. Due to a flight delay, I'll be arriving at approximately ${newTime} instead. Could you please hold my table? I apologize for any inconvenience.`;
     try {
       const anthropic = getAnthropic();
@@ -8515,31 +8493,26 @@ app.post("/trips/:tripId/cascade/restaurant-reschedule", auth, requirePro, async
         max_tokens: 200,
         messages: [{
           role: "user",
-          content: `Write a brief, polite SMS to ${restName} restaurant asking to push a reservation from ${resTime} to ${newTime} due to a flight delay. Keep it under 160 characters. Just the message text, no quotes.`,
+          content: `Write a brief, polite message to ${restName} restaurant asking to push a reservation from ${resTime} to ${newTime} due to a flight delay. Keep it under 160 characters. Just the message text, no quotes.`,
         }],
       });
       draftMessage = aiResp.content[0]?.text?.trim() || draftMessage;
     } catch {}
 
-    let smsResult = null;
-    if (restaurant_phone) {
-      smsResult = await sendTwilioSMS(restaurant_phone, draftMessage).catch(e => ({ ok: false, reason: e.message }));
-    }
-
     await logActivity(
       req.user.email, "cascade_restaurant_reschedule",
-      `Restaurant contacted: ${restName}`,
-      smsResult?.ok ? `SMS sent: "${draftMessage}"` : `Draft ready: "${draftMessage}"`,
+      `Restaurant message drafted: ${restName}`,
+      `Message ready to send: "${draftMessage}"`,
       tripId, leg_id,
-      { restaurant_name: restName, delay_minutes, restaurant_phone, sms_sent: smsResult?.ok || false }
+      { restaurant_name: restName, delay_minutes, sms_sent: false }
     );
 
     res.json({
       ok: true,
-      sms_sent: smsResult?.ok || false,
+      sms_sent: false,
       message_drafted: draftMessage,
       restaurant_name: restName,
-      note: restaurant_phone ? (smsResult?.ok ? "SMS sent" : "SMS failed — use drafted message") : "Copy this message to contact the restaurant",
+      note: "Message drafted — copy and send to the restaurant directly (call, SMS, or email).",
     });
   } catch (e) {
     console.error("[cascade/restaurant-reschedule]", e.message);
