@@ -4421,13 +4421,13 @@ app.post("/auth/refresh", authLimiter, async (req, res) => {
   }
 });
 
-app.get("/health", (_req, res) => res.json({ ok: true, ts: Date.now(), version: "2.12.0" }));
+app.get("/health", (_req, res) => res.json({ ok: true, ts: Date.now(), version: "2.13.0" }));
 
 // GET /env-status — internal diagnostic (auth required, non-sensitive)
 // Shows which optional API integrations are configured without exposing key values
 app.get("/env-status", auth, (_req, res) => {
   res.json({
-    version: "2.12.0",
+    version: "2.13.0",
     integrations: {
       flightaware:    { configured: !!process.env.FLIGHTAWARE_API_KEY,    label: "FlightAware AeroAPI (primary flight status)" },
       aviationstack:  { configured: !!process.env.AVIATIONSTACK_API_KEY,  label: "AviationStack (fallback flight status, free tier)" },
@@ -10091,5 +10091,17 @@ app.get("/me/offline-snapshot", auth, async (req, res) => {
     res.status(500).json({ error: e.message });
   }
 });
+
+// ---------------------------------------------------------------------------
+// Keep-alive: self-ping every 10 minutes to prevent Render free tier from sleeping
+// ---------------------------------------------------------------------------
+const SELF_URL = process.env.RENDER_EXTERNAL_URL || `http://localhost:${PORT}`;
+setInterval(async () => {
+  try {
+    await fetch(`${SELF_URL}/health`, { signal: AbortSignal.timeout(8000) });
+  } catch (e) {
+    // Silently ignore — this is best-effort
+  }
+}, 10 * 60 * 1000); // every 10 minutes
 
 app.listen(PORT, () => console.log("Wingman API on http://localhost:" + PORT));
