@@ -3072,30 +3072,88 @@ async function getLiveWeather(location) {
 }
 
 // ── Perplexity live search grounding ───────────────────────────────────────────────────────────────────────────────
-async function getPerplexityGrounding(userMessage) {
+async function getPerplexityGrounding(userMessage, userProfile = null) {
   const apiKey = process.env.PERPLEXITY_API_KEY;
   if (!apiKey) return null;
   // Only search for destination/hotel/restaurant queries — skip flight ops queries
-  const needsSearch = /hotel|restaurant|where to stay|where to eat|recommend|best|neighbourhood|neighborhood|things to do|activities|bar|cafe|coffee|brunch|dinner|lunch|breakfast|visit|explore|itinerary/i.test(userMessage);
+  const needsSearch = /hotel|restaurant|where to stay|where to eat|recommend|best|neighbourhood|neighborhood|things to do|activities|bar|cafe|coffee|brunch|dinner|lunch|breakfast|visit|explore|itinerary|plan|planning|trip to|travel to/i.test(userMessage);
   if (!needsSearch) return null;
+
+  // Detect planning mode — run multiple targeted queries in parallel
+  const isPlanningMode = /\b(plan|planning|itinerary|trip to|travel to|tour|cities|nights?|days?|schedule|route)\b/i.test(userMessage) && userMessage.length > 30;
+
   try {
-    const resp = await fetch("https://api.perplexity.ai/chat/completions", {
-      method: "POST",
+    if (isPlanningMode && userProfile) {
+      // Build targeted queries based on user memory
+      const m = userProfile;
+      const gymBrand = m.hotel_must_haves?.match(/technogym/i) ? 'Technogym' : m.hotel_must_haves?.match(/life fitness/i) ? 'Life Fitness' : null;
+      const coldPlunge = m.hotel_must_haves?.match(/cold plunge|ice bath|vitality pool/i);
+      const hotelBrands = m.hotel_brands || null;
+      const tier = m.travel_tier || 'upscale';
+
+      // Extract destination cities from the message
+      const cityMatches = userMessage.match(/\b([A-Z][a-z]+(?:\s+[A-Z][a-z]+)?)\b/g) || [];
+      const likelyCities = cityMatches.filter(c => c.length > 3 && !['Plan','Trip','Travel','Tour','Night','Day','Week'].includes(c));
+
+      // Build targeted search queries
+      const queries = [userMessage]; // always include the original
+      if (gymBrand && likelyCities.length > 0) {
+        queries.push(`${gymBrand} gym hotel ${likelyCities.slice(0,3).join(' ')} ${tier}`);
+      }
+      if (coldPlunge && likelyCities.length > 0) {
+        queries.push(`cold plunge ice bath hotel ${likelyCities.slice(0,3).join(' ')} ${tier}`);
+      }
+      if (hotelBrands && likelyCities.length > 0) {
+        const brands = hotelBrands.split(/[,;]+/).map(b => b.trim()).slice(0,2).join(' OR ');
+        queries.push(`${brands} hotel ${likelyCities.slice(0,3).join(' ')}`);
+      }
+
+      // Run all queries in parallel, combine results
+      const results = await Promise.all(queries.slice(0,3).map(async (q) => {
+        try {
+          const resp = await fetch('https://api.perplexity.ai/chat/completions', {
+            method: 'POST',
+            headers: { 'Authorization': `Bearer ${apiKey}`, 'Content-Type': 'application/json' },
+            body: JSON.stringify({
+              model: 'sonar',
+              messages: [
+                { role: 'system', content: 'You are a travel research assistant. Search the web and return a concise factual summary of current hotel and restaurant recommendations. Include specific property names, current open/closed status, price tier, and any notable amenities. Return plain text, no markdown.' },
+                { role: 'user', content: q }
+              ],
+              max_tokens: 500,
+              search_recency_filter: 'month',
+              return_citations: false,
+            }),
+            signal: AbortSignal.timeout(10000),
+          });
+          if (!resp.ok) return null;
+          const data = await resp.json();
+          return data.choices?.[0]?.message?.content || null;
+        } catch { return null; }
+      }));
+
+      const combined = results.filter(Boolean).join('\n\n---\n\n');
+      return combined || null;
+    }
+
+    // Standard single-query mode
+    const resp = await fetch('https://api.perplexity.ai/chat/completions', {
+      method: 'POST',
       headers: {
-        "Authorization": `Bearer ${apiKey}`,
-        "Content-Type": "application/json",
+        'Authorization': `Bearer ${apiKey}`,
+        'Content-Type': 'application/json',
       },
       body: JSON.stringify({
-        model: "sonar",
+        model: 'sonar',
         messages: [
           {
-            role: "system",
-            content: "You are a travel research assistant. Given a user's travel question, search the web and return a concise, factual summary of current recommendations. Focus on: specific hotel names with current status (open/closed), restaurant names with current status, neighbourhood descriptions, and any recent openings or closures. Be specific and cite recency where possible. Return plain text, no markdown headers."
+            role: 'system',
+            content: 'You are a travel research assistant. Given a user\'s travel question, search the web and return a concise, factual summary of current recommendations. Focus on: specific hotel names with current status (open/closed), restaurant names with current status, neighbourhood descriptions, and any recent openings or closures. Be specific and cite recency where possible. Return plain text, no markdown headers.'
           },
-          { role: "user", content: userMessage }
+          { role: 'user', content: userMessage }
         ],
         max_tokens: 600,
-        search_recency_filter: "month",
+        search_recency_filter: 'month',
         return_citations: false,
       }),
       signal: AbortSignal.timeout(8000),
@@ -3104,7 +3162,7 @@ async function getPerplexityGrounding(userMessage) {
     const data = await resp.json();
     return data.choices?.[0]?.message?.content || null;
   } catch (e) {
-    console.error("[perplexity]", e.message);
+    console.error('[perplexity]', e.message);
     return null;
   }
 }
@@ -3273,6 +3331,8 @@ app.post("/concierge", conciergeLimiter, async (req, res) => {
       : location?.lat
       ? `User's current coordinates: ${location.lat.toFixed(4)}, ${(location.lon || location.lng || 0).toFixed(4)}`
       : null;
+    // Detect planning intent — used to switch to planning mode (more tokens, targeted Perplexity queries)
+    const isPlanningMode = /\b(plan|planning|itinerary|trip to|travel to|tour|cities|nights?|days?|schedule|route)\b/i.test(message) && message.length > 30;
     // Detect transit/navigation intent for route lookup
     const transitIntentRegex = /how (do i|can i|to) (get|go|travel|commute|take|reach)|directions? (to|from)|transit|bus|metro|subway|train|tram|tube|underground|from .+ to .+|get (from|to) .+|route (to|from)/i;
     const transitMatch = message.match(/(?:from|get to|go to|travel to|directions? to|how (?:do i|can i) get to)\s+(.+?)(?:\s+from\s+(.+?))?(?:\?|$)/i);
@@ -3283,7 +3343,7 @@ app.post("/concierge", conciergeLimiter, async (req, res) => {
     const [placesResults, liveWeather, liveSearchContext, transitRoute] = await Promise.all([
       getPlacesGrounding(message, location).catch(() => []),
       getLiveWeather(location).catch(() => null),
-      getPerplexityGrounding(message).catch(() => null),
+      getPerplexityGrounding(message, userMemory).catch(() => null),
       (isTransitQuery && transitDest) ? getTransitRoute(transitOrigin, transitDest, location).catch(() => null) : Promise.resolve(null),
     ]);
 
@@ -3556,12 +3616,27 @@ LOGISTICS & PLANNING
 - End your response with: ACTION:{"type":"book","label":"<button label>","url":"<url>"} on its own line when a direct booking link is available — the app will render this as a tappable button. Only include one ACTION per response.
 - If no direct URL is available, say so honestly and suggest the best alternative (phone number, walk-in timing, etc.)
 
-=== TRIP PLANNING ===
-- When the user asks you to plan a trip, create an itinerary, or suggests visiting multiple cities, provide a detailed day-by-day plan in your reply.
-- After your full text reply, emit a PLAN tag on its own line with a compact JSON object (no newlines inside the JSON):
-  PLAN:{"title":"<trip name>","cities":["<city1>","<city2>",...],"nights":<total nights>,"legs":[{"from":"<city>","to":"<city>","date":"<YYYY-MM-DD>","type":"flight"},...],"highlights":["<key highlight 1>","<key highlight 2>","<key highlight 3>"]}
-- The PLAN tag allows the app to render a "Create this trip" button so the user can instantly add the trip to Wingman for monitoring.
-- Only emit one PLAN tag per response. Only emit it when you have actually planned a multi-city trip (not for single-destination or day-trip queries).`;
+=== TRIP PLANNING MODE ===
+When the user asks you to plan a trip, build an itinerary, or mentions visiting multiple cities or destinations:
+
+1. CLARIFYING QUESTIONS FIRST (if dates, companions, or purpose are missing): Ask 1-2 targeted questions before planning. Keep it brief — one question per unknown. Do not ask about things you already know from the user's profile (e.g. don't ask about hotel preferences if you already know them from memory).
+
+2. WHEN YOU HAVE ENOUGH CONTEXT: Build a detailed day-by-day plan. For each city:
+   - Recommend a specific hotel (name it, explain why it fits this user's profile — reference their must-haves like cold plunge, Technogym, gym brand)
+   - Note which loyalty program is accepted and whether their status applies
+   - Suggest 1-2 restaurants per city (specific names, not generic descriptions)
+   - Flag any training/recovery considerations if relevant (e.g. "The Aman has a 25m lap pool — good for quality sessions")
+   - Note the best neighbourhood to stay in and why
+
+3. FLIGHT ROUTING: When recommending flights between cities, consider:
+   - The user's airline status and alliance (route through hubs where their status is recognised)
+   - Suggest specific routing (e.g. LHR → NRT on BA, connecting in London to earn Avios)
+   - Flag if a route requires a connection and whether it's worth it vs direct
+
+4. PLAN TAG: After your full text reply, emit a PLAN tag on its own line with a compact JSON object (no newlines inside the JSON):
+  PLAN:{"title":"<trip name>","cities":["<city1>","<city2>",...],"nights":<total nights>,"legs":[{"from":"<city>","to":"<city>","date":"<YYYY-MM-DD>","type":"flight","routing":"<e.g. LHR-NRT on BA"},{"city":"<city>","hotel":"<specific hotel name>","nights":<n>,"check_in":"<YYYY-MM-DD>","loyalty_program":"<program>","why":"<one sentence why it fits this user>"},...],"highlights":["<key highlight 1>","<key highlight 2>","<key highlight 3>"],"training_notes":"<optional: quality windows, rest days, pool/gym notes>"}
+- Only emit one PLAN tag per response. Only emit it when you have actually built a multi-city trip plan (not for single questions or day-trip queries).
+- The PLAN tag allows the app to render a "Save this trip" button so the user can instantly add the itinerary to Wingman.`;
 
 
     // Scrub PII from history messages too
@@ -3580,7 +3655,7 @@ LOGISTICS & PLANNING
         const claudeResp = await Promise.race([
       getAnthropic().messages.create({
         model: "claude-sonnet-4-5",
-        max_tokens: 1000,
+        max_tokens: isPlanningMode ? 2500 : 1000,
         system: systemMsg,
         messages: chatMessages,
       }),
