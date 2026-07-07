@@ -3636,7 +3636,31 @@ When the user asks you to plan a trip, build an itinerary, or mentions visiting 
 4. PLAN TAG: After your full text reply, emit a PLAN tag on its own line with a compact JSON object (no newlines inside the JSON):
   PLAN:{"title":"<trip name>","cities":["<city1>","<city2>",...],"nights":<total nights>,"legs":[{"from":"<city>","to":"<city>","date":"<YYYY-MM-DD>","type":"flight","routing":"<e.g. LHR-NRT on BA"},{"city":"<city>","hotel":"<specific hotel name>","nights":<n>,"check_in":"<YYYY-MM-DD>","loyalty_program":"<program>","why":"<one sentence why it fits this user>"},...],"highlights":["<key highlight 1>","<key highlight 2>","<key highlight 3>"],"training_notes":"<optional: quality windows, rest days, pool/gym notes>"}
 - Only emit one PLAN tag per response. Only emit it when you have actually built a multi-city trip plan (not for single questions or day-trip queries).
-- The PLAN tag allows the app to render a "Save this trip" button so the user can instantly add the itinerary to Wingman.`;
+- The PLAN tag allows the app to render a "Save this trip" button so the user can instantly add the itinerary to Wingman.
+
+=== TRIP WRITE-BACK (modifying existing trips from chat) ===
+You have access to the user's trips listed above, including their trip IDs and leg IDs. When the user asks you to modify their trips — add a leg, change a date, delete a leg, rename a trip — you can do it directly.
+
+After your text reply, emit a WRITE tag on its own line with a compact JSON command (no newlines inside the JSON):
+
+To ADD a leg to an existing trip:
+  WRITE:{"action":"add_leg","trip_id":"<trip id>","leg":{"type":"flight|hotel|car|train","carrier":"<airline or hotel name>","flight_number":"<flight number if flight>","origin":"<IATA or city>","destination":"<IATA or city>","departs_at":"<ISO8601>","arrives_at":"<ISO8601 or null>","cabin_class":"<economy|business|first>","nights":<number if hotel>,"property_name":"<hotel name if hotel>"}}
+
+To UPDATE an existing leg:
+  WRITE:{"action":"update_leg","trip_id":"<trip id>","leg_id":"<leg id>","updates":{"<field>":"<new value>"}}
+
+To DELETE a leg:
+  WRITE:{"action":"delete_leg","trip_id":"<trip id>","leg_id":"<leg id>"}
+
+To UPDATE trip metadata (title, status):
+  WRITE:{"action":"update_trip","trip_id":"<trip id>","updates":{"title":"<new title>"}}
+
+Rules:
+- Only emit a WRITE tag when the user explicitly asks you to make a change to their trips
+- Always confirm what you did in your text reply (e.g. "Done — I've added the Park Hyatt Tokyo check-in to your Asia trip.")
+- Only emit one WRITE tag per response
+- Never emit a WRITE tag for planning/research responses — only for confirmed changes the user has asked for
+- If the trip_id or leg_id you need is not in the trips list above, tell the user you can't find it and ask them to check their Trips screen`;
 
 
     // Scrub PII from history messages too
@@ -3695,16 +3719,73 @@ When the user asks you to plan a trip, build an itinerary, or mentions visiting 
     // Extract PLAN tag — structured trip plan returned when Claude plans a multi-city trip
     // Format: PLAN:{"title":"...","cities":[...],"nights":19,"legs":[...],"highlights":[...]}
     let tripPlan = null;
-    const planMatch = rawReply.match(/PLAN:(\{[\s\S]+?\})(?:\n|$)/m);
+    const planMatch = rawReply.match(/PLAN:({[\s\S]+?})(?:\n|$)/m);
     if (planMatch) {
       try { tripPlan = JSON.parse(planMatch[1]); } catch {}
     }
+
+    // Extract WRITE tag — server-side trip/leg mutations emitted by Claude
+    // Format: WRITE:{"action":"add_leg","trip_id":"...","leg":{...}}
+    // Format: WRITE:{"action":"update_leg","trip_id":"...","leg_id":"...","updates":{...}}
+    // Format: WRITE:{"action":"delete_leg","trip_id":"...","leg_id":"..."}
+    // Format: WRITE:{"action":"update_trip","trip_id":"...","updates":{...}}
+    let writeResult = null;
+    const writeMatch = rawReply.match(/WRITE:({[^\n]+})/m);
+    if (writeMatch) {
+      try {
+        const cmd = JSON.parse(writeMatch[1]);
+        if (cmd.action === 'add_leg' && cmd.trip_id && cmd.leg) {
+          // Verify ownership
+          const tr = await sql`SELECT id FROM trips WHERE id = ${cmd.trip_id} AND user_email = ${email}`;
+          if (tr.length) {
+            const leg = cmd.leg;
+            const ins = await sql`
+              INSERT INTO trip_legs (trip_id, type, carrier, flight_number, origin, destination, departs_at, arrives_at, confirmation, property_name, cabin_class, seat, nights, guests)
+              VALUES (${cmd.trip_id}, ${leg.type||'flight'}, ${leg.carrier||null}, ${leg.flight_number||null}, ${leg.origin||null}, ${leg.destination||null}, ${leg.departs_at||null}, ${leg.arrives_at||null}, ${leg.confirmation||null}, ${leg.property_name||null}, ${leg.cabin_class||null}, ${leg.seat||null}, ${leg.nights||null}, ${leg.guests||null})
+              RETURNING *
+            `;
+            writeResult = { action: 'add_leg', leg: ins[0] };
+          }
+        } else if (cmd.action === 'update_leg' && cmd.trip_id && cmd.leg_id && cmd.updates) {
+          const tr = await sql`SELECT id FROM trips WHERE id = ${cmd.trip_id} AND user_email = ${email}`;
+          if (tr.length) {
+            const allowed = ['type','carrier','flight_number','origin','destination','departs_at','arrives_at','confirmation','property_name','cabin_class','seat','nights','guests'];
+            const fields = Object.keys(cmd.updates).filter(k => allowed.includes(k));
+            for (const f of fields) {
+              await sql`UPDATE trip_legs SET ${sql(f)} = ${cmd.updates[f]||null} WHERE id = ${cmd.leg_id} AND trip_id = ${cmd.trip_id}`;
+            }
+            const upd = await sql`SELECT * FROM trip_legs WHERE id = ${cmd.leg_id}`;
+            writeResult = { action: 'update_leg', leg: upd[0] };
+          }
+        } else if (cmd.action === 'delete_leg' && cmd.trip_id && cmd.leg_id) {
+          const tr = await sql`SELECT id FROM trips WHERE id = ${cmd.trip_id} AND user_email = ${email}`;
+          if (tr.length) {
+            await sql`DELETE FROM trip_legs WHERE id = ${cmd.leg_id} AND trip_id = ${cmd.trip_id}`;
+            writeResult = { action: 'delete_leg', leg_id: cmd.leg_id };
+          }
+        } else if (cmd.action === 'update_trip' && cmd.trip_id && cmd.updates) {
+          const tr = await sql`SELECT id FROM trips WHERE id = ${cmd.trip_id} AND user_email = ${email}`;
+          if (tr.length) {
+            const allowed = ['title','status','mode','companions_count','companion_names'];
+            const fields = Object.keys(cmd.updates).filter(k => allowed.includes(k));
+            for (const f of fields) {
+              await sql`UPDATE trips SET ${sql(f)} = ${cmd.updates[f]||null} WHERE id = ${cmd.trip_id}`;
+            }
+            writeResult = { action: 'update_trip', trip_id: cmd.trip_id };
+          }
+        }
+      } catch (we) {
+        console.error('[concierge/write]', we.message);
+      }
+    }
+
     // Also detect planning intent heuristically and ask Claude to emit a PLAN tag
     const planningIntent = !tripPlan && /\b(plan|planning|itinerary|trip to|travel to|visit|tour|cities|nights?|days?)\b/i.test(rawMessage) && rawMessage.length > 40;
     // (The system prompt instructs Claude to emit PLAN: when it detects trip planning; this is a fallback)
     const reply = rawReply
       .replace(/^ACTION:\{[^\n]+\}\s*$/gm, '') // remove ACTION line
       .replace(/^PLAN:\{[\s\S]+?\}\s*$/gm, '') // remove PLAN line
+      .replace(/^WRITE:\{[^\n]+\}\s*$/gm, '') // remove WRITE line
       .replace(/^#{1,6}\s+/gm, '')              // remove # headings
       .replace(/\*\*([^*]+)\*\*/g, '$1')        // remove **bold**
       .replace(/\*([^*]+)\*/g, '$1')            // remove *italic*
@@ -3713,7 +3794,7 @@ When the user asks you to plan a trip, build an itinerary, or mentions visiting 
       .trim();
     // Award points for first concierge message (idempotent)
     awardPoints(email, "concierge_first").catch(() => {});
-    res.json({ ok: true, reply, places: placesResults.length > 0 ? placesResults : undefined, weather: liveWeather || undefined, action: bookingAction || undefined, transit: transitRoute || undefined, plan: tripPlan || undefined });
+    res.json({ ok: true, reply, places: placesResults.length > 0 ? placesResults : undefined, weather: liveWeather || undefined, action: bookingAction || undefined, transit: transitRoute || undefined, plan: tripPlan || undefined, write: writeResult || undefined });
   } catch (e) {
     console.error("[concierge]", e.message);
     const isTimeout = e.name === "TimeoutError" || e.message?.includes("timeout");
