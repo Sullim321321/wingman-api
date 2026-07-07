@@ -677,6 +677,19 @@ async function bootstrapDB() {
       )
     `;
     await sql`CREATE INDEX IF NOT EXISTS idx_user_instructions_email ON user_instructions(user_email, created_at DESC)`;
+
+    // ── Persistent user memory document ──────────────────────────────────────
+    // A structured JSON document that accumulates everything Wingman learns about
+    // the user over time — from chat, booking history, and explicit profile edits.
+    await sql`
+      CREATE TABLE IF NOT EXISTS user_memory (
+        id SERIAL PRIMARY KEY,
+        user_email TEXT NOT NULL UNIQUE,
+        memory JSONB NOT NULL DEFAULT '{}',
+        updated_at TIMESTAMPTZ DEFAULT NOW()
+      )
+    `;
+    await sql`CREATE INDEX IF NOT EXISTS idx_user_memory_email ON user_memory(user_email)`;
         console.log("[db] tables ready");
   } catch (e) {
     console.error("[db] bootstrap error:", e.message);
@@ -3097,6 +3110,132 @@ async function getPerplexityGrounding(userMessage) {
 }
 
 // ---------------------------------------------------------------------------
+// GET /me/memory — return the user's current memory document
+// PATCH /me/memory — allow the user to directly update or correct their memory
+// DELETE /me/memory/:field — remove a specific field from memory
+// ---------------------------------------------------------------------------
+app.get("/me/memory", async (req, res) => {
+  const email = await verifyAccessToken(req);
+  if (!email) return res.status(401).json({ error: "unauthorized" });
+  try {
+    const rows = await sql`SELECT memory, updated_at FROM user_memory WHERE user_email = ${email}`;
+    res.json({ ok: true, memory: rows[0]?.memory || {}, updated_at: rows[0]?.updated_at || null });
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
+app.patch("/me/memory", async (req, res) => {
+  const email = await verifyAccessToken(req);
+  if (!email) return res.status(401).json({ error: "unauthorized" });
+  try {
+    const updates = req.body || {};
+    if (Object.keys(updates).length === 0) return res.status(400).json({ error: "no fields" });
+    // Fetch existing and merge
+    const rows = await sql`SELECT memory FROM user_memory WHERE user_email = ${email}`;
+    const existing = rows[0]?.memory || {};
+    const merged = { ...existing, ...updates };
+    await sql`
+      INSERT INTO user_memory (user_email, memory, updated_at)
+      VALUES (${email}, ${JSON.stringify(merged)}::jsonb, NOW())
+      ON CONFLICT (user_email) DO UPDATE
+      SET memory = ${JSON.stringify(merged)}::jsonb, updated_at = NOW()
+    `;
+    res.json({ ok: true, memory: merged });
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
+app.delete("/me/memory/:field", async (req, res) => {
+  const email = await verifyAccessToken(req);
+  if (!email) return res.status(401).json({ error: "unauthorized" });
+  try {
+    const field = req.params.field;
+    await sql`
+      UPDATE user_memory
+      SET memory = memory - ${field}, updated_at = NOW()
+      WHERE user_email = ${email}
+    `;
+    res.json({ ok: true, deleted: field });
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
+// ---------------------------------------------------------------------------
+// extractAndUpdateMemory — background function that learns about the user
+// from each conversation turn and persists it to user_memory
+// ---------------------------------------------------------------------------
+async function extractAndUpdateMemory(email, userMessage, assistantReply, existingMemory) {
+  // Only run if the message contains personal context worth learning
+  const personalSignals = /\b(i am|i'm|i have|i've|i fly|i stay|i train|i run|i work|i travel|my|mine|i prefer|i like|i love|i hate|i don't|i need|i want|i always|i never|we are|we're|my partner|my husband|my wife|my boyfriend|my girlfriend|my friend|my colleague|my team|passport|status|tier|alliance|mosaic|gold|platinum|diamond|elite|business class|first class|cold plunge|technogym|marathon|5k|10k|half marathon|race|coach|physio|training)\b/i;
+  if (!personalSignals.test(userMessage) && !personalSignals.test(assistantReply)) return;
+
+  try {
+    const extractPrompt = `You are a memory extraction system for a travel concierge app. Your job is to extract factual, persistent facts about the user from a conversation turn and merge them into their existing memory profile.
+
+Existing memory:
+${JSON.stringify(existingMemory, null, 2)}
+
+New conversation:
+User: ${userMessage}
+Assistant: ${assistantReply}
+
+Extract any NEW facts about the user that are worth remembering long-term. Only extract things that are stable personal attributes — not transient questions or one-off requests. Focus on:
+- Identity/context (who they are, what they do, where they're based)
+- Travel style and tier (luxury, upscale, budget; how they like to travel)
+- Loyalty programs and airline/hotel status
+- Cabin preferences (always business on long-haul, etc.)
+- Hotel brand preferences and must-haves (cold plunge, lap pool, Technogym, etc.)
+- Typical travel companions (solo, with partner, with friend, etc.)
+- Training/fitness goals (race dates, distances, training phase)
+- Recovery requirements (cold plunge, pool, massage, etc.)
+- Food/dining preferences and restrictions
+- Interests and things they enjoy
+- Things they dislike or want to avoid
+- Passport/nationality
+- Home base city
+
+Return ONLY a JSON object with fields to UPDATE in the memory. Use these exact field names:
+identity, travel_style, travel_tier, passport, home_base, loyalty_alliance, loyalty_notes, cabin_default, airline_notes, hotel_brands, hotel_must_haves, food_notes, companions, training, recovery, work_context, interests, dislikes, misc (array of freeform notes)
+
+If nothing new was learned, return {}. Do not repeat things already in the existing memory. Do not invent or infer things not stated. Return only valid JSON, no explanation.`;
+
+    const resp = await getAnthropic().messages.create({
+      model: 'claude-haiku-4-5',
+      max_tokens: 400,
+      messages: [{ role: 'user', content: extractPrompt }],
+    });
+    const raw = resp.content[0].text.trim();
+    // Parse JSON — strip any markdown fences
+    const jsonStr = raw.replace(/^```json?\s*/i, '').replace(/\s*```$/, '').trim();
+    const updates = JSON.parse(jsonStr);
+    if (!updates || typeof updates !== 'object' || Object.keys(updates).length === 0) return;
+
+    // Merge misc arrays rather than overwriting
+    const merged = { ...existingMemory };
+    for (const [k, v] of Object.entries(updates)) {
+      if (k === 'misc') {
+        merged.misc = [...(merged.misc || []), ...(Array.isArray(v) ? v : [v])].slice(-20);
+      } else if (v !== null && v !== undefined && v !== '') {
+        merged[k] = v;
+      }
+    }
+
+    await sql`
+      INSERT INTO user_memory (user_email, memory, updated_at)
+      VALUES (${email}, ${JSON.stringify(merged)}::jsonb, NOW())
+      ON CONFLICT (user_email) DO UPDATE
+      SET memory = ${JSON.stringify(merged)}::jsonb, updated_at = NOW()
+    `;
+  } catch (e) {
+    // Silent failure — memory extraction is best-effort
+    console.error('[memory-extract]', e.message);
+  }
+}
+
+// ---------------------------------------------------------------------------
 // POST /concierge — LLM chat with trip context
 // ---------------------------------------------------------------------------
 app.post("/concierge", conciergeLimiter, async (req, res) => {
@@ -3107,14 +3246,15 @@ app.post("/concierge", conciergeLimiter, async (req, res) => {
   // Scrub PII from user message before it reaches Anthropic
   const message = scrubPII(rawMessage);
   try {
-    // Fetch user preferences (taste graph), trips, loyalty accounts, and hotel affinity in parallel
-    const [userRows, rawTrips, rawLegs, loyaltyAccounts, hotelAffinity, savedInstructions] = await Promise.all([
-      sql`SELECT preferences, COALESCE(revealed_preferences, '{}') as revealed_preferences FROM users WHERE email = ${email}`,
+    // Fetch user preferences (taste graph), trips, loyalty accounts, hotel affinity, and memory in parallel
+    const [userRows, rawTrips, rawLegs, loyaltyAccounts, hotelAffinity, savedInstructions, memoryRows] = await Promise.all([
+      sql`SELECT preferences, first_name, COALESCE(revealed_preferences, '{}') as revealed_preferences FROM users WHERE email = ${email}`,
       sql`SELECT id, title, status, mode, created_at, companions_count, companion_names FROM trips WHERE user_email = ${email} ORDER BY created_at DESC LIMIT 10`,
       sql`SELECT tl.* FROM trip_legs tl INNER JOIN trips t ON tl.trip_id = t.id WHERE t.user_email = ${email} ORDER BY tl.departs_at ASC NULLS LAST`,
       sql`SELECT program, points_balance, elite_status, elite_level_next, points_to_next_level, nights_ytd, segments_ytd FROM loyalty_accounts WHERE user_email = ${email} ORDER BY program ASC`,
       sql`SELECT property_name, brand, city, country, tier, attributes, stay_count, last_stayed FROM hotel_affinity WHERE user_email = ${email} ORDER BY stay_count DESC, last_stayed DESC LIMIT 20`,
-      sql`SELECT instruction FROM user_instructions WHERE user_email = ${email} ORDER BY created_at DESC LIMIT 20`
+      sql`SELECT instruction FROM user_instructions WHERE user_email = ${email} ORDER BY created_at DESC LIMIT 20`,
+      sql`SELECT memory FROM user_memory WHERE user_email = ${email}`,
     ]);
     // Assemble trips with legs (avoids json_agg ORDER BY Neon compatibility issue)
     const legsByTrip = {};
@@ -3125,6 +3265,8 @@ app.post("/concierge", conciergeLimiter, async (req, res) => {
     const trips = rawTrips.map(t => ({ ...t, legs: legsByTrip[t.id] || [] }));
     const prefs = userRows[0]?.preferences || {};
     const revealedPrefs = userRows[0]?.revealed_preferences || {};
+    const firstName = userRows[0]?.first_name || null;
+    const userMemory = memoryRows[0]?.memory || {};
     const today = new Date().toISOString();
     const locationContext = location?.city
       ? `User's current location: ${location.city}${location.country ? ', ' + location.country : ''}${location.lat ? ` (${location.lat.toFixed(3)}, ${location.lon?.toFixed(3) || location.lng?.toFixed(3)})` : ''}`
@@ -3208,6 +3350,19 @@ app.post("/concierge", conciergeLimiter, async (req, res) => {
     const hotelPrefs = (prefs.hotel_prefs || []);
     const seatPrefs = (prefs.seat_prefs || []);
     const foodPrefs = (prefs.food_prefs || []);
+    // Phase 1: extended profile fields
+    const loyaltyAlliance = prefs.loyalty_alliance || null;
+    const loyaltyPrograms = prefs.loyalty_programs || [];
+    const trainingActive = prefs.training_active || false;
+    const raceDate = prefs.race_date || null;
+    const raceDistance = prefs.race_distance || null;
+    const trainingPhase = prefs.training_phase || null;
+    const gymBrandPref = prefs.gym_brand_pref || null;
+    const coldPlungeReq = prefs.cold_plunge_req || false;
+    const poolReq = prefs.pool_req || false;
+    const companionDefault = prefs.companion_default || null;
+    const travelTier = prefs.travel_tier || null;
+    const passportCountry = prefs.passport_country || null;
     const SOURCE_LABELS = {
       nyt36: "NYT 36 Hours (dense city itineraries)",
       service95: "Service95 (Dua Lipa's cultural concierge — arts, dining, nightlife)",
@@ -3286,11 +3441,43 @@ ${savedInstructions.map(r => `  - ${r.instruction}`).join("\n")}
 `
       : "";
 
+    // Build user memory section — the persistent contextual profile
+    const memorySection = (() => {
+      const m = userMemory;
+      if (!m || Object.keys(m).length === 0) return null;
+      const lines = [];
+      if (firstName) lines.push(`Name: ${firstName}`);
+      if (m.identity)       lines.push(`About: ${m.identity}`);
+      if (m.travel_style)   lines.push(`Travel style: ${m.travel_style}`);
+      if (m.travel_tier)    lines.push(`Tier: ${m.travel_tier}`);
+      if (m.passport)       lines.push(`Passport: ${m.passport}`);
+      if (m.home_base)      lines.push(`Home base: ${m.home_base}`);
+      if (m.loyalty_alliance) lines.push(`Alliance: ${m.loyalty_alliance}`);
+      if (m.loyalty_notes)  lines.push(`Loyalty: ${m.loyalty_notes}`);
+      if (m.cabin_default)  lines.push(`Default cabin: ${m.cabin_default}`);
+      if (m.airline_notes)  lines.push(`Airline preferences: ${m.airline_notes}`);
+      if (m.hotel_brands)   lines.push(`Preferred hotel brands: ${m.hotel_brands}`);
+      if (m.hotel_must_haves) lines.push(`Hotel must-haves: ${m.hotel_must_haves}`);
+      if (m.food_notes)     lines.push(`Food/dining: ${m.food_notes}`);
+      if (m.companions)     lines.push(`Typical travel companions: ${m.companions}`);
+      if (m.training)       lines.push(`Training/fitness: ${m.training}`);
+      if (m.recovery)       lines.push(`Recovery requirements: ${m.recovery}`);
+      if (m.work_context)   lines.push(`Work context: ${m.work_context}`);
+      if (m.interests)      lines.push(`Interests: ${m.interests}`);
+      if (m.dislikes)       lines.push(`Dislikes/avoid: ${m.dislikes}`);
+      if (m.misc && Array.isArray(m.misc)) m.misc.forEach(note => lines.push(`Note: ${note}`));
+      if (lines.length === 0) return null;
+      return `=== WHO THIS USER IS (persistent memory — treat as ground truth) ===
+This is everything Wingman has learned about this user over time. Use it to inform every response without the user needing to re-explain themselves.
+${lines.join("\n")}
+`;
+    })();
+
     const systemPrompt = `You are Wingman — a world-class AI travel concierge and destination intelligence engine. You combine the knowledge of a seasoned luxury travel editor, a Michelin-starred restaurant scout, a hotel critic, and a local fixer in every city on earth. You have real-time access to the user's trips, live flight statuses, and weather disruption risk scores. You know this user's personal taste profile and editorial preferences — use them to give recommendations that feel like they came from a trusted friend with impeccable taste and deep local knowledge, not a generic algorithm.
 
 Today's date/time: ${today}
-User: ${email}
-${instructionsSection}${tasteSection ? `=== USER'S TASTE PROFILE ===\n${tasteSection}\n` : ""}
+User: ${firstName ? firstName + ' (' + email + ')' : email}
+${memorySection || ''}${instructionsSection}${tasteSection ? `=== USER'S TASTE PROFILE ===\n${tasteSection}\n` : ""}
 ${loyaltySummary ? `=== USER'S LOYALTY ACCOUNTS ===\n${loyaltySummary}\n\nWhen recommending hotels, always factor in which programs the user has status with and suggest properties where their status will be recognized. When advising on flights, factor in their airline status and miles balance — suggest using miles for upgrades when the balance is high.\n` : ""}
 ${locationContext ? `=== USER'S CURRENT LOCATION ===\n${locationContext}\nUse this to give hyper-local recommendations. If the user asks "what should I do" or "where should I eat" without specifying a city, assume they mean right now, right here.\n` : ""}
 ${liveWeather ? `=== LIVE WEATHER AT USER'S LOCATION ===\nCurrently ${liveWeather.temp}\u00b0C (feels like ${liveWeather.feels}\u00b0C), ${liveWeather.desc}${liveWeather.windKph ? `, wind ${liveWeather.windKph} km/h` : ''}${liveWeather.humidity ? `, humidity ${liveWeather.humidity}%` : ''}.\nUse this when the user asks about weather, what to wear, or whether to go outside.\n` : ""}
@@ -3419,6 +3606,10 @@ LOGISTICS & PLANNING
         }
       }
     }
+
+    // ── Persistent memory: silently extract and update user memory from conversation ──
+    // Run async in background — does not block the response
+    extractAndUpdateMemory(email, rawMessage, rawReply, userMemory).catch(() => {});
     // Extract ACTION tag before stripping
     let bookingAction = null;
     const actionMatch = rawReply.match(/ACTION:(\{[^\n]+\})/m);
@@ -8000,6 +8191,19 @@ app.get("/me/travel-profile", async (req, res) => {
       notify_gate_change:  prefs.notify_gate_change  !== false,
       notify_delay:        prefs.notify_delay        !== false,
       notify_journey:      prefs.notify_journey      !== false, // traffic/buffer alerts
+      // === Phase 1 additions: loyalty alliance, training, recovery, companion ===
+      loyalty_alliance:    prefs.loyalty_alliance    || null,   // "star" | "oneworld" | "skyteam" | null
+      loyalty_programs:    prefs.loyalty_programs    || [],     // [{program, tier, number, is_primary}]
+      training_active:     prefs.training_active     || false,  // currently in a training block
+      race_date:           prefs.race_date           || null,   // ISO date of target race
+      race_distance:       prefs.race_distance       || null,   // "5k" | "10k" | "half" | "marathon"
+      training_phase:      prefs.training_phase      || null,   // "base" | "build" | "peak" | "taper"
+      gym_brand_pref:      prefs.gym_brand_pref      || null,   // "technogym" | "life_fitness" | "precor" | "any"
+      cold_plunge_req:     prefs.cold_plunge_req     || false,  // requires cold plunge / ice bath
+      pool_req:            prefs.pool_req            || false,  // requires lap pool
+      companion_default:   prefs.companion_default   || "solo", // "solo" | "partner" | "friend" | "family"
+      travel_tier:         prefs.travel_tier         || "upscale", // "budget" | "midrange" | "upscale" | "luxury"
+      passport_country:    prefs.passport_country    || null,   // primary passport country code e.g. "US"
     };
     res.json({ ok: true, profile });
   } catch (e) {
@@ -8017,6 +8221,11 @@ app.patch("/me/travel-profile", async (req, res) => {
       "payment_methods", "dietary", "currency", "display_name",
       "min_connection_mins", "auto_checkin", "notify_gate_change",
       "notify_delay", "notify_journey",
+      // Phase 1 additions
+      "loyalty_alliance", "loyalty_programs",
+      "training_active", "race_date", "race_distance", "training_phase",
+      "gym_brand_pref", "cold_plunge_req", "pool_req",
+      "companion_default", "travel_tier", "passport_country",
     ];
     const updates = {};
     for (const k of allowed) {
