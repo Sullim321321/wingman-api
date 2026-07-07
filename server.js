@@ -690,6 +690,20 @@ async function bootstrapDB() {
       )
     `;
     await sql`CREATE INDEX IF NOT EXISTS idx_user_memory_email ON user_memory(user_email)`;
+    await sql`
+      CREATE TABLE IF NOT EXISTS race_events (
+        id SERIAL PRIMARY KEY,
+        user_email TEXT NOT NULL,
+        name TEXT NOT NULL,
+        distance TEXT,
+        race_date DATE NOT NULL,
+        location TEXT,
+        goal_time TEXT,
+        notes TEXT,
+        created_at TIMESTAMPTZ DEFAULT NOW()
+      )
+    `;
+    await sql`CREATE INDEX IF NOT EXISTS idx_race_events_email ON race_events(user_email)`;
         console.log("[db] tables ready");
   } catch (e) {
     console.error("[db] bootstrap error:", e.message);
@@ -5152,11 +5166,12 @@ async function pollDisruptions() {
 
       // Send push notification (only for actionable events)
       if (pushTitle) {
+        const isDisruption = newStatus === "Cancelled" || newStatus === "Delayed";
         await sendPushToUser(leg.user_email, pushTitle, pushBody, {
-          route: newStatus === "Cancelled" || newStatus === "Delayed" ? "Alert" : "Activity",
+          route: isDisruption ? "Disruption" : "Activity",
           tripId: String(leg.trip_id),
-          legId: String(leg.id),
-          flightIdent: ident,
+          legId:  String(leg.id),
+          ident,
         });
       }
 
