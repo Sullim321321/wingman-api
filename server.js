@@ -2078,57 +2078,97 @@ function extractEmailBody(payload) {
 
 // ─── Trip grouping: find an existing trip that covers the same destination + date window ────
 async function findOrCreateGroupedTrip(userEmail, parsed, emailId, source) {
-  const dest = (parsed.destination_city || parsed.destination || "").toLowerCase().trim();
+  // FIXED (chief-of-staff data layer): dedup by confirmation first, group by
+  // destination even without dates, never name a trip after a carrier, and route
+  // un-groupable bookings to a single "Needs review" holder instead of spawning
+  // dozens of anonymous "Trip" entries.
+  const rawDest = (parsed.destination_city || parsed.destination || "").split(",")[0].trim();
+  const dest = rawDest.toLowerCase();
+  const confirmation = (parsed.confirmation || "").trim();
   const startDate = parsed.departs_at ? new Date(parsed.departs_at) : null;
   const endDate   = parsed.arrives_at  ? new Date(parsed.arrives_at)  : startDate;
 
-  // ── 1. Try to attach to an existing trip covering the same destination + overlapping dates ──
-  if (dest && startDate) {
-    const buffer = 2 * 24 * 60 * 60 * 1000; // 2-day buffer
-    const windowStart = new Date(startDate.getTime() - buffer);
-    const windowEnd   = endDate ? new Date(endDate.getTime() + buffer) : new Date(startDate.getTime() + buffer);
-
-    // Find trips where ANY leg's destination_city or destination fuzzy-matches AND dates overlap
-    const candidates = await sql`
-      SELECT DISTINCT t.id, t.title
+  // 1. Strongest signal: an existing leg with the SAME confirmation number.
+  if (confirmation) {
+    const byConf = await sql`
+      SELECT t.id, t.title
       FROM trips t
       JOIN trip_legs tl ON tl.trip_id = t.id
       WHERE t.user_email = ${userEmail}
-        AND (
-          LOWER(COALESCE(tl.destination_city, tl.destination, '')) LIKE ${'%' + dest.split(',')[0].trim() + '%'}
-          OR LOWER(COALESCE(tl.destination, '')) LIKE ${'%' + dest.split(',')[0].trim() + '%'}
-        )
-        AND (
-          (tl.departs_at IS NOT NULL AND tl.departs_at <= ${windowEnd.toISOString()} AND COALESCE(tl.arrives_at, tl.departs_at) >= ${windowStart.toISOString()})
-        )
+        AND tl.confirmation IS NOT NULL
+        AND LOWER(tl.confirmation) = ${confirmation.toLowerCase()}
       ORDER BY t.id ASC
       LIMIT 1
     `;
-    if (candidates.length > 0) {
-      console.log(`[grouping] attaching ${parsed.type} leg to existing trip "${candidates[0].title}" (id=${candidates[0].id})`);
-      return { tripId: candidates[0].id, isNew: false };
+    if (byConf.length > 0) {
+      console.log(`[grouping] confirmation match -> trip "${byConf[0].title}" (id=${byConf[0].id})`);
+      return { tripId: byConf[0].id, isNew: false, tripTitle: byConf[0].title };
     }
   }
 
-  // ── 2. No matching trip — create a new destination-named trip ──
-  // Name by destination city, not by carrier/flight number
-  const destCity = parsed.destination_city || (parsed.destination ? parsed.destination.split(',')[0].trim() : null);
-  let tripTitle = parsed.trip_title || parsed.title;
-  if (!tripTitle || tripTitle === "Unknown" || tripTitle === "Unknown Trip") {
-    if (destCity) {
-      tripTitle = destCity;
-    } else if (parsed.origin && parsed.destination) {
-      tripTitle = `${parsed.origin} \u2192 ${parsed.destination}`;
-    } else if (parsed.destination) {
-      tripTitle = `${parsed.destination} Trip`;
-    } else if (parsed.carrier) {
-      tripTitle = `${parsed.carrier} Trip`;
+  // 2. Destination match (with date window when dates exist; without otherwise).
+  if (dest) {
+    let candidates;
+    if (startDate) {
+      const buffer = 2 * 24 * 60 * 60 * 1000; // 2-day buffer
+      const windowStart = new Date(startDate.getTime() - buffer);
+      const windowEnd   = endDate ? new Date(endDate.getTime() + buffer) : new Date(startDate.getTime() + buffer);
+      candidates = await sql`
+        SELECT DISTINCT t.id, t.title
+        FROM trips t
+        JOIN trip_legs tl ON tl.trip_id = t.id
+        WHERE t.user_email = ${userEmail}
+          AND LOWER(COALESCE(tl.destination_city, tl.destination, '')) LIKE ${'%' + dest + '%'}
+          AND tl.departs_at IS NOT NULL
+          AND tl.departs_at <= ${windowEnd.toISOString()}
+          AND COALESCE(tl.arrives_at, tl.departs_at) >= ${windowStart.toISOString()}
+        ORDER BY t.id ASC
+        LIMIT 1
+      `;
     } else {
-      tripTitle = "Trip";
+      // No dates on this booking: still group by destination so dateless bookings
+      // stop spawning duplicates.
+      candidates = await sql`
+        SELECT DISTINCT t.id, t.title
+        FROM trips t
+        JOIN trip_legs tl ON tl.trip_id = t.id
+        WHERE t.user_email = ${userEmail}
+          AND LOWER(COALESCE(tl.destination_city, tl.destination, '')) LIKE ${'%' + dest + '%'}
+        ORDER BY t.id ASC
+        LIMIT 1
+      `;
+    }
+    if (candidates && candidates.length > 0) {
+      console.log(`[grouping] destination match -> trip "${candidates[0].title}" (id=${candidates[0].id})`);
+      return { tripId: candidates[0].id, isNew: false, tripTitle: candidates[0].title };
     }
   }
 
-  // Manual duplicate check — avoids ON CONFLICT on partial index (not supported by PostgreSQL)
+  // 3. Decide a title -- destination or route ONLY. Never carrier.
+  let tripTitle = null;
+  const explicit = parsed.trip_title || parsed.title;
+  if (explicit && explicit !== "Unknown" && explicit !== "Unknown Trip") {
+    tripTitle = explicit;
+  } else if (rawDest) {
+    tripTitle = rawDest;
+  } else if (parsed.origin && parsed.destination) {
+    tripTitle = `${parsed.origin} → ${parsed.destination}`;
+  }
+
+  // 4. Un-groupable (no destination, no route) -> single "Needs review" holder.
+  if (!tripTitle) {
+    const HOLD = "Needs review";
+    const held = await sql`SELECT id FROM trips WHERE user_email = ${userEmail} AND title = ${HOLD} LIMIT 1`;
+    if (held.length > 0) return { tripId: held[0].id, isNew: false, tripTitle: HOLD };
+    const holdRows = await sql`
+      INSERT INTO trips (user_email, title, source, raw_email_id)
+      VALUES (${userEmail}, ${HOLD}, ${source || 'gmail'}, ${emailId || null})
+      RETURNING id
+    `;
+    return holdRows.length ? { tripId: holdRows[0].id, isNew: true, tripTitle: HOLD } : null;
+  }
+
+  // 5. Guard against re-processing the same email, then create the trip.
   if (emailId) {
     const dup = await sql`SELECT id FROM trips WHERE user_email = ${userEmail} AND raw_email_id = ${emailId} LIMIT 1`;
     if (dup.length > 0) return null;
@@ -2228,6 +2268,33 @@ Return this exact JSON structure:
     }
 
     if (!parsed.is_travel_booking) return;
+
+    // ── P0 hardening: if a booking is missing the fields we group on, retry once
+    //    with a focused prompt before storing. Reliable destination + date is what
+    //    keeps trips from fragmenting into junk. ──
+    const missingCritical = (p) =>
+      !(p.destination_city || p.destination) || !(p.departs_at || p.arrives_at);
+    if (missingCritical(parsed)) {
+      try {
+        const repairPrompt = `From this ${parsed.type || "travel"} booking email, extract ONLY the destination and dates. Return ONLY JSON: {"destination_city": string|null, "destination": string|null, "departs_at": ISO8601|null, "arrives_at": ISO8601|null}. For flights, destination_city = arrival city; departs_at = departure time. For hotels, departs_at = check-in, arrives_at = check-out.\n\nSubject: ${subject}\nBody: ${(body || snippet).slice(0, 8000)}`;
+        const fix = await getAnthropic().messages.create({
+          model: "claude-sonnet-4-5",
+          max_tokens: 300,
+          messages: [{ role: "user", content: repairPrompt }],
+        });
+        const fixRaw = fix.content[0].text.trim().replace(/^```json\n?/, "").replace(/\n?```$/, "").trim();
+        const fixed = JSON.parse(fixRaw);
+        parsed.destination_city = parsed.destination_city || fixed.destination_city || null;
+        parsed.destination      = parsed.destination      || fixed.destination      || null;
+        parsed.departs_at       = parsed.departs_at       || fixed.departs_at        || null;
+        parsed.arrives_at       = parsed.arrives_at       || fixed.arrives_at         || null;
+      } catch (repairErr) {
+        console.warn("[gmail parse] repair pass failed:", repairErr.message, "Subject:", subject);
+      }
+      if (missingCritical(parsed)) {
+        console.warn("[gmail parse] still missing destination/date after retry; routing to review. Subject:", subject);
+      }
+    }
 
     // ── Find or create a grouped trip ──
     const groupResult = await findOrCreateGroupedTrip(userEmail, parsed, message.id, 'gmail');
@@ -3186,6 +3253,107 @@ async function getPerplexityGrounding(userMessage, userProfile = null) {
 // PATCH /me/memory — allow the user to directly update or correct their memory
 // DELETE /me/memory/:field — remove a specific field from memory
 // ---------------------------------------------------------------------------
+// ── P1 cleanup migration: repair junk trips created before the grouping fix ──
+// Removes duplicate legs sharing a confirmation, merges trips that share a
+// confirmation, relabels carrier-named / "Trip" titles from their legs'
+// destination, and deletes empty trips. DRY-RUN by default; pass ?apply=true.
+async function cleanupTrips(userEmail, { dryRun = true } = {}) {
+  const report = { dryRun, duplicateLegsRemoved: 0, tripsMerged: 0, titlesFixed: 0, emptyTripsDeleted: 0, details: [] };
+
+  // (a) duplicate legs sharing the same confirmation (keep lowest id)
+  const dupLegs = await sql`
+    SELECT tl.confirmation AS confirmation, COUNT(*) AS n
+    FROM trip_legs tl JOIN trips t ON t.id = tl.trip_id
+    WHERE t.user_email = ${userEmail} AND tl.confirmation IS NOT NULL AND tl.confirmation <> ''
+    GROUP BY tl.confirmation HAVING COUNT(*) > 1
+  `;
+  for (const row of dupLegs) {
+    report.duplicateLegsRemoved += Number(row.n) - 1;
+    report.details.push(`dup legs for confirmation ${row.confirmation}: ${row.n} -> 1`);
+    if (!dryRun) {
+      await sql`
+        DELETE FROM trip_legs WHERE id IN (
+          SELECT tl.id FROM trip_legs tl JOIN trips t ON t.id = tl.trip_id
+          WHERE t.user_email = ${userEmail} AND tl.confirmation = ${row.confirmation}
+          ORDER BY tl.id ASC OFFSET 1
+        )
+      `;
+    }
+  }
+
+  // (b) merge trips that share a confirmation number (keep earliest trip)
+  const sharedConf = await sql`
+    SELECT tl.confirmation AS confirmation, ARRAY_AGG(DISTINCT t.id ORDER BY t.id) AS trip_ids
+    FROM trip_legs tl JOIN trips t ON t.id = tl.trip_id
+    WHERE t.user_email = ${userEmail} AND tl.confirmation IS NOT NULL AND tl.confirmation <> ''
+    GROUP BY tl.confirmation HAVING COUNT(DISTINCT t.id) > 1
+  `;
+  for (const row of sharedConf) {
+    const ids = row.trip_ids;
+    const keep = ids[0];
+    const merge = ids.slice(1);
+    report.tripsMerged += merge.length;
+    report.details.push(`merge trips ${merge.join(",")} -> ${keep} (confirmation ${row.confirmation})`);
+    if (!dryRun) {
+      for (const mid of merge) {
+        await sql`UPDATE trip_legs SET trip_id = ${keep} WHERE trip_id = ${mid}`;
+        await sql`DELETE FROM trips WHERE id = ${mid} AND user_email = ${userEmail}`;
+      }
+    }
+  }
+
+  // (c) relabel carrier-named / generic titles from the legs' destination
+  const badTitles = await sql`
+    SELECT t.id, t.title FROM trips t
+    WHERE t.user_email = ${userEmail}
+      AND (t.title = 'Trip' OR t.title LIKE '% Trip' OR t.title LIKE '%Airlines%' OR t.title LIKE '%Air Lines%')
+  `;
+  for (const t of badTitles) {
+    const better = await sql`
+      SELECT COALESCE(destination_city, destination) AS dest FROM trip_legs
+      WHERE trip_id = ${t.id} AND COALESCE(destination_city, destination) IS NOT NULL
+      ORDER BY id ASC LIMIT 1
+    `;
+    if (better.length && better[0].dest) {
+      const newTitle = better[0].dest.split(",")[0].trim();
+      report.titlesFixed += 1;
+      report.details.push(`retitle #${t.id}: "${t.title}" -> "${newTitle}"`);
+      if (!dryRun) await sql`UPDATE trips SET title = ${newTitle} WHERE id = ${t.id}`;
+    }
+  }
+
+  // (d) delete empty trips (no legs)
+  const empties = await sql`
+    SELECT t.id FROM trips t
+    WHERE t.user_email = ${userEmail}
+      AND NOT EXISTS (SELECT 1 FROM trip_legs tl WHERE tl.trip_id = t.id)
+  `;
+  report.emptyTripsDeleted = empties.length;
+  if (empties.length) report.details.push(`delete ${empties.length} empty trips: ${empties.map(e => e.id).join(",")}`);
+  if (!dryRun && empties.length) {
+    await sql`
+      DELETE FROM trips t
+      WHERE t.user_email = ${userEmail}
+        AND NOT EXISTS (SELECT 1 FROM trip_legs tl WHERE tl.trip_id = t.id)
+    `;
+  }
+
+  return report;
+}
+
+app.post("/admin/cleanup-trips", async (req, res) => {
+  const email = await verifyAccessToken(req);
+  if (!email) return res.status(401).json({ error: "unauthorized" });
+  try {
+    const dryRun = req.query.apply !== "true";
+    const report = await cleanupTrips(email, { dryRun });
+    res.json({ ok: true, ...report });
+  } catch (e) {
+    console.error("[cleanup-trips]", e.message);
+    res.status(500).json({ ok: false, error: e.message });
+  }
+});
+
 app.get("/me/memory", async (req, res) => {
   const email = await verifyAccessToken(req);
   if (!email) return res.status(401).json({ error: "unauthorized" });
@@ -3603,19 +3771,29 @@ LOGISTICS & PLANNING
 - Currency, SIM cards, packing lists
 - Day-by-day itinerary building
 
+=== VOICE — YOU ARE A CHIEF OF STAFF, NOT A CONCIERGE ===
+Act like the principal's trusted chief of staff: three steps ahead, discreet, and protective of their time and attention.
+- Open with a read, not raw data ("You're in good shape"), then the substance.
+- Report what you have already handled; never announce baseline monitoring ("I'm watching your flight") — that is assumed and should feel intuitive.
+- Prioritise ruthlessly. Surface only what genuinely needs the user, and bundle it. Suppress noise.
+- Always carry a recommendation with a short reason drawn from memory ("you loved the kaiseki in Kanazawa, so I'd lock it"), and offer a sensible default the user can approve in one word.
+- Ask a brief, specific question when a preference is genuinely unknown — do not guess. One question per unknown.
+- Close with agency ("say the word and I'll take it from here").
+- Warm, economical, personal. You know this user; use memory so they never re-explain themselves.
+
 === RESPONSE FORMAT — CRITICAL ===
 - NEVER use markdown: no #, ##, **, *, -, bullet points, or any other markdown syntax
-- Write in plain conversational prose only — like a text message from a knowledgeable friend
+- Write in plain conversational prose only — like a text message from a trusted chief of staff
 - Keep responses concise: 1-3 sentences unless the user explicitly asks for more detail
 - Do not list capabilities or introduce yourself unless directly asked
 - Never start a response with "I" or "As your"
-- NEVER volunteer unsolicited recommendations or itineraries — only give them when the user explicitly asks
-- NEVER tell the user how to spend their time or what they should do unprompted
-- If the user asks a question, answer it directly and concisely. Ask a clarifying question only if genuinely needed.
+- Lead with a direct answer to what was asked. You MAY briefly surface a single time-sensitive item the user would clearly want handled (e.g. a reservation about to sell out) with a recommendation and a one-word-approvable default — but never pad replies with unsolicited itineraries or lists.
+- Don't lecture the user on how to spend their time; offer, don't instruct.
+- If the user asks a question, answer it directly and concisely. When a decision genuinely depends on a preference you don't know, ask one brief clarifying question rather than guessing.
 
 === RECOMMENDATION STYLE ===
-- Only make recommendations when the user explicitly asks for them
-- When asked, be specific: name the actual place from the verified Places list. Never say "there are many great options."
+- Make recommendations when asked, and when you proactively surface a time-sensitive item (per the Voice section) — but keep proactive suggestions to a single high-value item, never a list.
+- Always be specific: name the actual place from the verified Places list. Never say "there are many great options."
 - Follow the user's lead — if they say they want to visit somewhere, help them do it, don't redirect them
 - Reference the user's taste profile only when it's directly relevant to what they asked
 - Trip modes: [CLIENT TRIP] = prioritize prestige, private dining, car service; [PARTNER/LEISURE TRIP] = romance, design-forward boutique hotels, chef's table dinners; no mode = solo/efficiency
