@@ -1869,6 +1869,34 @@ async function scanGmailForTrips(userEmail, tokens) {
   // After importing, fold loose reservations (dinners, Ubers) into the trips
   // they happened during; delete any orphans with no surrounding trip.
   await cleanupLooseTrips(userEmail, { dryRun: false }).catch(e => console.error("[scan re-home]", e.message));
+  // Remove any duplicate legs that slipped in across repeated scans.
+  await dedupeLegs(userEmail).catch(e => console.error("[scan dedupe]", e.message));
+}
+
+// Delete duplicate trip_legs, keeping the earliest of each identical booking.
+// Identical = same trip + type + confirmation (or, when confirmation is null,
+// same type + date + carrier + property + destination).
+async function dedupeLegs(userEmail) {
+  const removed = await sql`
+    DELETE FROM trip_legs
+    WHERE id IN (
+      SELECT id FROM (
+        SELECT id, ROW_NUMBER() OVER (
+          PARTITION BY trip_id, type,
+            COALESCE(LOWER(confirmation), ''),
+            COALESCE(departs_at::text, ''),
+            COALESCE(LOWER(carrier), ''),
+            COALESCE(LOWER(property_name), ''),
+            COALESCE(LOWER(destination), '')
+          ORDER BY id ASC
+        ) AS rn
+        FROM trip_legs
+        WHERE trip_id IN (SELECT id FROM trips WHERE user_email = ${userEmail})
+      ) ranked
+      WHERE ranked.rn > 1
+    )
+    RETURNING id`;
+  return removed.length;
 }
 
 async function scanGmailAccountForTrips(userEmail, accountEmail) {
@@ -2448,6 +2476,30 @@ Return this exact JSON structure:
     if (!groupResult) return; // duplicate email
     const { tripId, isNew, tripTitle } = groupResult;
     const legTitle = tripTitle || parsed.trip_title || parsed.destination_city || parsed.destination || "Trip";
+
+    // ── Skip if this exact booking is already a leg ──
+    // A booking grouped INTO an existing trip never records its own raw_email_id on
+    // the trips table, so the email can be re-seen on later scans and re-inserted.
+    // Guard by confirmation number (and, when absent, by type+date+name) so rescans
+    // fill gaps without creating duplicate legs.
+    if (parsed.confirmation) {
+      const dupLeg = await sql`
+        SELECT tl.id FROM trip_legs tl JOIN trips t ON t.id = tl.trip_id
+        WHERE t.user_email = ${userEmail}
+          AND LOWER(tl.confirmation) = ${String(parsed.confirmation).toLowerCase()}
+        LIMIT 1`;
+      if (dupLeg.length > 0) return;
+    } else if (parsed.departs_at) {
+      const dupLeg = await sql`
+        SELECT tl.id FROM trip_legs tl JOIN trips t ON t.id = tl.trip_id
+        WHERE t.user_email = ${userEmail}
+          AND tl.type = ${parsed.type || "flight"}
+          AND tl.departs_at = ${parsed.departs_at}::TIMESTAMPTZ
+          AND COALESCE(LOWER(tl.carrier),'') = ${String(parsed.carrier || "").toLowerCase()}
+          AND COALESCE(LOWER(tl.destination),'') = ${String(parsed.destination || "").toLowerCase()}
+        LIMIT 1`;
+      if (dupLeg.length > 0) return;
+    }
 
     // ── Insert the leg with all enriched fields ──
     await sql`
@@ -3547,6 +3599,20 @@ app.post("/admin/cleanup-reservations", async (req, res) => {
     res.json({ ok: true, ...report });
   } catch (e) {
     console.error("[cleanup-reservations]", e.message);
+    res.status(500).json({ ok: false, error: e.message });
+  }
+});
+
+// Fast, non-destructive-ish cleanup: remove duplicate legs (keeps the earliest of
+// each identical booking). Pure SQL — returns immediately, no Gmail scan.
+app.post("/admin/dedupe-legs", async (req, res) => {
+  const email = await verifyAccessToken(req);
+  if (!email) return res.status(401).json({ error: "unauthorized" });
+  try {
+    const removed = await dedupeLegs(email);
+    res.json({ ok: true, removed });
+  } catch (e) {
+    console.error("[dedupe-legs]", e.message);
     res.status(500).json({ ok: false, error: e.message });
   }
 });
@@ -8708,9 +8774,12 @@ setInterval(() => { runMorningBriefings().catch(e => console.error("[morning-bri
 
 // External scheduler endpoint (reliable on free tiers that sleep). Point a cron
 // service at this every 15 min with header  x-cron-secret: <CRON_SECRET>.
-app.post("/cron/morning-briefings", async (req, res) => {
+async function handleCronMorningBriefings(req, res) {
   if (!process.env.CRON_SECRET) return res.status(503).json({ error: "CRON_SECRET not configured" });
-  if (req.get("x-cron-secret") !== process.env.CRON_SECRET) return res.status(401).json({ error: "unauthorized" });
+  // Secret may arrive as the x-cron-secret header OR a ?secret= query param —
+  // free cron services often send a plain GET and can't set custom headers.
+  const provided = req.get("x-cron-secret") || req.query.secret;
+  if (provided !== process.env.CRON_SECRET) return res.status(401).json({ error: "unauthorized" });
   try {
     const sent = await runMorningBriefings();
     res.json({ ok: true, sent });
@@ -8718,7 +8787,9 @@ app.post("/cron/morning-briefings", async (req, res) => {
     console.error("[cron/morning-briefings]", e.message);
     res.status(500).json({ ok: false, error: e.message });
   }
-});
+}
+app.post("/cron/morning-briefings", handleCronMorningBriefings);
+app.get("/cron/morning-briefings", handleCronMorningBriefings);
 
 // GET /me/next-trip-window — predicts next travel window from past trip patterns
 app.get('/me/next-trip-window', auth, async (req, res) => {
