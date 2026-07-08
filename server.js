@@ -255,6 +255,8 @@ async function bootstrapDB() {
     await sql`ALTER TABLE users ADD COLUMN IF NOT EXISTS weather_alerts BOOLEAN DEFAULT true`;
     await sql`ALTER TABLE users ADD COLUMN IF NOT EXISTS price_alerts BOOLEAN DEFAULT true`;
     await sql`ALTER TABLE users ADD COLUMN IF NOT EXISTS quiet_hours BOOLEAN DEFAULT true`;
+    await sql`ALTER TABLE users ADD COLUMN IF NOT EXISTS timezone TEXT`;
+    await sql`ALTER TABLE users ADD COLUMN IF NOT EXISTS last_morning_briefing TIMESTAMPTZ`;
     await sql`ALTER TABLE users ADD COLUMN IF NOT EXISTS travel_pace TEXT DEFAULT 'comfortable'`;
     await sql`ALTER TABLE users ADD COLUMN IF NOT EXISTS home_airports JSONB DEFAULT '[]'`;
     await sql`ALTER TABLE users ADD COLUMN IF NOT EXISTS seat_preference TEXT`;
@@ -1159,12 +1161,56 @@ app.post("/push-token", async (req, res) => {
   if (!email) return res.status(401).json({ error: "unauthorized" });
   // App sends { pushToken } (Expo convention); also accept legacy { token }
   const token = req.body?.pushToken || req.body?.token;
+  const timezone = req.body?.timezone || null; // IANA tz for daily briefing timing
   if (!token) return res.status(400).json({ error: "token required" });
   try {
-    await sql`UPDATE users SET push_token = ${token} WHERE email = ${email}`;
+    if (timezone) {
+      await sql`UPDATE users SET push_token = ${token}, timezone = ${timezone} WHERE email = ${email}`;
+    } else {
+      await sql`UPDATE users SET push_token = ${token} WHERE email = ${email}`;
+    }
     res.json({ ok: true });
   } catch (e) {
     res.status(500).json({ error: "db error" });
+  }
+});
+
+// ---------------------------------------------------------------------------
+// POST /me/test-morning-briefing — send yourself the daily briefing now (for testing)
+// ---------------------------------------------------------------------------
+app.post("/me/test-morning-briefing", async (req, res) => {
+  const email = await verifyAccessToken(req);
+  if (!email) return res.status(401).json({ error: "unauthorized" });
+  try {
+    const urows = await sql`SELECT first_name, push_token FROM users WHERE email = ${email}`;
+    const u = urows[0];
+    const now = new Date();
+    const nextRows = await sql`
+      SELECT tl.departs_at, tl.origin, tl.destination, tl.destination_city, tl.carrier, tl.flight_number
+      FROM trips t JOIN trip_legs tl ON tl.trip_id = t.id
+      WHERE t.user_email = ${email} AND tl.type = 'flight'
+        AND COALESCE(tl.arrives_at, tl.departs_at) > NOW()
+      ORDER BY tl.departs_at ASC LIMIT 1
+    `;
+    const next = nextRows[0];
+    const name = u?.first_name ? `, ${u.first_name}` : "";
+    let title = `Good morning${name}`, body;
+    if (!next) {
+      body = `Nothing on your calendar yet. Forward a booking or tell me where you're headed and I'll take it from there.`;
+    } else {
+      const daysAway = Math.ceil((new Date(next.departs_at) - now) / 86400000);
+      const dest = next.destination_city || next.destination || "your destination";
+      const ident = [next.carrier, next.flight_number].filter(Boolean).join("");
+      const route = next.origin && next.destination ? `${next.origin} → ${next.destination}` : dest;
+      if (daysAway <= 0) body = `${dest} today. ${route}${ident ? ` · ${ident}` : ""}. You're in good shape — I'll flag anything the moment it moves.`;
+      else if (daysAway === 1) body = `${dest} tomorrow. Everything's lined up; I'll have your full briefing ready in the morning.`;
+      else body = `${dest} in ${daysAway} days. Nothing needs you yet — I'm watching it and will speak up if that changes.`;
+    }
+    if (u?.push_token) await sendPushToUser(email, title, body, { screen: "Home" });
+    res.json({ ok: true, sent: !!u?.push_token, preview: { title, body } });
+  } catch (e) {
+    console.error("[test-morning-briefing]", e.message);
+    res.status(500).json({ ok: false, error: e.message });
   }
 });
 
@@ -8411,6 +8457,77 @@ setInterval(async () => {
     console.error('[weekly-digest] error:', e.message);
   }
 }, 15 * 60 * 1000);
+
+// ─── Daily morning briefing ──────────────────────────────────────
+// A chief of staff briefs you each morning — but only when there's a trip to
+// brief. Shared by the in-process timer and the external /cron endpoint.
+async function runMorningBriefings() {
+  const now = new Date();
+  let sent = 0;
+  const users = await sql`
+    SELECT email, first_name, push_token, preferences, timezone, last_morning_briefing
+    FROM users WHERE push_token IS NOT NULL
+  `;
+  for (const user of users) {
+    try {
+      const prefs = user.preferences || {};
+      if (prefs.briefing_enabled === false) continue;
+      const briefingHour = Number.isInteger(prefs.briefing_hour) ? prefs.briefing_hour : 7;
+      const tz = user.timezone || "UTC";
+      let localHour, localMinute;
+      try {
+        const parts = new Intl.DateTimeFormat("en-GB", { timeZone: tz, hour: "2-digit", minute: "2-digit", hour12: false }).formatToParts(now);
+        localHour = Number(parts.find(p => p.type === "hour").value);
+        localMinute = Number(parts.find(p => p.type === "minute").value);
+      } catch { continue; }
+      if (localHour !== briefingHour || localMinute >= 15) continue;
+      if (user.last_morning_briefing && (now - new Date(user.last_morning_briefing)) < 20 * 3600 * 1000) continue;
+      const nextRows = await sql`
+        SELECT tl.departs_at, tl.origin, tl.destination, tl.destination_city, tl.carrier, tl.flight_number
+        FROM trips t JOIN trip_legs tl ON tl.trip_id = t.id
+        WHERE t.user_email = ${user.email} AND tl.type = 'flight'
+          AND COALESCE(tl.arrives_at, tl.departs_at) > NOW()
+        ORDER BY tl.departs_at ASC LIMIT 1
+      `;
+      const next = nextRows[0];
+      if (!next) continue;
+      const daysAway = Math.ceil((new Date(next.departs_at) - now) / 86400000);
+      if (daysAway > 14) continue;
+      const name = user.first_name ? `, ${user.first_name}` : "";
+      const dest = next.destination_city || next.destination || "your destination";
+      const ident = [next.carrier, next.flight_number].filter(Boolean).join("");
+      const route = next.origin && next.destination ? `${next.origin} → ${next.destination}` : dest;
+      const title = `Good morning${name}`;
+      let body;
+      if (daysAway <= 0) body = `${dest} today. ${route}${ident ? ` · ${ident}` : ""}. You're in good shape — I'll flag anything the moment it moves.`;
+      else if (daysAway === 1) body = `${dest} tomorrow. Everything's lined up; I'll have your full briefing ready in the morning.`;
+      else body = `${dest} in ${daysAway} days. Nothing needs you yet — I'm watching it and will speak up if that changes.`;
+      await sendPushToUser(user.email, title, body, { screen: "Home" });
+      await sql`UPDATE users SET last_morning_briefing = NOW() WHERE email = ${user.email}`;
+      sent++;
+    } catch (e) {
+      console.error("[morning-briefing] user error:", e.message);
+    }
+  }
+  return sent;
+}
+
+// In-process timer (works while the service is awake).
+setInterval(() => { runMorningBriefings().catch(e => console.error("[morning-briefing] error:", e.message)); }, 15 * 60 * 1000);
+
+// External scheduler endpoint (reliable on free tiers that sleep). Point a cron
+// service at this every 15 min with header  x-cron-secret: <CRON_SECRET>.
+app.post("/cron/morning-briefings", async (req, res) => {
+  if (!process.env.CRON_SECRET) return res.status(503).json({ error: "CRON_SECRET not configured" });
+  if (req.get("x-cron-secret") !== process.env.CRON_SECRET) return res.status(401).json({ error: "unauthorized" });
+  try {
+    const sent = await runMorningBriefings();
+    res.json({ ok: true, sent });
+  } catch (e) {
+    console.error("[cron/morning-briefings]", e.message);
+    res.status(500).json({ ok: false, error: e.message });
+  }
+});
 
 // GET /me/next-trip-window — predicts next travel window from past trip patterns
 app.get('/me/next-trip-window', auth, async (req, res) => {
