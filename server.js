@@ -2311,7 +2311,7 @@ Rules:
 - For hotels/Airbnb: "departs_at" = check-in datetime, "arrives_at" = check-out datetime, "nights" = number of nights
 - For trains: "station_from" and "station_to" are the station names (e.g. "London King's Cross", "Edinburgh Waverley")
 - For cars: "pickup_location" = city or airport where car is collected, "dropoff_location" = return location
-- For flights: "flight_number" = IATA code (e.g. "BA1234"), "origin" = departure IATA or city, "destination" = arrival IATA or city
+- For flights: "flight_number" = IATA code (e.g. "BA1234"), "origin" = departure IATA or city, "destination" = arrival IATA or city ALWAYS extract "departs_at" for flights — the departure date and time in ISO 8601 (include the year; infer it from the email date if the ticket only shows month/day). A flight without a departs_at is not useful, so never leave it null when any date/time appears in the email.
 - "carrier" = airline, hotel property name, car rental company, train operator, ferry operator, or activity provider
 - "price_total" = total cost as a number (no currency symbol), "currency" = 3-letter ISO code (e.g. "GBP", "USD")
 - "guests" = number of guests/passengers as integer
@@ -2420,8 +2420,8 @@ Return this exact JSON structure:
         ${parsed.origin || null},
         ${parsed.destination || null},
         ${parsed.destination_city || null},
-        ${parsed.departs_at || null},
-        ${parsed.arrives_at  || null},
+        ${parsed.departs_at || null}::TIMESTAMPTZ,
+        ${parsed.arrives_at  || null}::TIMESTAMPTZ,
         ${parsed.confirmation || null},
         ${JSON.stringify(parsed)},
         ${parsed.nights    || null},
@@ -2722,7 +2722,7 @@ Rules:
 - For hotels/Airbnb: "departs_at" = check-in datetime, "arrives_at" = check-out datetime, "nights" = number of nights
 - For trains: "station_from" and "station_to" are the station names
 - For cars: "pickup_location" = city or airport where car is collected, "dropoff_location" = return location
-- For flights: "flight_number" = IATA code, "origin" = departure IATA or city, "destination" = arrival IATA or city
+- For flights: "flight_number" = IATA code, "origin" = departure IATA or city, "destination" = arrival IATA or city ALWAYS extract "departs_at" for flights — the departure date and time in ISO 8601 (include the year; infer it from the email date if the ticket only shows month/day). A flight without a departs_at is not useful, so never leave it null when any date/time appears in the email.
 - "carrier" = airline, hotel property name, car rental company, train operator, etc.
 - "price_total" = total cost as a number, "currency" = 3-letter ISO code
 - "guests" = number of guests/passengers as integer
