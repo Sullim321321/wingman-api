@@ -1886,7 +1886,6 @@ async function dedupeLegs(userEmail) {
             COALESCE(LOWER(confirmation), ''),
             COALESCE(departs_at::text, ''),
             COALESCE(LOWER(carrier), ''),
-            COALESCE(LOWER(property_name), ''),
             COALESCE(LOWER(destination), '')
           ORDER BY id ASC
         ) AS rn
