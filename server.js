@@ -2123,18 +2123,55 @@ function extractEmailBody(payload) {
 }
 
 // ─── Trip grouping: find an existing trip that covers the same destination + date window ────
+// Leg types that make a trip a "real" trip (travel + lodging). Everything else
+// (dining, activities, transfers) is a "loose" booking that belongs INSIDE a trip.
+const ANCHOR_TYPES = new Set(["flight", "hotel", "airbnb", "train", "ferry", "cruise", "car"]);
+
+// Find a real trip (has an anchor leg) whose date window covers `whenISO`.
+// Prefers a trip whose city matches; falls back to any date-overlapping trip.
+async function findTripForLooseBooking(userEmail, whenISO, city) {
+  if (!whenISO) return null;
+  const rows = await sql`
+    SELECT t.id, t.title,
+      MIN(tl.departs_at) AS s,
+      MAX(COALESCE(tl.arrives_at, tl.departs_at)) AS e,
+      BOOL_OR(tl.type IN ('flight','hotel','airbnb','train','ferry','cruise','car')) AS has_anchor,
+      STRING_AGG(LOWER(COALESCE(tl.destination_city, tl.destination, '')), ' ') AS cities
+    FROM trips t
+    JOIN trip_legs tl ON tl.trip_id = t.id
+    WHERE t.user_email = ${userEmail}
+    GROUP BY t.id, t.title
+  `;
+  const when = new Date(whenISO).getTime();
+  if (Number.isNaN(when)) return null;
+  const DAY = 86400000;
+  const cityLc = (city || "").toLowerCase().split(",")[0].trim();
+  let fallback = null;
+  for (const r of rows) {
+    if (!r.has_anchor || !r.s) continue;      // only attach to real trips
+    const start = new Date(r.s).getTime() - DAY;
+    const end   = new Date(r.e || r.s).getTime() + DAY;
+    if (when < start || when > end) continue;  // date must fall in the trip window
+    if (cityLc && r.cities && r.cities.includes(cityLc)) {
+      return { tripId: r.id, title: r.title };  // best: date + city match
+    }
+    if (!fallback) fallback = { tripId: r.id, title: r.title }; // date-only match
+  }
+  return fallback;
+}
+
 async function findOrCreateGroupedTrip(userEmail, parsed, emailId, source) {
-  // FIXED (chief-of-staff data layer): dedup by confirmation first, group by
-  // destination even without dates, never name a trip after a carrier, and route
-  // un-groupable bookings to a single "Needs review" holder instead of spawning
-  // dozens of anonymous "Trip" entries.
+  // Dedup by confirmation first, group anchors by destination, attach loose
+  // bookings (dining/activities) to the trip they happen during, and never name
+  // a trip after a carrier or a restaurant.
   const rawDest = (parsed.destination_city || parsed.destination || "").split(",")[0].trim();
   const dest = rawDest.toLowerCase();
   const confirmation = (parsed.confirmation || "").trim();
   const startDate = parsed.departs_at ? new Date(parsed.departs_at) : null;
   const endDate   = parsed.arrives_at  ? new Date(parsed.arrives_at)  : startDate;
+  const isLoose = parsed.type && !ANCHOR_TYPES.has(parsed.type);
 
-  // 1. Strongest signal: an existing leg with the SAME confirmation number.
+  // ── 1. Strongest signal: an existing leg with the SAME confirmation number ──
   if (confirmation) {
     const byConf = await sql`
       SELECT t.id, t.title
@@ -2147,16 +2184,28 @@ async function findOrCreateGroupedTrip(userEmail, parsed, emailId, source) {
       LIMIT 1
     `;
     if (byConf.length > 0) {
-      console.log(`[grouping] confirmation match -> trip "${byConf[0].title}" (id=${byConf[0].id})`);
       return { tripId: byConf[0].id, isNew: false, tripTitle: byConf[0].title };
     }
   }
 
-  // 2. Destination match (with date window when dates exist; without otherwise).
+  // ── 2. Loose booking (dinner, bar, activity, transfer): attach to the trip it
+  //       happens during. If there's no such trip, SKIP it — a dinner with no
+  //       surrounding trip is not itself a trip. ──
+  if (isLoose) {
+    const match = await findTripForLooseBooking(userEmail, parsed.departs_at, rawDest);
+    if (match) {
+      console.log(`[grouping] loose ${parsed.type} -> trip "${match.title}" (id=${match.tripId})`);
+      return { tripId: match.tripId, isNew: false, tripTitle: match.title };
+    }
+    console.log(`[grouping] loose ${parsed.type} with no surrounding trip — skipped`);
+    return null;
+  }
+
+  // ── 3. Anchor booking — destination match (with date window when dates exist) ──
   if (dest) {
     let candidates;
     if (startDate) {
-      const buffer = 2 * 24 * 60 * 60 * 1000; // 2-day buffer
+      const buffer = 2 * 24 * 60 * 60 * 1000;
       const windowStart = new Date(startDate.getTime() - buffer);
       const windowEnd   = endDate ? new Date(endDate.getTime() + buffer) : new Date(startDate.getTime() + buffer);
       candidates = await sql`
@@ -2172,8 +2221,6 @@ async function findOrCreateGroupedTrip(userEmail, parsed, emailId, source) {
         LIMIT 1
       `;
     } else {
-      // No dates on this booking: still group by destination so dateless bookings
-      // stop spawning duplicates.
       candidates = await sql`
         SELECT DISTINCT t.id, t.title
         FROM trips t
@@ -2185,12 +2232,11 @@ async function findOrCreateGroupedTrip(userEmail, parsed, emailId, source) {
       `;
     }
     if (candidates && candidates.length > 0) {
-      console.log(`[grouping] destination match -> trip "${candidates[0].title}" (id=${candidates[0].id})`);
       return { tripId: candidates[0].id, isNew: false, tripTitle: candidates[0].title };
     }
   }
 
-  // 3. Decide a title -- destination or route ONLY. Never carrier.
+  // ── 4. Title — destination or route ONLY. Never carrier. ──
   let tripTitle = null;
   const explicit = parsed.trip_title || parsed.title;
   if (explicit && explicit !== "Unknown" && explicit !== "Unknown Trip") {
@@ -2201,7 +2247,7 @@ async function findOrCreateGroupedTrip(userEmail, parsed, emailId, source) {
     tripTitle = `${parsed.origin} → ${parsed.destination}`;
   }
 
-  // 4. Un-groupable (no destination, no route) -> single "Needs review" holder.
+  // ── 5. Un-groupable anchor (no destination, no route) → "Needs review" holder ──
   if (!tripTitle) {
     const HOLD = "Needs review";
     const held = await sql`SELECT id FROM trips WHERE user_email = ${userEmail} AND title = ${HOLD} LIMIT 1`;
@@ -2214,7 +2260,7 @@ async function findOrCreateGroupedTrip(userEmail, parsed, emailId, source) {
     return holdRows.length ? { tripId: holdRows[0].id, isNew: true, tripTitle: HOLD } : null;
   }
 
-  // 5. Guard against re-processing the same email, then create the trip.
+  // ── 6. Guard against re-processing the same email, then create the trip ──
   if (emailId) {
     const dup = await sql`SELECT id FROM trips WHERE user_email = ${userEmail} AND raw_email_id = ${emailId} LIMIT 1`;
     if (dup.length > 0) return null;
@@ -3396,6 +3442,56 @@ app.post("/admin/cleanup-trips", async (req, res) => {
     res.json({ ok: true, ...report });
   } catch (e) {
     console.error("[cleanup-trips]", e.message);
+    res.status(500).json({ ok: false, error: e.message });
+  }
+});
+
+// Re-home dining/activity reservations that were imported as their own "trips":
+// move each into the real trip it happened during, then delete the loose trips
+// (orphan reservations with no surrounding trip are junk and get removed).
+async function cleanupLooseTrips(userEmail, { dryRun = true } = {}) {
+  const report = { dryRun, reservationsReassigned: 0, looseTripsDeleted: 0, details: [] };
+  const looseTrips = await sql`
+    SELECT t.id, t.title
+    FROM trips t
+    WHERE t.user_email = ${userEmail}
+      AND EXISTS (SELECT 1 FROM trip_legs tl WHERE tl.trip_id = t.id)
+      AND NOT EXISTS (
+        SELECT 1 FROM trip_legs tl
+        WHERE tl.trip_id = t.id
+          AND tl.type IN ('flight','hotel','airbnb','train','ferry','cruise','car')
+      )
+      AND t.title <> 'Needs review'
+  `;
+  for (const lt of looseTrips) {
+    const legs = await sql`SELECT id, departs_at, destination_city, destination FROM trip_legs WHERE trip_id = ${lt.id}`;
+    for (const leg of legs) {
+      const match = await findTripForLooseBooking(userEmail, leg.departs_at, leg.destination_city || leg.destination);
+      if (match && match.tripId !== lt.id) {
+        report.reservationsReassigned++;
+        report.details.push(`"${lt.title}" reservation -> "${match.title}"`);
+        if (!dryRun) await sql`UPDATE trip_legs SET trip_id = ${match.tripId} WHERE id = ${leg.id}`;
+      }
+    }
+    report.looseTripsDeleted++;
+    report.details.push(`delete loose trip "${lt.title}"`);
+    if (!dryRun) {
+      await sql`DELETE FROM trip_legs WHERE trip_id = ${lt.id}`;
+      await sql`DELETE FROM trips WHERE id = ${lt.id} AND user_email = ${userEmail}`;
+    }
+  }
+  return report;
+}
+
+app.post("/admin/cleanup-reservations", async (req, res) => {
+  const email = await verifyAccessToken(req);
+  if (!email) return res.status(401).json({ error: "unauthorized" });
+  try {
+    const dryRun = req.query.apply !== "true";
+    const report = await cleanupLooseTrips(email, { dryRun });
+    res.json({ ok: true, ...report });
+  } catch (e) {
+    console.error("[cleanup-reservations]", e.message);
     res.status(500).json({ ok: false, error: e.message });
   }
 });
