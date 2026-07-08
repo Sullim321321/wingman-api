@@ -1855,6 +1855,9 @@ async function scanGmailForTrips(userEmail, tokens) {
   for (const accountRow of accountRows) {
     await scanGmailAccountForTrips(userEmail, accountRow.account_email);
   }
+  // After importing, fold loose reservations (dinners, Ubers) into the trips
+  // they happened during; delete any orphans with no surrounding trip.
+  await cleanupLooseTrips(userEmail, { dryRun: false }).catch(e => console.error("[scan re-home]", e.message));
 }
 
 async function scanGmailAccountForTrips(userEmail, accountEmail) {
@@ -2197,8 +2200,13 @@ async function findOrCreateGroupedTrip(userEmail, parsed, emailId, source) {
       console.log(`[grouping] loose ${parsed.type} -> trip "${match.title}" (id=${match.tripId})`);
       return { tripId: match.tripId, isNew: false, tripTitle: match.title };
     }
-    console.log(`[grouping] loose ${parsed.type} with no surrounding trip — skipped`);
-    return null;
+    // No surrounding trip yet — park in a single "Reservations" holder so it can
+    // be folded in when its trip appears. Never a venue-named trip.
+    const HOLD = "Reservations";
+    const held = await sql`SELECT id FROM trips WHERE user_email = ${userEmail} AND title = ${HOLD} LIMIT 1`;
+    if (held.length) return { tripId: held[0].id, isNew: false, tripTitle: HOLD };
+    const rrows = await sql`INSERT INTO trips (user_email, title, source, raw_email_id) VALUES (${userEmail}, ${HOLD}, ${source || 'gmail'}, ${emailId || null}) RETURNING id`;
+    return rrows.length ? { tripId: rrows[0].id, isNew: true, tripTitle: HOLD } : null;
   }
 
   // ── 3. Anchor booking — destination match (with date window when dates exist) ──
@@ -3492,6 +3500,29 @@ app.post("/admin/cleanup-reservations", async (req, res) => {
     res.json({ ok: true, ...report });
   } catch (e) {
     console.error("[cleanup-reservations]", e.message);
+    res.status(500).json({ ok: false, error: e.message });
+  }
+});
+
+// Rebuild trips from scratch: wipe this user's trips, then re-scan Gmail with the
+// fixed parser (flights+hotels group into cohesive trips; dinners/Ubers fold in).
+// Preview by default; pass ?confirm=true to actually wipe and rebuild. The scan
+// runs in the background because a full re-scan can take a few minutes.
+app.post("/admin/rebuild-trips", async (req, res) => {
+  const email = await verifyAccessToken(req);
+  if (!email) return res.status(401).json({ error: "unauthorized" });
+  try {
+    const [{ count }] = await sql`SELECT COUNT(*)::int AS count FROM trips WHERE user_email = ${email}`;
+    if (req.query.confirm !== "true") {
+      return res.json({ ok: true, preview: true, currentTrips: count, message: `Would delete ${count} trips and re-scan Gmail. Re-run with ?confirm=true to proceed.` });
+    }
+    await sql`DELETE FROM trip_legs WHERE trip_id IN (SELECT id FROM trips WHERE user_email = ${email})`;
+    await sql`DELETE FROM trips WHERE user_email = ${email}`;
+    // Fire the scan in the background so the request doesn't time out.
+    scanGmailForTrips(email).catch(e => console.error("[rebuild scan]", e.message));
+    res.json({ ok: true, deleted: count, message: "Wiped. Re-scanning Gmail in the background — your trips will repopulate over the next few minutes." });
+  } catch (e) {
+    console.error("[rebuild-trips]", e.message);
     res.status(500).json({ ok: false, error: e.message });
   }
 });
