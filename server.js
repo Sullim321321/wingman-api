@@ -2395,7 +2395,7 @@ Return this exact JSON structure:
     let claudeResp;
     try {
       claudeResp = await getAnthropic().messages.create({
-        model: "claude-sonnet-4-5",
+        model: "claude-haiku-4-5",  // cheap model — email field extraction is simple; Sonnet repair below catches misses
         max_tokens: 700,
         messages: [{ role: "user", content: prompt }],
       });
@@ -2803,7 +2803,7 @@ Return this exact JSON structure:
   let parsed;
   try {
     const claudeResp = await getAnthropic().messages.create({
-      model: "claude-sonnet-4-5",
+      model: "claude-haiku-4-5",  // cheap model for email field extraction
       max_tokens: 700,
       messages: [{ role: "user", content: prompt }],
     });
