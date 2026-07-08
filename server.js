@@ -4051,7 +4051,7 @@ Rules:
         messages: chatMessages,
       }),
       new Promise((_, reject) =>
-        setTimeout(() => reject(Object.assign(new Error("Concierge LLM timeout after 25s"), { name: "TimeoutError" })), 25000)
+        setTimeout(() => reject(Object.assign(new Error("Concierge LLM timeout after 55s"), { name: "TimeoutError" })), 55000)
       ),
     ]);
     // Strip any markdown that slips through — render as plain text on mobile
