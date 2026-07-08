@@ -2122,18 +2122,54 @@ async function scanGmailAccountForTrips(userEmail, accountEmail) {
   }
 }
 
+// Turn an HTML email into readable plain text so the parser can actually see the
+// itinerary. Airline confirmations (esp. American) are huge HTML documents whose
+// first several KB are <head>, CSS, and preheader boilerplate — the flight DATE
+// sits deep in the markup. Stripping tags surfaces the real content up front.
+function stripHtml(html) {
+  return String(html)
+    .replace(/<!--[\s\S]*?-->/g, " ")
+    .replace(/<style[\s\S]*?<\/style>/gi, " ")
+    .replace(/<script[\s\S]*?<\/script>/gi, " ")
+    .replace(/<head[\s\S]*?<\/head>/gi, " ")
+    .replace(/<\/(p|div|tr|td|table|li|h[1-6]|br)>/gi, "\n")
+    .replace(/<br\s*\/?>(?=)/gi, "\n")
+    .replace(/<[^>]+>/g, " ")
+    .replace(/&nbsp;/gi, " ")
+    .replace(/&amp;/gi, "&")
+    .replace(/&lt;/gi, "<")
+    .replace(/&gt;/gi, ">")
+    .replace(/&#39;|&apos;/gi, "'")
+    .replace(/&quot;/gi, '"')
+    .replace(/&[#a-z0-9]+;/gi, " ")
+    .replace(/[ \t ]+/g, " ")
+    .replace(/\n[ \t]+/g, "\n")
+    .replace(/\n{3,}/g, "\n\n")
+    .trim();
+}
+
+// Walk the full MIME tree, collecting text/plain and text/html separately.
+function collectEmailParts(payload, acc) {
+  if (!payload) return;
+  const mime = (payload.mimeType || "").toLowerCase();
+  if (payload.body && payload.body.data) {
+    const decoded = Buffer.from(payload.body.data, "base64").toString("utf8");
+    if (mime.includes("text/html")) acc.html.push(decoded);
+    else if (mime.includes("text/plain") || mime.startsWith("text/") || !mime) acc.plain.push(decoded);
+  }
+  if (payload.parts) for (const part of payload.parts) collectEmailParts(part, acc);
+}
+
 function extractEmailBody(payload) {
   if (!payload) return "";
-  if (payload.body && payload.body.data) {
-    return Buffer.from(payload.body.data, "base64").toString("utf8");
-  }
-  if (payload.parts) {
-    for (const part of payload.parts) {
-      const text = extractEmailBody(part);
-      if (text) return text;
-    }
-  }
-  return "";
+  const acc = { plain: [], html: [] };
+  collectEmailParts(payload, acc);
+  const plain = acc.plain.join("\n").trim();
+  // Prefer the plain-text part only when it's substantial — many airline emails
+  // ship an empty/preheader-only text/plain part alongside the real HTML itinerary.
+  if (plain.length > 400) return plain;
+  const stripped = acc.html.length ? stripHtml(acc.html.join("\n")) : "";
+  return stripped.length > plain.length ? stripped : plain;
 }
 
 // ─── Trip grouping: find an existing trip that covers the same destination + date window ────
