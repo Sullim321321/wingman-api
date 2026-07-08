@@ -571,6 +571,8 @@ async function bootstrapDB() {
     // ── Ensure all trip_legs columns exist ──
     await sql`ALTER TABLE trip_legs ADD COLUMN IF NOT EXISTS status TEXT DEFAULT 'upcoming'`;
     await sql`ALTER TABLE trip_legs ADD COLUMN IF NOT EXISTS raw_data JSONB`;
+    await sql`ALTER TABLE trip_legs ADD COLUMN IF NOT EXISTS gate TEXT`;
+    await sql`ALTER TABLE trip_legs ADD COLUMN IF NOT EXISTS terminal TEXT`;
     // ── Enriched leg fields for all reservation types (v2 pipeline) ──
     await sql`ALTER TABLE trip_legs ADD COLUMN IF NOT EXISTS destination_city TEXT`;
     await sql`ALTER TABLE trip_legs ADD COLUMN IF NOT EXISTS nights INTEGER`;
@@ -2244,15 +2246,15 @@ async function findOrCreateGroupedTrip(userEmail, parsed, emailId, source) {
     }
   }
 
-  // ── 4. Title — destination or route ONLY. Never carrier. ──
+  // ── 4. Title — city or route ONLY. Prefer the destination city; never a
+  //       property or email-subject name (that is how "Brentwood Hotel" happened). ──
   let tripTitle = null;
-  const explicit = parsed.trip_title || parsed.title;
-  if (explicit && explicit !== "Unknown" && explicit !== "Unknown Trip") {
-    tripTitle = explicit;
-  } else if (rawDest) {
+  if (rawDest) {
     tripTitle = rawDest;
   } else if (parsed.origin && parsed.destination) {
     tripTitle = `${parsed.origin} → ${parsed.destination}`;
+  } else if (parsed.trip_title && parsed.trip_title !== "Unknown" && parsed.trip_title !== "Unknown Trip") {
+    tripTitle = parsed.trip_title;
   }
 
   // ── 5. Un-groupable anchor (no destination, no route) → "Needs review" holder ──
@@ -2304,7 +2306,7 @@ Body (up to 8000 chars): ${(body || snippet).slice(0, 8000)}
 Rules:
 - "is_travel_booking" = true for any email containing a confirmed booking, reservation, or itinerary — including emails from loyalty programmes (TrueBlue, MileagePlus, SkyMiles, Avios, etc.) and OTAs (Expedia, Booking.com, TrueBlue Travel, etc.) that contain booking details. Set false ONLY for pure promotional emails, newsletters, or points statements with NO booking details.
 - "type" must be one of: flight | hotel | airbnb | car | train | ferry | cruise | activity | transfer | other
-- "destination_city" = the city the traveller is visiting (e.g. "Edinburgh", "New York", "Tokyo") — extract this even for flights (use arrival city)
+- "destination_city" = the city the traveller is visiting (e.g. "Edinburgh", "New York", "Tokyo") — extract this even for flights (use arrival city). For hotels, Airbnb, restaurants, and activities, this is the city where the property or venue is located — derive it from the address if it is not stated. NEVER leave destination_city null for a hotel, restaurant, or activity.
 - "trip_title" = the destination city name only (e.g. "Edinburgh", "New York") — used to group all bookings for the same trip. NEVER include carrier/airline/hotel name here.
 - For hotels/Airbnb: "departs_at" = check-in datetime, "arrives_at" = check-out datetime, "nights" = number of nights
 - For trains: "station_from" and "station_to" are the station names (e.g. "London King's Cross", "Edinburgh Waverley")
@@ -2715,7 +2717,7 @@ Text: ${body.slice(0, 4000)}
 Rules:
 - "is_travel_booking" = true for any email containing a confirmed booking, reservation, or itinerary — including emails from loyalty programmes (TrueBlue, MileagePlus, SkyMiles, Avios, etc.) and OTAs (Expedia, Booking.com, TrueBlue Travel, etc.) that contain booking details. Set false ONLY for pure promotional emails, newsletters, or points statements with NO booking details.
 - "type" must be one of: flight | hotel | airbnb | car | train | ferry | cruise | activity | transfer | other
-- "destination_city" = the city the traveller is visiting (e.g. "Edinburgh", "New York", "Tokyo")
+- "destination_city" = the city the traveller is visiting (e.g. "Edinburgh", "New York", "Tokyo") For hotels, Airbnb, restaurants, and activities, this is the city where the property or venue is located — derive it from the address if it is not stated. NEVER leave destination_city null for a hotel, restaurant, or activity.
 - "trip_title" = the destination city name only (e.g. "Edinburgh") — used to group all bookings for the same trip
 - For hotels/Airbnb: "departs_at" = check-in datetime, "arrives_at" = check-out datetime, "nights" = number of nights
 - For trains: "station_from" and "station_to" are the station names
