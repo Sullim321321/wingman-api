@@ -3529,9 +3529,26 @@ app.post("/admin/rebuild-trips", async (req, res) => {
     }
     await sql`DELETE FROM trip_legs WHERE trip_id IN (SELECT id FROM trips WHERE user_email = ${email})`;
     await sql`DELETE FROM trips WHERE user_email = ${email}`;
-    // Fire the scan in the background so the request doesn't time out.
-    scanGmailForTrips(email).catch(e => console.error("[rebuild scan]", e.message));
-    res.json({ ok: true, deleted: count, message: "Wiped. Re-scanning Gmail in the background — your trips will repopulate over the next few minutes." });
+    // Run the scan synchronously (awaited). A fire-and-forget background scan dies
+    // on Render's free tier — the dyno spins down the moment the response is sent,
+    // killing the in-flight scan (that's why a background rebuild produced 0 trips).
+    await scanGmailForTrips(email);
+    const after = await sql`
+      SELECT
+        (SELECT COUNT(*)::int FROM trips WHERE user_email = ${email}) AS trips,
+        (SELECT COUNT(*)::int FROM trip_legs tl JOIN trips t ON t.id = tl.trip_id
+           WHERE t.user_email = ${email}) AS legs,
+        (SELECT COUNT(*)::int FROM trip_legs tl JOIN trips t ON t.id = tl.trip_id
+           WHERE t.user_email = ${email}
+             AND tl.type IN ('flight','hotel','airbnb','train','ferry','cruise','car')
+             AND tl.departs_at IS NULL) AS dateless_anchors
+    `;
+    res.json({
+      ok: true,
+      deleted: count,
+      rebuilt: after[0],
+      message: `Rebuilt ${after[0].trips} trips, ${after[0].legs} legs. ${after[0].dateless_anchors} anchor leg(s) still missing a date.`,
+    });
   } catch (e) {
     console.error("[rebuild-trips]", e.message);
     res.status(500).json({ ok: false, error: e.message });
