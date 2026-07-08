@@ -105,7 +105,12 @@ if (!JWT_SECRET) {
   console.error("FATAL: JWT_SECRET env var not set. Refusing to start.");
   process.exit(1);
 }
-const JWT_EXPIRES_IN = "15m";   // Short-lived access token
+// NOTE: the mobile client does not implement token refresh (no /auth/refresh call),
+// so it holds a single access token for the whole session. A 15m lifetime silently
+// killed that token mid-session — the concierge (used late in a session) was the most
+// visible casualty, 401ing while already-loaded screens still showed cached data.
+// Match the access token to the refresh-token window until client refresh is built.
+const JWT_EXPIRES_IN = "30d";   // Long-lived access token (client has no refresh flow)
 const REFRESH_TOKEN_TTL_DAYS = 30; // Rotating refresh token TTL
 
 // ── Field-level encryption for OAuth tokens stored in DB ─────────────────────
@@ -835,8 +840,12 @@ async function verifyAccessToken(req) {
   if (!t) return null;
   try {
     const payload = jwt.verify(t, JWT_SECRET);
-    if (payload.type !== "access") return null;
-    return payload.email;
+    // Accept access tokens. Older builds signed tokens without a `type` field, and
+    // the `auth` middleware (used by the rest of the app) never checked type — so a
+    // strict check here rejected valid tokens ONLY at the concierge. Align the two:
+    // trust any valid JWT with an email, and only reject explicit refresh tokens.
+    if (payload.type === "refresh") return null;
+    return payload.email || null;
   } catch {
     return null;
   }
