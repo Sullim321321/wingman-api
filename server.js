@@ -2154,13 +2154,24 @@ async function scanGmailAccountForTrips(userEmail, accountEmail) {
     "subject:(ferry booking OR ferry ticket OR sailing confirmation) newer_than:6m",
     "subject:(activity booking OR experience confirmed OR tour confirmation) newer_than:6m",
     "subject:(Airbnb OR vacation rental OR short stay OR apartment booking) newer_than:6m",
-    // Dining reservations — restaurants + booking platforms
+    // Dining reservations — restaurants + booking platforms (US + European/Nordic)
     "from:opentable.com",
     "from:resy.com",
     "from:sevenrooms.com",
     "from:exploretock.com",
     "from:tock.com",
+    "from:waiteraid.com",
+    "from:bokabord.se",
+    "from:thefork.com",
+    "from:quandoo.com",
     "subject:(reservation confirmed OR your reservation OR table for OR dining reservation OR your table OR booking confirmed) newer_than:6m",
+    // Broad body-level catch — many hotels use a plain "Reservation Confirmation"
+    // subject from their own domain (SynXis/Design Hotels) and restaurants use
+    // non-obvious platforms. These booking-specific phrases match in subject OR body,
+    // so they catch confirmations the templated queries above miss. is_travel_booking
+    // filters out any non-travel noise before anything is stored.
+    "subject:(reservation confirmation) newer_than:1y",
+    "(\"confirmation number\" OR \"booking reference\" OR \"reservation is now confirmed\" OR \"your reservation is confirmed\") newer_than:1y",
   ];
   const seen = new Set();
   for (const q of queries) {
