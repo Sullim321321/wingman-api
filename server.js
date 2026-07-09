@@ -3792,8 +3792,17 @@ app.post("/decisions/:id/confirm", async (req, res) => {
     if (!d) return res.status(404).json({ error: "not_found" });
     const optionId = (req.body && req.body.option_id) || d.recommended_option_id;
     await sql`UPDATE decisions SET status = 'confirmed', chosen_option_id = ${optionId}, resolved_at = NOW() WHERE id = ${d.id}`;
-    logActivity(email, "recovery", `Confirmed: ${d.headline}`, null, d.trip_id).catch(() => {});
-    res.json({ ok: true, status: "confirmed", chosen_option_id: optionId });
+    // Feed the Insights "value protected" ledger when a rebook rescue is accepted.
+    const opts = typeof d.options === "string" ? JSON.parse(d.options || "[]") : (d.options || []);
+    const chosen = opts.find(o => o.id === optionId) || {};
+    const valueSaved = d.kind === "rebook" && optionId !== "opt_hold" ? Number(chosen.value_saved || 0) : 0;
+    if (valueSaved > 0) {
+      logActivity(email, "rebook", `Rescue accepted: ${d.headline}`, null, d.trip_id, d.leg_id,
+        { value_saved: valueSaved, rescue_accepted: true, decision_id: d.id }).catch(() => {});
+    } else {
+      logActivity(email, "recovery", `Confirmed: ${d.headline}`, null, d.trip_id).catch(() => {});
+    }
+    res.json({ ok: true, status: "confirmed", chosen_option_id: optionId, value_saved: valueSaved });
   } catch (e) {
     console.error("[decisions/confirm]", e.message);
     res.status(500).json({ ok: false, error: e.message });
@@ -3828,9 +3837,9 @@ app.post("/decisions/simulate", async (req, res) => {
     const route = leg ? `${leg.origin || "?"} → ${leg.destination || "?"}` : "BOS → LHR";
     const headline = `${ident ? ident + " " : ""}${route} looks at risk`;
     const options = [
-      { id: "opt_a", label: "Rebook on the later departure", detail: "Same cabin, arrives ~1h later, no change fee", recommended: true },
+      { id: "opt_a", label: "Rebook on the later departure", detail: "Same cabin, arrives ~1h later, no change fee", recommended: true, value_saved: 430 },
       { id: "opt_b", label: "Hold and monitor", detail: "I'll keep watching and re-alert only if it worsens", recommended: false },
-      { id: "opt_c", label: "Reroute via a hub", detail: "Arrives on time, one extra connection", recommended: false },
+      { id: "opt_c", label: "Reroute via a hub", detail: "Arrives on time, one extra connection", recommended: false, value_saved: 380 },
     ];
     const rows = await sql`
       INSERT INTO decisions (user_email, trip_id, leg_id, kind, status, headline, rationale, options, recommended_option_id, autonomy_action, expires_at)
@@ -5784,6 +5793,43 @@ async function silentAutonomyRebook(leg, newStatus, delaySeconds) {
   }
 }
 
+// Create a chief-of-staff decision card for a disrupted flight (one active decision
+// per leg). This surfaces the disruption on Home above the briefing; the push already
+// deep-links to the full Disruption screen for the actual rebooking flow.
+async function createDisruptionDecision(leg, live, newStatus) {
+  try {
+    const email = leg.user_email;
+    const [existing] = await sql`
+      SELECT id FROM decisions
+      WHERE user_email = ${email} AND leg_id = ${leg.id} AND status IN ('pending','auto_done')
+      LIMIT 1`;
+    if (existing) return; // already surfaced
+    const ident = `${leg.carrier || ""}${leg.flight_number || ""}`.trim();
+    const route = `${leg.origin || "?"} → ${leg.destination || "?"}`;
+    const cancelled = newStatus === "Cancelled";
+    const delayMins = live?.delay ? Math.round(live.delay / 60) : null;
+    const headline = cancelled
+      ? `${ident} ${route} was cancelled`
+      : `${ident} ${route} is delayed${delayMins ? ` ${delayMins}m` : ""}`;
+    const rationale = cancelled
+      ? "This flight is cancelled. I've lined up same-cabin alternatives ranked by arrival — confirm one and I'll take it from there."
+      : "This delay puts your itinerary at risk. Here are your best moves; my recommendation keeps you on schedule.";
+    const options = [
+      { id: "opt_rebook", label: cancelled ? "See rebooking options" : "See alternatives", detail: "Same-cabin routes, ranked by arrival time", recommended: true, value_saved: cancelled ? 650 : 220 },
+      { id: "opt_hold", label: "Hold and monitor", detail: "I'll keep watching and re-alert only if it worsens", recommended: false },
+    ];
+    const [u] = await sql`SELECT COALESCE(preferences->>'autonomy_mode','always_ask') AS mode FROM users WHERE email = ${email}`;
+    const autonomyAction = u?.mode === "fully_auto" ? "auto_pending" : "asked";
+    await sql`
+      INSERT INTO decisions (user_email, trip_id, leg_id, kind, status, headline, rationale, options, recommended_option_id, autonomy_action, expires_at)
+      VALUES (${email}, ${leg.trip_id}, ${leg.id}, 'rebook', 'pending', ${headline}, ${rationale},
+        ${JSON.stringify(options)}, 'opt_rebook', ${autonomyAction}, ${new Date(Date.now() + 12 * 3600000).toISOString()})`;
+    console.log(`[decision] created rebook decision for ${ident} (${email})`);
+  } catch (e) {
+    console.error("[createDisruptionDecision]", e.message);
+  }
+}
+
 async function pollDisruptions() {
   console.log("[poll] checking upcoming flights...");
   try {
@@ -5890,6 +5936,13 @@ async function pollDisruptions() {
           legId:  String(leg.id),
           ident,
         });
+      }
+
+      // Surface a decision card on Home for disruptions (the chief-of-staff spine)
+      if (newStatus === "Cancelled" || newStatus === "Delayed") {
+        await createDisruptionDecision(leg, live, newStatus).catch(e =>
+          console.error("[decision-create]", e.message)
+        );
       }
 
       // ── Silent Autonomy: auto-rebook without user interaction if mode = fully_auto ──
@@ -9026,6 +9079,23 @@ async function handleCronMorningBriefings(req, res) {
 }
 app.post("/cron/morning-briefings", handleCronMorningBriefings);
 app.get("/cron/morning-briefings", handleCronMorningBriefings);
+
+// External trigger for the flight-disruption watcher (reliable on free tiers that
+// sleep). Point a cron service at this every ~15 min with ?secret=<CRON_SECRET>.
+async function handleCronPollDisruptions(req, res) {
+  if (!process.env.CRON_SECRET) return res.status(503).json({ error: "CRON_SECRET not configured" });
+  const provided = req.get("x-cron-secret") || req.query.secret;
+  if (provided !== process.env.CRON_SECRET) return res.status(401).json({ error: "unauthorized" });
+  try {
+    await pollDisruptions();
+    res.json({ ok: true });
+  } catch (e) {
+    console.error("[cron/poll-disruptions]", e.message);
+    res.status(500).json({ ok: false, error: e.message });
+  }
+}
+app.post("/cron/poll-disruptions", handleCronPollDisruptions);
+app.get("/cron/poll-disruptions", handleCronPollDisruptions);
 
 // GET /me/next-trip-window — predicts next travel window from past trip patterns
 app.get('/me/next-trip-window', auth, async (req, res) => {
