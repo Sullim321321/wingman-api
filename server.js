@@ -1871,6 +1871,33 @@ async function scanGmailForTrips(userEmail, tokens) {
   await cleanupLooseTrips(userEmail, { dryRun: false }).catch(e => console.error("[scan re-home]", e.message));
   // Remove any duplicate legs that slipped in across repeated scans.
   await dedupeLegs(userEmail).catch(e => console.error("[scan dedupe]", e.message));
+  // Reset hotel stay counts to the real number of stays (repeated scans inflated them).
+  await recomputeHotelAffinity(userEmail).catch(e => console.error("[scan affinity]", e.message));
+}
+
+// Reset hotel_affinity.stay_count to the actual number of stays — counted as
+// distinct trips per property from the (deduped) hotel legs. The upsert increments
+// stay_count on every import, so repeated scans inflate it (e.g. "101 stays").
+async function recomputeHotelAffinity(userEmail) {
+  const updated = await sql`
+    UPDATE hotel_affinity ha
+    SET stay_count = sub.cnt
+    FROM (
+      SELECT LOWER(TRIM(COALESCE(tl.carrier, tl.destination))) AS name,
+             COUNT(DISTINCT tl.trip_id) AS cnt
+      FROM trip_legs tl
+      JOIN trips t ON t.id = tl.trip_id
+      WHERE t.user_email = ${userEmail}
+        AND tl.type IN ('hotel','airbnb')
+        AND COALESCE(tl.carrier, tl.destination) IS NOT NULL
+      GROUP BY 1
+    ) sub
+    WHERE ha.user_email = ${userEmail}
+      AND LOWER(TRIM(ha.property_name)) = sub.name
+      AND ha.stay_count <> sub.cnt
+    RETURNING ha.id
+  `;
+  return updated.length;
 }
 
 // Delete duplicate trip_legs, keeping the earliest of each identical booking.
@@ -3619,6 +3646,19 @@ app.post("/admin/dedupe-legs", async (req, res) => {
     res.json({ ok: true, removed });
   } catch (e) {
     console.error("[dedupe-legs]", e.message);
+    res.status(500).json({ ok: false, error: e.message });
+  }
+});
+
+// Fast: reset inflated hotel stay counts to real values. Pure SQL, no scan.
+app.post("/admin/recompute-affinity", async (req, res) => {
+  const email = await verifyAccessToken(req);
+  if (!email) return res.status(401).json({ error: "unauthorized" });
+  try {
+    const corrected = await recomputeHotelAffinity(email);
+    res.json({ ok: true, corrected });
+  } catch (e) {
+    console.error("[recompute-affinity]", e.message);
     res.status(500).json({ ok: false, error: e.message });
   }
 });
