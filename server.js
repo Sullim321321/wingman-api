@@ -3822,6 +3822,24 @@ app.post("/decisions/:id/dismiss", async (req, res) => {
   }
 });
 
+// POST /decisions/:id/undo — reverse a just-confirmed decision (reversible autonomy).
+// Restores it to pending and removes the value-protected event so Insights doesn't
+// count a rescue the user backed out of.
+app.post("/decisions/:id/undo", async (req, res) => {
+  const email = await verifyAccessToken(req);
+  if (!email) return res.status(401).json({ error: "unauthorized" });
+  try {
+    const [d] = await sql`SELECT id FROM decisions WHERE id = ${req.params.id} AND user_email = ${email}`;
+    if (!d) return res.status(404).json({ error: "not_found" });
+    await sql`UPDATE decisions SET status = 'pending', chosen_option_id = NULL, resolved_at = NULL WHERE id = ${d.id}`;
+    await sql`DELETE FROM activity_events WHERE user_email = ${email} AND type = 'rebook' AND (metadata->>'decision_id') = ${String(d.id)}`;
+    res.json({ ok: true, status: "pending" });
+  } catch (e) {
+    console.error("[decisions/undo]", e.message);
+    res.status(500).json({ ok: false, error: e.message });
+  }
+});
+
 // POST /decisions/simulate — create a test decision so the whole confirm/dismiss
 // loop is exercisable before the automated flight-watcher is switched on.
 app.post("/decisions/simulate", async (req, res) => {
