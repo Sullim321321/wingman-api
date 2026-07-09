@@ -2127,11 +2127,18 @@ async function scanGmailAccountForTrips(userEmail, accountEmail) {
     "subject:(ferry booking OR ferry ticket OR sailing confirmation) newer_than:6m",
     "subject:(activity booking OR experience confirmed OR tour confirmation) newer_than:6m",
     "subject:(Airbnb OR vacation rental OR short stay OR apartment booking) newer_than:6m",
+    // Dining reservations — restaurants + booking platforms
+    "from:opentable.com",
+    "from:resy.com",
+    "from:sevenrooms.com",
+    "from:exploretock.com",
+    "from:tock.com",
+    "subject:(reservation confirmed OR your reservation OR table for OR dining reservation OR your table OR booking confirmed) newer_than:6m",
   ];
   const seen = new Set();
   for (const q of queries) {
     try {
-      const listRes = await gmail.users.messages.list({ userId: "me", q, maxResults: 20 });
+      const listRes = await gmail.users.messages.list({ userId: "me", q, maxResults: 50 });
       const messages = listRes.data.messages || [];
       for (const msg of messages) {
         if (seen.has(msg.id)) continue;
@@ -3625,14 +3632,22 @@ app.post("/admin/rebuild-trips", async (req, res) => {
   if (!email) return res.status(401).json({ error: "unauthorized" });
   try {
     const [{ count }] = await sql`SELECT COUNT(*)::int AS count FROM trips WHERE user_email = ${email}`;
+    const wipe = req.query.wipe === "true";
     if (req.query.confirm !== "true") {
-      return res.json({ ok: true, preview: true, currentTrips: count, message: `Would delete ${count} trips and re-scan Gmail. Re-run with ?confirm=true to proceed.` });
+      return res.json({
+        ok: true, preview: true, currentTrips: count,
+        message: `Re-scan Gmail and reconcile ${count} trips (SAFE — no deletion). Add ?confirm=true to proceed. Add &wipe=true ONLY if you want to delete all trips first and rebuild from scratch.`,
+      });
     }
-    await sql`DELETE FROM trip_legs WHERE trip_id IN (SELECT id FROM trips WHERE user_email = ${email})`;
-    await sql`DELETE FROM trips WHERE user_email = ${email}`;
+    // DEFAULT is non-destructive: the scan dedupes and re-homes, so existing trips are
+    // preserved and only gaps get filled. A wipe-first rebuild is opt-in (&wipe=true)
+    // because a failed/slow scan after a wipe leaves the user with nothing.
+    if (wipe) {
+      await sql`DELETE FROM trip_legs WHERE trip_id IN (SELECT id FROM trips WHERE user_email = ${email})`;
+      await sql`DELETE FROM trips WHERE user_email = ${email}`;
+    }
     // Run the scan synchronously (awaited). A fire-and-forget background scan dies
-    // on Render's free tier — the dyno spins down the moment the response is sent,
-    // killing the in-flight scan (that's why a background rebuild produced 0 trips).
+    // on Render's free tier — the dyno spins down the moment the response is sent.
     await scanGmailForTrips(email);
     const after = await sql`
       SELECT
@@ -3646,9 +3661,9 @@ app.post("/admin/rebuild-trips", async (req, res) => {
     `;
     res.json({
       ok: true,
-      deleted: count,
+      wiped: wipe,
       rebuilt: after[0],
-      message: `Rebuilt ${after[0].trips} trips, ${after[0].legs} legs. ${after[0].dateless_anchors} anchor leg(s) still missing a date.`,
+      message: `${wipe ? "Wiped and rebuilt" : "Reconciled"}: ${after[0].trips} trips, ${after[0].legs} legs. ${after[0].dateless_anchors} anchor leg(s) still missing a date.`,
     });
   } catch (e) {
     console.error("[rebuild-trips]", e.message);
@@ -3791,7 +3806,7 @@ app.post("/concierge", conciergeLimiter, async (req, res) => {
     // Fetch user preferences (taste graph), trips, loyalty accounts, hotel affinity, and memory in parallel
     const [userRows, rawTrips, rawLegs, loyaltyAccounts, hotelAffinity, savedInstructions, memoryRows] = await Promise.all([
       sql`SELECT preferences, first_name, COALESCE(revealed_preferences, '{}') as revealed_preferences FROM users WHERE email = ${email}`,
-      sql`SELECT id, title, status, mode, created_at, companions_count, companion_names FROM trips WHERE user_email = ${email} ORDER BY created_at DESC LIMIT 10`,
+      sql`SELECT id, title, status, mode, created_at, companions_count, companion_names FROM trips WHERE user_email = ${email} ORDER BY created_at DESC LIMIT 25`,
       sql`SELECT tl.* FROM trip_legs tl INNER JOIN trips t ON tl.trip_id = t.id WHERE t.user_email = ${email} ORDER BY tl.departs_at ASC NULLS LAST`,
       sql`SELECT program, points_balance, elite_status, elite_level_next, points_to_next_level, nights_ytd, segments_ytd FROM loyalty_accounts WHERE user_email = ${email} ORDER BY program ASC`,
       sql`SELECT property_name, brand, city, country, tier, attributes, stay_count, last_stayed FROM hotel_affinity WHERE user_email = ${email} ORDER BY stay_count DESC, last_stayed DESC LIMIT 20`,
@@ -9719,33 +9734,47 @@ app.get("/me/stats", async (req, res) => {
   try {
     const year = new Date().getFullYear();
     const yearStart = new Date(`${year}-01-01T00:00:00Z`);
+    const yearEnd   = new Date(`${year + 1}-01-01T00:00:00Z`);
 
-    // Trips this year
+    // Trips this year — counted by when the travel actually happens (a leg departs
+    // this year), NOT when the record was imported. Only trips with a real dated leg
+    // count, which also excludes empty "Reservations"/"Needs review" holders.
     const tripsThisYear = await sql`
-      SELECT COUNT(*) as cnt FROM trips
-      WHERE user_email = ${email}
-        AND created_at >= ${yearStart}
-        AND archived = false
+      SELECT COUNT(DISTINCT t.id) as cnt FROM trips t
+      JOIN trip_legs tl ON tl.trip_id = t.id
+      WHERE t.user_email = ${email}
+        AND t.archived = false
+        AND tl.departs_at >= ${yearStart}
+        AND tl.departs_at <  ${yearEnd}
     `;
 
-    // Miles flown this year — estimate from flight legs
-    // We don't store distance, so we count legs and estimate 800mi average per leg
+    // Miles flown this year — estimate from flight legs (no stored distance)
     const flightLegsThisYear = await sql`
       SELECT COUNT(*) as cnt FROM trip_legs tl
       JOIN trips t ON t.id = tl.trip_id
       WHERE t.user_email = ${email}
         AND tl.type = 'flight'
         AND tl.departs_at >= ${yearStart}
+        AND tl.departs_at <  ${yearEnd}
     `;
     const estimatedMiles = Math.round(parseInt(flightLegsThisYear[0]?.cnt || 0) * 800);
 
-    // Nights away this year — sum from hotel legs
+    // Nights away this year — use the stored nights count when present, else derive
+    // it from the check-in → check-out span (the parser often omits `nights`).
     const nightsAway = await sql`
-      SELECT COALESCE(SUM(tl.nights), 0) as total FROM trip_legs tl
+      SELECT COALESCE(SUM(
+        CASE
+          WHEN tl.nights IS NOT NULL AND tl.nights > 0 THEN tl.nights
+          WHEN tl.arrives_at IS NOT NULL AND tl.departs_at IS NOT NULL
+            THEN GREATEST(1, ROUND(EXTRACT(EPOCH FROM (tl.arrives_at - tl.departs_at)) / 86400.0))
+          ELSE 0
+        END
+      ), 0) as total FROM trip_legs tl
       JOIN trips t ON t.id = tl.trip_id
       WHERE t.user_email = ${email}
-        AND tl.type = 'hotel'
+        AND tl.type IN ('hotel','airbnb')
         AND tl.departs_at >= ${yearStart}
+        AND tl.departs_at <  ${yearEnd}
     `;
 
     // Countries visited this year
