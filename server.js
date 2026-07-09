@@ -358,6 +358,17 @@ async function bootstrapDB() {
       )
     `;
     await sql`CREATE INDEX IF NOT EXISTS idx_activity_user ON activity_events(user_email, created_at DESC)`;
+    // Ledger of every Gmail message we've already run through the parser (any outcome).
+    // Lets rescans skip the expensive LLM call for emails we've already seen, so each
+    // email is parsed at most once ever instead of on every scan.
+    await sql`
+      CREATE TABLE IF NOT EXISTS processed_emails (
+        user_email TEXT NOT NULL,
+        email_id TEXT NOT NULL,
+        processed_at TIMESTAMPTZ DEFAULT NOW(),
+        PRIMARY KEY (user_email, email_id)
+      )
+    `;
     await sql`
       CREATE TABLE IF NOT EXISTS loyalty_accounts (
         id SERIAL PRIMARY KEY,
@@ -2405,6 +2416,10 @@ async function parseAndStoreEmail(userEmail, message) {
   // Check if already processed
   const existing = await sql`SELECT id FROM trips WHERE user_email = ${userEmail} AND raw_email_id = ${message.id}`;
   if (existing.length > 0) return;
+  // Skip the (paid) LLM call if we've already parsed this email once — any outcome.
+  // This is what keeps rescans from re-charging Anthropic for the whole inbox.
+  const seenBefore = await sql`SELECT 1 FROM processed_emails WHERE user_email = ${userEmail} AND email_id = ${message.id} LIMIT 1`;
+  if (seenBefore.length > 0) return;
 
   const headers = message.payload?.headers || [];
   const subject = headers.find(h => h.name === "Subject")?.value || "";
@@ -2485,6 +2500,10 @@ Return this exact JSON structure:
       console.error("[gmail parse] JSON parse failed:", parseErr.message, "Raw:", claudeResp.content[0]?.text?.slice(0, 200));
       return;
     }
+
+    // Record that we've parsed this email (even non-travel ones) so future scans
+    // never pay to run it through the LLM again.
+    await sql`INSERT INTO processed_emails (user_email, email_id) VALUES (${userEmail}, ${message.id}) ON CONFLICT DO NOTHING`.catch(() => {});
 
     if (!parsed.is_travel_booking) return;
 
