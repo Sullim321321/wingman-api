@@ -369,6 +369,29 @@ async function bootstrapDB() {
         PRIMARY KEY (user_email, email_id)
       )
     `;
+    // Decision spine — a "decision" is a headline + rationale + ranked options with a
+    // recommended default, tied to a trip/leg. Powers auto-handled disruptions and
+    // one-tap decision cards. (Build-plan ticket #1.)
+    await sql`
+      CREATE TABLE IF NOT EXISTS decisions (
+        id SERIAL PRIMARY KEY,
+        user_email TEXT NOT NULL,
+        trip_id INTEGER,
+        leg_id INTEGER,
+        kind TEXT NOT NULL,
+        status TEXT NOT NULL DEFAULT 'pending',
+        headline TEXT NOT NULL,
+        rationale TEXT,
+        options JSONB DEFAULT '[]',
+        recommended_option_id TEXT,
+        autonomy_action TEXT,
+        chosen_option_id TEXT,
+        created_at TIMESTAMPTZ DEFAULT NOW(),
+        resolved_at TIMESTAMPTZ,
+        expires_at TIMESTAMPTZ
+      )
+    `;
+    await sql`CREATE INDEX IF NOT EXISTS idx_decisions_user ON decisions(user_email, status, created_at DESC)`;
     await sql`
       CREATE TABLE IF NOT EXISTS loyalty_accounts (
         id SERIAL PRIMARY KEY,
@@ -3735,6 +3758,89 @@ app.post("/admin/merge-duplicate-trips", async (req, res) => {
     res.json({ ok: true, merged });
   } catch (e) {
     console.error("[merge-duplicate-trips]", e.message);
+    res.status(500).json({ ok: false, error: e.message });
+  }
+});
+
+// ─── Decision spine (build-plan ticket #1) ──────────────────────────────────────
+// GET /decisions — pending / auto-done decisions that still need surfacing.
+app.get("/decisions", async (req, res) => {
+  const email = await verifyAccessToken(req);
+  if (!email) return res.status(401).json({ error: "unauthorized" });
+  try {
+    const rows = await sql`
+      SELECT * FROM decisions
+      WHERE user_email = ${email}
+        AND status IN ('pending', 'auto_done')
+        AND (expires_at IS NULL OR expires_at > NOW())
+      ORDER BY created_at DESC
+      LIMIT 20`;
+    res.json({ ok: true, decisions: rows });
+  } catch (e) {
+    console.error("[decisions]", e.message);
+    res.status(500).json({ ok: false, error: e.message });
+  }
+});
+
+// POST /decisions/:id/confirm — confirm the recommended (or chosen) option.
+// (Execution of the real action — Duffel rebook etc. — will hook in here later.)
+app.post("/decisions/:id/confirm", async (req, res) => {
+  const email = await verifyAccessToken(req);
+  if (!email) return res.status(401).json({ error: "unauthorized" });
+  try {
+    const [d] = await sql`SELECT * FROM decisions WHERE id = ${req.params.id} AND user_email = ${email}`;
+    if (!d) return res.status(404).json({ error: "not_found" });
+    const optionId = (req.body && req.body.option_id) || d.recommended_option_id;
+    await sql`UPDATE decisions SET status = 'confirmed', chosen_option_id = ${optionId}, resolved_at = NOW() WHERE id = ${d.id}`;
+    logActivity(email, "recovery", `Confirmed: ${d.headline}`, null, d.trip_id).catch(() => {});
+    res.json({ ok: true, status: "confirmed", chosen_option_id: optionId });
+  } catch (e) {
+    console.error("[decisions/confirm]", e.message);
+    res.status(500).json({ ok: false, error: e.message });
+  }
+});
+
+// POST /decisions/:id/dismiss — snooze/decline.
+app.post("/decisions/:id/dismiss", async (req, res) => {
+  const email = await verifyAccessToken(req);
+  if (!email) return res.status(401).json({ error: "unauthorized" });
+  try {
+    await sql`UPDATE decisions SET status = 'dismissed', resolved_at = NOW() WHERE id = ${req.params.id} AND user_email = ${email}`;
+    res.json({ ok: true, status: "dismissed" });
+  } catch (e) {
+    console.error("[decisions/dismiss]", e.message);
+    res.status(500).json({ ok: false, error: e.message });
+  }
+});
+
+// POST /decisions/simulate — create a test decision so the whole confirm/dismiss
+// loop is exercisable before the automated flight-watcher is switched on.
+app.post("/decisions/simulate", async (req, res) => {
+  const email = await verifyAccessToken(req);
+  if (!email) return res.status(401).json({ error: "unauthorized" });
+  try {
+    const [leg] = await sql`
+      SELECT tl.*, t.id AS trip_id, t.title
+      FROM trip_legs tl JOIN trips t ON t.id = tl.trip_id
+      WHERE t.user_email = ${email} AND tl.type = 'flight' AND tl.departs_at > NOW()
+      ORDER BY tl.departs_at ASC LIMIT 1`;
+    const ident = leg ? `${leg.carrier || ""}${leg.flight_number || ""}`.trim() : "";
+    const route = leg ? `${leg.origin || "?"} → ${leg.destination || "?"}` : "BOS → LHR";
+    const headline = `${ident ? ident + " " : ""}${route} looks at risk`;
+    const options = [
+      { id: "opt_a", label: "Rebook on the later departure", detail: "Same cabin, arrives ~1h later, no change fee", recommended: true },
+      { id: "opt_b", label: "Hold and monitor", detail: "I'll keep watching and re-alert only if it worsens", recommended: false },
+      { id: "opt_c", label: "Reroute via a hub", detail: "Arrives on time, one extra connection", recommended: false },
+    ];
+    const rows = await sql`
+      INSERT INTO decisions (user_email, trip_id, leg_id, kind, status, headline, rationale, options, recommended_option_id, autonomy_action, expires_at)
+      VALUES (${email}, ${leg?.trip_id || null}, ${leg?.id || null}, 'rebook', 'pending', ${headline},
+        ${"A high delay probability and a tight downstream connection put this itinerary at risk. The later departure keeps you in the same cabin with no change fee — that's my recommendation."},
+        ${JSON.stringify(options)}, 'opt_a', 'asked', ${new Date(Date.now() + 6 * 3600000).toISOString()})
+      RETURNING id`;
+    res.json({ ok: true, id: rows[0].id, headline });
+  } catch (e) {
+    console.error("[decisions/simulate]", e.message);
     res.status(500).json({ ok: false, error: e.message });
   }
 });
