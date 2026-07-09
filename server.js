@@ -1882,8 +1882,41 @@ async function scanGmailForTrips(userEmail, tokens) {
   await cleanupLooseTrips(userEmail, { dryRun: false }).catch(e => console.error("[scan re-home]", e.message));
   // Remove any duplicate legs that slipped in across repeated scans.
   await dedupeLegs(userEmail).catch(e => console.error("[scan dedupe]", e.message));
+  // Fold near-duplicate trips (e.g. "Brentwood" + "Brentwood Hotel") into one.
+  await mergeDuplicateTrips(userEmail).catch(e => console.error("[scan merge]", e.message));
   // Reset hotel stay counts to the real number of stays (repeated scans inflated them).
   await recomputeHotelAffinity(userEmail).catch(e => console.error("[scan affinity]", e.message));
+}
+
+// Merge trips whose titles are the same once trailing generic lodging words are
+// stripped ("Brentwood Hotel" -> "Brentwood"). Legs move into the canonical trip
+// (shortest, cleanest title); the redundant trip is deleted. Pure SQL, no LLM.
+async function mergeDuplicateTrips(userEmail) {
+  const trips = await sql`SELECT id, title FROM trips WHERE user_email = ${userEmail}`;
+  const norm = (t) => String(t || "").trim().toLowerCase()
+    .replace(/\s+(hotel|hotels|airbnb|stay|reservations?|resort|inn|suites?|apartment|apartments)$/i, "")
+    .trim();
+  const groups = {};
+  for (const t of trips) {
+    const k = norm(t.title);
+    if (!k) continue;
+    (groups[k] = groups[k] || []).push(t);
+  }
+  let merged = 0;
+  for (const k of Object.keys(groups)) {
+    const g = groups[k];
+    if (g.length < 2) continue;
+    // Keep the trip with the shortest title (prefer "Brentwood" over "Brentwood Hotel").
+    g.sort((a, b) => (a.title || "").length - (b.title || "").length || a.id - b.id);
+    const keep = g[0];
+    for (const t of g.slice(1)) {
+      await sql`UPDATE trip_legs SET trip_id = ${keep.id} WHERE trip_id = ${t.id}`;
+      await sql`DELETE FROM trips WHERE id = ${t.id} AND user_email = ${userEmail}`;
+      merged++;
+    }
+  }
+  if (merged > 0) await dedupeLegs(userEmail).catch(() => {});
+  return merged;
 }
 
 // Reset hotel_affinity.stay_count to the actual number of stays — counted as
@@ -3689,6 +3722,19 @@ app.post("/admin/recompute-affinity", async (req, res) => {
     res.json({ ok: true, corrected });
   } catch (e) {
     console.error("[recompute-affinity]", e.message);
+    res.status(500).json({ ok: false, error: e.message });
+  }
+});
+
+// Fast: merge near-duplicate trips (e.g. "Brentwood" + "Brentwood Hotel"). Pure SQL.
+app.post("/admin/merge-duplicate-trips", async (req, res) => {
+  const email = await verifyAccessToken(req);
+  if (!email) return res.status(401).json({ error: "unauthorized" });
+  try {
+    const merged = await mergeDuplicateTrips(email);
+    res.json({ ok: true, merged });
+  } catch (e) {
+    console.error("[merge-duplicate-trips]", e.message);
     res.status(500).json({ ok: false, error: e.message });
   }
 });
