@@ -585,6 +585,18 @@ async function bootstrapDB() {
         updated_at TIMESTAMPTZ DEFAULT NOW()
       )
     `;
+    // Standing orders (Roadmap 2) — per-trip pre-authorized auto-rebooking rules.
+    await sql`
+      CREATE TABLE IF NOT EXISTS standing_orders (
+        trip_id INTEGER PRIMARY KEY REFERENCES trips(id) ON DELETE CASCADE,
+        user_email TEXT NOT NULL,
+        enabled BOOLEAN DEFAULT FALSE,
+        max_price INTEGER,
+        min_cabin TEXT,
+        avoid_airports JSONB DEFAULT '[]',
+        updated_at TIMESTAMPTZ DEFAULT NOW()
+      )
+    `;
     await sql`ALTER TABLE users ADD COLUMN IF NOT EXISTS revealed_preferences JSONB DEFAULT '{}'`;
     await sql`ALTER TABLE users ADD COLUMN IF NOT EXISTS apple_sub TEXT`;
     await sql`ALTER TABLE users ADD COLUMN IF NOT EXISTS phone TEXT`;
@@ -5700,9 +5712,18 @@ async function silentAutonomyRebook(leg, newStatus, delaySeconds) {
     const userRows = await sql`SELECT preferences FROM users WHERE email = ${leg.user_email}`;
     const prefs = userRows[0]?.preferences || {};
     const autonomyMode = prefs.autonomy_mode || "always_ask";
-    if (autonomyMode !== "fully_auto") return; // Only act for fully autonomous users
 
-    const threshold = prefs.threshold || 500; // Max spend without asking
+    // Standing order (Roadmap 2): a per-trip pre-authorization that grants autonomy
+    // for this trip even when the global mode is "always_ask", with its own limits.
+    let standingOrder = null;
+    if (leg.trip_id) {
+      const soRows = await sql`SELECT * FROM standing_orders WHERE trip_id = ${leg.trip_id} AND enabled = TRUE`;
+      standingOrder = soRows[0] || null;
+    }
+    if (autonomyMode !== "fully_auto" && !standingOrder) return; // Only act if authorized
+
+    // Standing order limits override the global defaults for this trip.
+    const threshold = standingOrder?.max_price || prefs.threshold || 500; // Max spend without asking
     const delayMins = delaySeconds ? Math.round(delaySeconds / 60) : 0;
 
     // Only auto-rebook cancellations or delays > 2 hours
@@ -5729,7 +5750,7 @@ async function silentAutonomyRebook(leg, newStatus, delaySeconds) {
     const offerRequest = await duffel.offerRequests.create({
       slices: [{ origin: leg.origin, destination: leg.destination, departure_date: dateStr }],
       passengers: [{ type: "adult" }],
-      cabin_class: prefs.cabin_preference || "economy",
+      cabin_class: standingOrder?.min_cabin || prefs.cabin_preference || "economy",
     });
     const offers = await duffel.offers.list({ offer_request_id: offerRequest.data.id, sort: "total_amount" });
     const bestOffer = offers.data?.[0];
@@ -8985,8 +9006,19 @@ setInterval(async () => {
           ORDER BY tl.departs_at ASC LIMIT 1
         `;
         const next = nextRows[0];
+        // Chief-of-staff framing: lead with anything that needs the user.
+        let pendingDecisions = 0;
+        try {
+          const dRows = await sql`SELECT COUNT(*) AS c FROM decisions WHERE user_email = ${user.email} AND status = 'pending'`;
+          pendingDecisions = parseInt(dRows[0]?.c || 0);
+        } catch {}
         let pushTitle, body;
-        if (next) {
+        if (pendingDecisions > 0) {
+          pushTitle = `${pendingDecisions} decision${pendingDecisions !== 1 ? 's' : ''} need you`;
+          body = next
+            ? `Before ${next.destination}, there ${pendingDecisions === 1 ? 'is 1 thing' : `are ${pendingDecisions} things`} waiting on your call.`
+            : `I've got ${pendingDecisions === 1 ? 'a decision' : 'a few decisions'} ready for you — one tap each.`;
+        } else if (next) {
           const days = Math.round((new Date(next.departs_at) - now) / 86400000);
           if (days <= 1) {
             pushTitle = `Your flight is ${days === 0 ? 'today' : 'tomorrow'} ✈`;
@@ -11087,6 +11119,45 @@ app.get("/destination/image", auth, async (req, res) => {
   } catch (e) {
     console.error("[destination/image]", e.message);
     res.json({ url: null });
+  }
+});
+
+// ---------------------------------------------------------------------------
+// Standing orders (Roadmap 2) — per-trip pre-authorized auto-rebooking rules.
+// ---------------------------------------------------------------------------
+app.get("/trips/:tripId/standing-order", auth, async (req, res) => {
+  const email = await verifyAccessToken(req);
+  if (!email) return res.status(401).json({ error: "unauthorized" });
+  try {
+    const own = await sql`SELECT id FROM trips WHERE id = ${req.params.tripId} AND user_email = ${email}`;
+    if (!own.length) return res.status(404).json({ error: "trip not found" });
+    const rows = await sql`SELECT enabled, max_price, min_cabin, avoid_airports FROM standing_orders WHERE trip_id = ${req.params.tripId}`;
+    res.json(rows[0] || { enabled: false, max_price: null, min_cabin: null, avoid_airports: [] });
+  } catch (e) {
+    console.error("[standing-order/get]", e.message);
+    res.status(500).json({ error: e.message });
+  }
+});
+
+app.put("/trips/:tripId/standing-order", auth, async (req, res) => {
+  const email = await verifyAccessToken(req);
+  if (!email) return res.status(401).json({ error: "unauthorized" });
+  try {
+    const own = await sql`SELECT id FROM trips WHERE id = ${req.params.tripId} AND user_email = ${email}`;
+    if (!own.length) return res.status(404).json({ error: "trip not found" });
+    const { enabled, max_price, min_cabin, avoid_airports } = req.body || {};
+    const avoid = JSON.stringify(Array.isArray(avoid_airports) ? avoid_airports : []);
+    await sql`
+      INSERT INTO standing_orders (trip_id, user_email, enabled, max_price, min_cabin, avoid_airports, updated_at)
+      VALUES (${req.params.tripId}, ${email}, ${!!enabled}, ${max_price || null}, ${min_cabin || null}, ${avoid}::jsonb, NOW())
+      ON CONFLICT (trip_id) DO UPDATE SET
+        enabled = EXCLUDED.enabled, max_price = EXCLUDED.max_price, min_cabin = EXCLUDED.min_cabin,
+        avoid_airports = EXCLUDED.avoid_airports, updated_at = NOW()
+    `;
+    res.json({ ok: true });
+  } catch (e) {
+    console.error("[standing-order/put]", e.message);
+    res.status(500).json({ error: e.message });
   }
 });
 
