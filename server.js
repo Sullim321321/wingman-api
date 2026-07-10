@@ -11049,6 +11049,54 @@ app.delete("/trips/:tripId/legs/:legId", auth, async (req, res) => {
 });
 
 // ---------------------------------------------------------------------------
+// GET /onboarding/summary — "here's what I found" backfill recap (read-only)
+// Used after a Gmail connect to make the value legible in the first 30 seconds.
+// ---------------------------------------------------------------------------
+app.get("/onboarding/summary", auth, async (req, res) => {
+  const email = await verifyAccessToken(req);
+  if (!email) return res.status(401).json({ error: "unauthorized" });
+  try {
+    const [{ trips_found }] = await sql`
+      SELECT COUNT(*)::int AS trips_found FROM trips WHERE user_email = ${email}`;
+
+    const [{ earliest }] = await sql`
+      SELECT MIN(departs_at) AS earliest FROM trip_legs
+      WHERE trip_id IN (SELECT id FROM trips WHERE user_email = ${email})`;
+
+    const favRows = await sql`
+      SELECT property_name, stay_count, city FROM hotel_affinity
+      WHERE user_email = ${email}
+      ORDER BY stay_count DESC, last_stayed DESC NULLS LAST
+      LIMIT 1`;
+
+    const cityRows = await sql`
+      SELECT destination AS city, COUNT(*)::int AS n FROM trip_legs
+      WHERE type = 'flight' AND destination IS NOT NULL AND destination <> ''
+        AND trip_id IN (SELECT id FROM trips WHERE user_email = ${email})
+      GROUP BY destination ORDER BY n DESC LIMIT 1`;
+
+    const [{ dining_count }] = await sql`
+      SELECT COUNT(*)::int AS dining_count FROM trip_legs
+      WHERE type IN ('dining','restaurant')
+        AND trip_id IN (SELECT id FROM trips WHERE user_email = ${email})`;
+
+    const fav = favRows[0] || null;
+    res.json({
+      trips_found: trips_found || 0,
+      earliest_year: earliest ? new Date(earliest).getFullYear() : null,
+      favorite_hotel: fav && fav.stay_count > 1
+        ? { name: fav.property_name, stays: fav.stay_count, city: fav.city || null }
+        : null,
+      top_city: cityRows[0]?.city || null,
+      dining_count: dining_count || 0,
+    });
+  } catch (e) {
+    console.error("[onboarding/summary]", e.message);
+    res.status(500).json({ error: e.message });
+  }
+});
+
+// ---------------------------------------------------------------------------
 // POST /trips/:tripId/legs — add a single leg to an existing trip
 // ---------------------------------------------------------------------------
 app.post("/trips/:tripId/legs", auth, async (req, res) => {
