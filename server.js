@@ -358,6 +358,7 @@ async function bootstrapDB() {
       )
     `;
     await sql`CREATE INDEX IF NOT EXISTS idx_activity_user ON activity_events(user_email, created_at DESC)`;
+    await sql`ALTER TABLE activity_events ADD COLUMN IF NOT EXISTS dismissed BOOLEAN DEFAULT FALSE`;
     // Ledger of every Gmail message we've already run through the parser (any outcome).
     // Lets rescans skip the expensive LLM call for emails we've already seen, so each
     // email is parsed at most once ever instead of on every scan.
@@ -1304,13 +1305,26 @@ app.get("/activity", async (req, res) => {
              t.title as trip_title
       FROM activity_events ae
       LEFT JOIN trips t ON t.id = ae.trip_id
-      WHERE ae.user_email = ${email}
+      WHERE ae.user_email = ${email} AND ae.dismissed IS NOT TRUE
       ORDER BY ae.created_at DESC
       LIMIT ${limit}
     `;
     res.json({ events });
   } catch (e) {
     console.error("[activity]", e.message);
+    res.status(500).json({ error: e.message });
+  }
+});
+
+// POST /activity/:id/dismiss — soft-dismiss a signal (swipe-to-dismiss)
+app.post("/activity/:id/dismiss", async (req, res) => {
+  const email = await verifyAccessToken(req);
+  if (!email) return res.status(401).json({ error: "unauthorized" });
+  try {
+    await sql`UPDATE activity_events SET dismissed = TRUE WHERE id = ${req.params.id} AND user_email = ${email}`;
+    res.json({ ok: true });
+  } catch (e) {
+    console.error("[activity/dismiss]", e.message);
     res.status(500).json({ error: e.message });
   }
 });
