@@ -6126,63 +6126,40 @@ async function dispatchUberOnLanding(leg) {
 // ---------------------------------------------------------------------------
 // Apple Wallet — PassKit .pkpass generation
 // ---------------------------------------------------------------------------
-const { PKPass } = require("passkit-generator");
+const wallet = require("./wallet");
 const fs = require("fs");
 const os = require("os");
 
-// GET /wallet/pass/:legId — generate a .pkpass for a flight or hotel leg
+// GET /wallet/pass/:legId — generate + sign a real .pkpass for a leg.
+// Opened via Safari (no auth header possible), so the access token comes as ?token=.
 app.get("/wallet/pass/:legId", async (req, res) => {
   try {
-    const authHeader = req.headers.authorization || "";
-    const token = authHeader.replace("Bearer ", "");
-    const { email } = jwt.verify(token, JWT_SECRET);
+    const token = (req.query.token || (req.headers.authorization || "").replace("Bearer ", "")).toString();
+    let email;
+    try { ({ email } = jwt.verify(token, JWT_SECRET)); }
+    catch { return res.status(401).json({ error: "unauthorized" }); }
+
     const { legId } = req.params;
-    // Fetch leg + trip
     const rows = await sql`
-      SELECT tl.*, t.title as trip_title, t.mode as trip_mode
+      SELECT tl.*, t.title AS trip_title
       FROM trip_legs tl
       JOIN trips t ON t.id = tl.trip_id
       WHERE tl.id = ${legId} AND t.user_email = ${email}
     `;
     if (!rows.length) return res.status(404).json({ error: "Leg not found" });
     const leg = rows[0];
-    // Check if Apple Wallet certs are configured
-    const certPem = process.env.APPLE_WALLET_CERT_PEM;
-    const keyPem = process.env.APPLE_WALLET_KEY_PEM;
-    const wwdrPem = process.env.APPLE_WALLET_WWDR_PEM;
-    const passTypeId = process.env.APPLE_WALLET_PASS_TYPE_ID || "pass.app.wingmantravel";
-    const teamId = process.env.APPLE_TEAM_ID || "7BXHSR34RG";
-    if (!certPem || !keyPem || !wwdrPem) {
-      // Return a JSON representation of what the pass would contain
-      // so the mobile app can show a preview
-      return res.json({
-        preview: true,
-        type: leg.type,
-        data: buildPassData(leg, email, passTypeId, teamId),
-        message: "Apple Wallet certificates not yet configured. Add APPLE_WALLET_CERT_PEM, APPLE_WALLET_KEY_PEM, and APPLE_WALLET_WWDR_PEM to Render environment.",
-      });
+
+    if (!wallet.walletReady()) {
+      return res.status(503).json({ error: "Wallet signing not configured on the server yet." });
     }
-    const passData = buildPassData(leg, email, passTypeId, teamId);
-    const pass = new PKPass({}, {
-      wwdr: Buffer.from(wwdrPem),
-      signerCert: Buffer.from(certPem),
-      signerKey: Buffer.from(keyPem),
-    }, passData);
-    // Add Wingman logo (white on dark background)
-    // In production, serve from a CDN; here we use a placeholder
-    const logoPath = path.join(__dirname, "assets", "wallet", "logo.png");
-    if (fs.existsSync(logoPath)) {
-      pass.addBuffer("logo.png", fs.readFileSync(logoPath));
-      pass.addBuffer("logo@2x.png", fs.readFileSync(logoPath));
-      pass.addBuffer("icon.png", fs.readFileSync(logoPath));
-      pass.addBuffer("icon@2x.png", fs.readFileSync(logoPath));
-    }
-    const pkpassBuffer = await pass.getAsBuffer();
+
+    const passJson = wallet.passJsonForLeg(leg, { title: leg.trip_title });
+    const buf = await wallet.buildPkpass(passJson);
     res.set({
       "Content-Type": "application/vnd.apple.pkpass",
-      "Content-Disposition": `attachment; filename="wingman-${leg.type}-${leg.id}.pkpass"`,
+      "Content-Disposition": `attachment; filename="wingman-${leg.type || "trip"}-${leg.id}.pkpass"`,
     });
-    res.send(pkpassBuffer);
+    res.send(buf);
   } catch (e) {
     console.error("[wallet]", e.message);
     res.status(500).json({ error: e.message });
