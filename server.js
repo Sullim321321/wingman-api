@@ -575,6 +575,15 @@ async function bootstrapDB() {
         UNIQUE(user_email, restaurant_name)
       )
     `;
+    await sql`
+      CREATE TABLE IF NOT EXISTS destination_images (
+        city TEXT PRIMARY KEY,
+        url TEXT,
+        credit TEXT,
+        credit_url TEXT,
+        updated_at TIMESTAMPTZ DEFAULT NOW()
+      )
+    `;
     await sql`ALTER TABLE users ADD COLUMN IF NOT EXISTS revealed_preferences JSONB DEFAULT '{}'`;
     await sql`ALTER TABLE users ADD COLUMN IF NOT EXISTS apple_sub TEXT`;
     await sql`ALTER TABLE users ADD COLUMN IF NOT EXISTS phone TEXT`;
@@ -11045,6 +11054,48 @@ app.delete("/trips/:tripId/legs/:legId", auth, async (req, res) => {
     res.json({ ok: true });
   } catch (e) {
     res.status(500).json({ error: e.message });
+  }
+});
+
+// ---------------------------------------------------------------------------
+// GET /destination/image?city=X — a muted destination photo for trip screens.
+// Backed by Unsplash (key held server-side), cached per city for 30 days so we
+// never approach the rate limit. Returns { url, credit, credit_url } or url:null.
+// ---------------------------------------------------------------------------
+const UNSPLASH_ACCESS_KEY = process.env.UNSPLASH_ACCESS_KEY || "SqZOgtKwYCfTxuTwmvM93Am9I9SwQAcpoBMGek6oSDQ";
+app.get("/destination/image", auth, async (req, res) => {
+  const email = await verifyAccessToken(req);
+  if (!email) return res.status(401).json({ error: "unauthorized" });
+  const cityRaw = (req.query.city || "").toString().trim();
+  if (!cityRaw) return res.json({ url: null });
+  const cityKey = cityRaw.toLowerCase();
+  try {
+    const cached = await sql`SELECT url, credit, credit_url, updated_at FROM destination_images WHERE city = ${cityKey}`;
+    if (cached.length && (Date.now() - new Date(cached[0].updated_at).getTime()) < 30 * 86400000) {
+      return res.json({ url: cached[0].url, credit: cached[0].credit, credit_url: cached[0].credit_url });
+    }
+    if (!UNSPLASH_ACCESS_KEY) return res.json({ url: null });
+    const r = await fetch(
+      `https://api.unsplash.com/search/photos?query=${encodeURIComponent(cityRaw)}&orientation=landscape&per_page=1&content_filter=high`,
+      { headers: { Authorization: `Client-ID ${UNSPLASH_ACCESS_KEY}` } }
+    );
+    if (!r.ok) return res.json({ url: cached[0]?.url || null, credit: cached[0]?.credit || null, credit_url: cached[0]?.credit_url || null });
+    const d = await r.json();
+    const p = (d.results || [])[0];
+    if (!p) return res.json({ url: null });
+    // Muted, editorial wash: desaturate slightly + size down.
+    const url = `${p.urls.raw}&w=1200&q=80&fit=crop&sat=-45`;
+    const credit = p.user?.name || null;
+    const credit_url = p.links?.html || p.user?.links?.html || null;
+    await sql`
+      INSERT INTO destination_images (city, url, credit, credit_url, updated_at)
+      VALUES (${cityKey}, ${url}, ${credit}, ${credit_url}, NOW())
+      ON CONFLICT (city) DO UPDATE SET url = EXCLUDED.url, credit = EXCLUDED.credit, credit_url = EXCLUDED.credit_url, updated_at = NOW()
+    `;
+    res.json({ url, credit, credit_url });
+  } catch (e) {
+    console.error("[destination/image]", e.message);
+    res.json({ url: null });
   }
 });
 
