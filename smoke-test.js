@@ -193,4 +193,44 @@ async function hit(path, token) {
     process.exit(1);
   }
   console.log(`  ${GREEN}No 500s. Every endpoint tested actually runs.${RESET}\n`);
+
+  // ───────────────────────────────────────────────────────────────────────────
+  // PART 2 — is the answer POSSIBLE?
+  //
+  // Everything above only proves the server responded. But "266 nights" came back
+  // as a clean 200 for weeks. A well-formed response carrying impossible data is
+  // the failure mode that status codes are structurally blind to.
+  //
+  // So now we assert invariants: statements about the data that must never be true.
+  // ───────────────────────────────────────────────────────────────────────────
+  console.log(`  ${BOLD}Data invariants${RESET} ${DIM}— is the answer possible, not just well-formed?${RESET}\n`);
+
+  const invRes = await fetch(`${API}/admin/invariants`, { headers: { Authorization: `Bearer ${token}` } });
+  if (invRes.status !== 200) {
+    console.log(`  ${YELLOW}! /admin/invariants returned ${invRes.status} — skipping (deploy the latest server).${RESET}\n`);
+    return;
+  }
+  const inv = await invRes.json();
+
+  if (inv.ok) {
+    console.log(`  ${GREEN}✓ all ${inv.checked} invariants hold — the data is sane.${RESET}\n`);
+    return;
+  }
+
+  console.log(`  ${RED}✗ ${inv.violations.length} of ${inv.checked} invariants VIOLATED${RESET}\n`);
+  for (const v of inv.violations) {
+    console.log(`  ${RED}✗ ${v.name}${RESET} ${DIM}(${v.count ?? "?"} found)${RESET}`);
+    console.log(`    ${DIM}${v.why}${RESET}`);
+    for (const ex of (v.examples || []).slice(0, 3)) {
+      const bits = Object.entries(ex)
+        .filter(([k]) => k !== "id")
+        .map(([k, val]) => `${k}=${val}`)
+        .join("  ");
+      console.log(`      ${DIM}#${ex.id ?? "—"}  ${bits}${RESET}`);
+    }
+    console.log("");
+  }
+  console.log(`  ${DIM}The endpoints all returned 200. The data is still wrong.${RESET}`);
+  console.log(`  ${DIM}That gap is the whole point of this section.${RESET}\n`);
+  process.exit(1);
 })();

@@ -4087,6 +4087,143 @@ app.post("/admin/cleanup-trips", async (req, res) => {
   }
 });
 
+/**
+ * GET /admin/invariants — assert things that must NEVER be true of the data.
+ *
+ * WHY THIS EXISTS
+ * ---------------
+ * Every bug we found by hand had the same shape: the endpoint returned 200, the
+ * JSON was well-formed, the app rendered it beautifully — and it said "266 nights".
+ * Nothing FAILED. The system faithfully served nonsense.
+ *
+ * A status-code test can never catch that. It asks "did it respond?" when the
+ * question that matters is "is the answer possible?".
+ *
+ * So this checks the data itself. Each invariant is a statement that should return
+ * ZERO rows. Any row is a bug — in the parser, the grouping, or a migration — and
+ * it is reported with real examples so it can be chased down rather than shrugged at.
+ *
+ * Add to this list every time we find a bug. That is what stops it recurring.
+ */
+const INVARIANTS = [
+  {
+    name: "hotel stay longer than 30 nights",
+    why: "A check-out date parsed with the wrong year. These become date magnets that swallow unrelated trips.",
+    query: (email) => sql`
+      SELECT tl.id, tl.property_name AS detail, tl.departs_at, tl.arrives_at,
+             ROUND(EXTRACT(EPOCH FROM (tl.arrives_at - tl.departs_at)) / 86400) AS days
+      FROM trip_legs tl JOIN trips t ON t.id = tl.trip_id
+      WHERE t.user_email = ${email}
+        AND tl.arrives_at IS NOT NULL AND tl.departs_at IS NOT NULL
+        AND tl.arrives_at - tl.departs_at > INTERVAL '30 days'
+      LIMIT 5`,
+  },
+  {
+    name: "leg that arrives before it departs",
+    why: "Time does not work that way. A date-parse error.",
+    query: (email) => sql`
+      SELECT tl.id, COALESCE(tl.property_name, tl.flight_number) AS detail, tl.departs_at, tl.arrives_at
+      FROM trip_legs tl JOIN trips t ON t.id = tl.trip_id
+      WHERE t.user_email = ${email}
+        AND tl.arrives_at IS NOT NULL AND tl.departs_at IS NOT NULL
+        AND tl.arrives_at < tl.departs_at
+      LIMIT 5`,
+  },
+  {
+    name: "trip spanning more than 30 days",
+    why: "Almost always a trip that has absorbed unrelated travel, not a real long journey.",
+    query: (email) => sql`
+      SELECT t.id, t.title AS detail,
+             ROUND(EXTRACT(EPOCH FROM (MAX(COALESCE(tl.arrives_at, tl.departs_at)) - MIN(tl.departs_at))) / 86400) AS days,
+             COUNT(tl.id)::int AS legs
+      FROM trips t JOIN trip_legs tl ON tl.trip_id = t.id
+      WHERE t.user_email = ${email}
+      GROUP BY t.id, t.title
+      HAVING MAX(COALESCE(tl.arrives_at, tl.departs_at)) - MIN(tl.departs_at) > INTERVAL '30 days'
+      LIMIT 5`,
+  },
+  {
+    name: "nights count disagrees with the dates",
+    why: "The stored nights value and the actual date range have drifted apart. One of them is lying.",
+    query: (email) => sql`
+      SELECT tl.id, tl.property_name AS detail, tl.nights,
+             ROUND(EXTRACT(EPOCH FROM (tl.arrives_at - tl.departs_at)) / 86400) AS days
+      FROM trip_legs tl JOIN trips t ON t.id = tl.trip_id
+      WHERE t.user_email = ${email}
+        AND tl.nights IS NOT NULL
+        AND tl.arrives_at IS NOT NULL AND tl.departs_at IS NOT NULL
+        AND ABS(tl.nights - EXTRACT(EPOCH FROM (tl.arrives_at - tl.departs_at)) / 86400) > 1
+      LIMIT 5`,
+  },
+  {
+    name: "same confirmation number across different trips",
+    why: "One booking cannot belong to two journeys. The grouping split something it should have kept together.",
+    query: (email) => sql`
+      SELECT tl.confirmation AS detail, COUNT(DISTINCT t.id)::int AS trips
+      FROM trip_legs tl JOIN trips t ON t.id = tl.trip_id
+      WHERE t.user_email = ${email} AND tl.confirmation IS NOT NULL AND tl.confirmation <> ''
+      GROUP BY tl.confirmation
+      HAVING COUNT(DISTINCT t.id) > 1
+      LIMIT 5`,
+  },
+  {
+    name: "trip named after an airline",
+    why: "Trips are named for places. 'American Airlines' is a carrier, not a destination.",
+    query: (email) => sql`
+      SELECT t.id, t.title AS detail FROM trips t
+      WHERE t.user_email = ${email}
+        AND (t.title ILIKE '%airlines%' OR t.title ILIKE '%air lines%' OR t.title ILIKE '%jetblue%' OR t.title = 'Trip')
+      LIMIT 5`,
+  },
+  {
+    name: "trip with no legs",
+    why: "An empty trip is a ghost — it renders as a card that opens onto nothing.",
+    query: (email) => sql`
+      SELECT t.id, t.title AS detail FROM trips t
+      WHERE t.user_email = ${email}
+        AND NOT EXISTS (SELECT 1 FROM trip_legs tl WHERE tl.trip_id = t.id)
+      LIMIT 5`,
+  },
+  {
+    name: "departure more than 2 years in the future",
+    why: "Nobody books that far out. It's a year-parse error hiding in plain sight.",
+    query: (email) => sql`
+      SELECT tl.id, COALESCE(tl.property_name, tl.flight_number, tl.carrier) AS detail, tl.departs_at
+      FROM trip_legs tl JOIN trips t ON t.id = tl.trip_id
+      WHERE t.user_email = ${email}
+        AND tl.departs_at > NOW() + INTERVAL '2 years'
+      LIMIT 5`,
+  },
+];
+
+app.get("/admin/invariants", async (req, res) => {
+  const email = await verifyAccessToken(req);
+  if (!email) return res.status(401).json({ error: "unauthorized" });
+  try {
+    const violations = [];
+    for (const inv of INVARIANTS) {
+      let rows = [];
+      try {
+        rows = await inv.query(email);
+      } catch (e) {
+        violations.push({ name: inv.name, why: inv.why, error: e.message, examples: [] });
+        continue;
+      }
+      if (rows.length) {
+        violations.push({ name: inv.name, why: inv.why, count: rows.length, examples: rows });
+      }
+    }
+    res.json({
+      ok: violations.length === 0,
+      checked: INVARIANTS.length,
+      violations,
+    });
+  } catch (e) {
+    console.error("[invariants]", e.message);
+    res.status(500).json({ ok: false, error: e.message });
+  }
+});
+
 // POST /admin/unmerge-trips — split trips that swallowed unrelated travel.
 // Dry-run by default. Add ?apply=true to actually write.
 app.post("/admin/unmerge-trips", async (req, res) => {
