@@ -10479,7 +10479,10 @@ app.get("/me/data-export", auth, async (req, res) => {
     const [user]     = await sql`SELECT email, first_name, created_at, preferences, taste_profile FROM users WHERE email = ${email}`;
     const trips      = await sql`SELECT * FROM trips WHERE user_email = ${email}`;
     const legs       = await sql`SELECT tl.* FROM trip_legs tl JOIN trips t ON t.id = tl.trip_id WHERE t.user_email = ${email}`;
-    const loyalty    = await sql`SELECT program, points_balance, elite_status, updated_at FROM loyalty_accounts WHERE user_email = ${email}`;
+    // loyalty_accounts has last_synced + created_at — never an updated_at. Asking
+    // for a column that doesn't exist 500'd the whole export. Aliased so the
+    // export payload keeps a stable shape.
+    const loyalty    = await sql`SELECT program, points_balance, elite_status, last_synced AS updated_at FROM loyalty_accounts WHERE user_email = ${email}`;
     // Was: activity_log (nonexistent table) with event_type/summary (nonexistent
     // columns) — data export threw every time. Correct table is activity_events.
     const activity   = await sql`SELECT type AS event_type, title AS summary, body, created_at FROM activity_events WHERE user_email = ${email} ORDER BY created_at DESC LIMIT 500`;
