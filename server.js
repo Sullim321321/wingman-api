@@ -5617,7 +5617,7 @@ app.get("/trains/status", async (req, res) => {
 // Disruption polling cron — runs every 15 min
 // Checks all upcoming flight legs, detects status changes, sends push + logs activity
 // ---------------------------------------------------------------------------
-async function sendPushToUser(userEmail, title, body, data = {}) {
+async function sendPushToUser(userEmail, title, body, data = {}, categoryId = null) {
   try {
     const rows = await sql`SELECT push_token FROM users WHERE email = ${userEmail}`;
     const token = rows[0]?.push_token;
@@ -5625,7 +5625,8 @@ async function sendPushToUser(userEmail, title, body, data = {}) {
     await fetch("https://exp.host/--/api/v2/push/send", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ to: token, title, body, data }),
+      // categoryId drives the actionable buttons (Approve / Not now) on iOS.
+      body: JSON.stringify({ to: token, title, body, data, ...(categoryId ? { categoryId } : {}) }),
     });
   } catch (e) {
     console.error("[push]", e.message);
@@ -5640,60 +5641,65 @@ async function sendPushToUser(userEmail, title, body, data = {}) {
 // ---------------------------------------------------------------------------
 async function triggerCascadeCheck(leg, eventType, delayMins) {
   try {
-    const userRows = await sql`SELECT id, preferences, push_token FROM users WHERE email = ${leg.user_email}`;
-    if (!userRows[0]) return;
-    const user = userRows[0];
-    const prefs = user.preferences || {};
-    const pushToken = user.push_token;
+    const email = leg.user_email;
+    if (!email || !leg.trip_id || !leg.departs_at) return;
 
-    // Find the trip this leg belongs to
-    const tripRows = await sql`
-      SELECT t.id, t.destination, t.legs FROM trips t
-      WHERE t.user_id = ${user.id}
-      AND EXISTS (
-        SELECT 1 FROM jsonb_array_elements(t.legs) AS l
-        WHERE l->>'flight_number' = ${leg.flight_number}
-      )
+    // Everything downstream on this trip — the chain a slipped flight puts at risk.
+    const downstream = await sql`
+      SELECT id, type, carrier, destination, departs_at, confirmation
+      FROM trip_legs
+      WHERE trip_id = ${leg.trip_id}
+        AND id <> ${leg.id}
+        AND departs_at IS NOT NULL
+        AND departs_at >= ${leg.departs_at}
+      ORDER BY departs_at ASC
     `;
-    if (!tripRows[0]) return;
-    const trip = tripRows[0];
-    const legs = trip.legs || [];
+    if (!downstream.length) return;
 
-    // Check for connecting flights in the same trip
-    const legIndex = legs.findIndex(l => l.flight_number === leg.flight_number);
-    if (legIndex >= 0 && legIndex < legs.length - 1) {
-      const nextLeg = legs[legIndex + 1];
-      const impact = eventType === "cancelled"
-        ? `Your connecting flight ${nextLeg.flight_number} may be affected. I'm checking alternatives.`
-        : `Your connection to ${nextLeg.flight_number} is at risk with a ${delayMins}m delay. I'm monitoring.`;
-      if (pushToken) {
-        await sendPushToUser(user.id, {
-          title: "Connection at risk",
-          body: impact,
-          data: { type: "cascade_connection", trip_id: trip.id }
-        });
+    const impacted = [];
+    for (const d of downstream) {
+      const name = d.carrier || d.destination || d.type;
+      let title = null, body = null;
+      if (d.type === "flight") {
+        title = "Connection at risk";
+        body = eventType === "cancelled"
+          ? `Your onward flight ${name} is at risk. I'm lining up alternatives.`
+          : `Your connection to ${name} is at risk with a ${delayMins}m delay. I'm on it.`;
+      } else if (d.type === "hotel" || d.type === "airbnb") {
+        title = "Late check-in";
+        body = `You'll likely reach ${name} late. I can let them know to hold your room.`;
+      } else if (d.type === "dining" || d.type === "restaurant") {
+        title = "Reservation at risk";
+        body = `Your table at ${name} is at risk. Want me to move it?`;
+      } else if (d.type === "car" || d.type === "transfer") {
+        title = "Pickup no longer lines up";
+        body = `Your ${name} pickup no longer matches your new arrival. I can shift it.`;
+      } else if (d.type === "activity" || d.type === "event") {
+        title = "Booking at risk";
+        body = `${name} may no longer fit your revised arrival.`;
       }
+      if (title) impacted.push({ leg: d, title, body });
     }
+    if (!impacted.length) return;
 
-    // Check for hotel check-in on arrival day
-    const signals = await sql`
-      SELECT * FROM signals
-      WHERE user_id = ${user.id}
-      AND type = 'hotel'
-      AND data->>'trip_id' = ${String(trip.id)}
-    `;
-    if (signals.length > 0 && pushToken) {
-      const hotelName = signals[0].data?.hotel_name || "your hotel";
-      const hotelMsg = eventType === "cancelled"
-        ? `I'll contact ${hotelName} about your check-in if you need to rebook.`
-        : `Your check-in at ${hotelName} may be affected by the delay. I'm keeping an eye on it.`;
-      await sendPushToUser(user.id, {
-        title: "Hotel check-in",
-        body: hotelMsg,
-        data: { type: "cascade_hotel", trip_id: trip.id }
-      });
+    // One consolidated push — a chief of staff reports the chain, not a barrage.
+    const first = impacted[0];
+    const extra = impacted.length - 1;
+    await sendPushToUser(
+      email,
+      impacted.length === 1 ? first.title : `${impacted.length} bookings affected downstream`,
+      extra > 0 ? `${first.body} (+${extra} more affected)` : first.body,
+      { route: "TripDetail", tripId: String(leg.trip_id), legId: String(leg.id), type: "cascade" },
+    );
+
+    // And a signal per impacted booking, so the chain is visible in the app.
+    for (const i of impacted) {
+      await logActivity(
+        email, "cascade", i.title, i.body, leg.trip_id, i.leg.id,
+        { cascade_from_leg: String(leg.id), event: eventType, delay_minutes: delayMins || 0 },
+      ).catch(() => {});
     }
-
+    console.log(`[cascade] flagged ${impacted.length} downstream item(s) for ${email}`);
   } catch (err) {
     console.error("[triggerCascadeCheck] error:", err.message);
   }
@@ -5882,13 +5888,16 @@ async function createDisruptionDecision(leg, live, newStatus) {
     ];
     const [u] = await sql`SELECT COALESCE(preferences->>'autonomy_mode','always_ask') AS mode FROM users WHERE email = ${email}`;
     const autonomyAction = u?.mode === "fully_auto" ? "auto_pending" : "asked";
-    await sql`
+    const [dec] = await sql`
       INSERT INTO decisions (user_email, trip_id, leg_id, kind, status, headline, rationale, options, recommended_option_id, autonomy_action, expires_at)
       VALUES (${email}, ${leg.trip_id}, ${leg.id}, 'rebook', 'pending', ${headline}, ${rationale},
-        ${JSON.stringify(options)}, 'opt_rebook', ${autonomyAction}, ${new Date(Date.now() + 12 * 3600000).toISOString()})`;
+        ${JSON.stringify(options)}, 'opt_rebook', ${autonomyAction}, ${new Date(Date.now() + 12 * 3600000).toISOString()})
+      RETURNING id`;
     console.log(`[decision] created rebook decision for ${ident} (${email})`);
+    return dec?.id || null; // caller uses this to send an actionable push
   } catch (e) {
     console.error("[createDisruptionDecision]", e.message);
+    return null;
   }
 }
 
@@ -5989,22 +5998,43 @@ async function pollDisruptions() {
         { ident, prevStatus, newStatus, delay: live.delay, gate: live.gate, terminal: live.terminal }
       );
 
-      // Send push notification (only for actionable events)
-      if (pushTitle) {
-        const isDisruption = newStatus === "Cancelled" || newStatus === "Delayed";
-        await sendPushToUser(leg.user_email, pushTitle, pushBody, {
-          route: isDisruption ? "Disruption" : "Activity",
-          tripId: String(leg.trip_id),
-          legId:  String(leg.id),
-          ident,
+      const isDisruption = newStatus === "Cancelled" || newStatus === "Delayed";
+
+      // Surface a decision card on Home for disruptions (the chief-of-staff spine).
+      // Created BEFORE the push so the notification can carry the decision id and
+      // offer Approve / Not now inline (UI #5) — no app-open required.
+      let decisionId = null;
+      if (isDisruption) {
+        decisionId = await createDisruptionDecision(leg, live, newStatus).catch(e => {
+          console.error("[decision-create]", e.message);
+          return null;
         });
       }
 
-      // Surface a decision card on Home for disruptions (the chief-of-staff spine)
-      if (newStatus === "Cancelled" || newStatus === "Delayed") {
-        await createDisruptionDecision(leg, live, newStatus).catch(e =>
-          console.error("[decision-create]", e.message)
-        );
+      // Send push notification (only for actionable events)
+      if (pushTitle) {
+        if (isDisruption && decisionId) {
+          // Actionable: Approve rebooking or dismiss straight from the lock screen.
+          await sendPushToUser(
+            leg.user_email, pushTitle, pushBody,
+            {
+              route: "Decisions",
+              decision_id: String(decisionId),
+              option_id: "opt_rebook",
+              tripId: String(leg.trip_id),
+              legId:  String(leg.id),
+              ident,
+            },
+            "wingman_decision",
+          );
+        } else {
+          await sendPushToUser(leg.user_email, pushTitle, pushBody, {
+            route: isDisruption ? "Disruption" : "Activity",
+            tripId: String(leg.trip_id),
+            legId:  String(leg.id),
+            ident,
+          });
+        }
       }
 
       // ── Silent Autonomy: auto-rebook without user interaction if mode = fully_auto ──
