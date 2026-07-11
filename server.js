@@ -3998,7 +3998,7 @@ async function unmergeMegaTrips(userEmail, { dryRun = true } = {}) {
 
   for (const t of longTrips) {
     const legs = await sql`
-      SELECT id, departs_at, arrives_at, destination_city, destination
+      SELECT id, departs_at, arrives_at, destination_city, destination, confirmation
       FROM trip_legs WHERE trip_id = ${t.id}
       ORDER BY departs_at ASC NULLS LAST
     `;
@@ -4006,7 +4006,7 @@ async function unmergeMegaTrips(userEmail, { dryRun = true } = {}) {
     const undated = legs.filter(l => !l.departs_at);
 
     // Greedy clustering on date gaps.
-    const clusters = [];
+    let clusters = [];
     let cur = null;
     for (const l of dated) {
       const start = new Date(l.departs_at).getTime();
@@ -4021,6 +4021,49 @@ async function unmergeMegaTrips(userEmail, { dryRun = true } = {}) {
       }
     }
     if (cur) clusters.push(cur);
+
+    // ── Confirmation numbers OVERRIDE the date gaps ──────────────────────────
+    // A return flight booked on one confirmation can easily sit 10 days after the
+    // outbound. Date-gap clustering alone tears that booking in half — which it
+    // did, scattering one confirmation across three "trips". A shared confirmation
+    // is the strongest signal we have that two legs belong together, stronger than
+    // any date heuristic. So: union any clusters that share one.
+    const byConf = new Map();
+    clusters.forEach((c, i) => {
+      for (const l of c.legs) {
+        const conf = (l.confirmation || "").trim().toLowerCase();
+        if (!conf) continue;
+        if (!byConf.has(conf)) byConf.set(conf, new Set());
+        byConf.get(conf).add(i);
+      }
+    });
+
+    // Union-find over cluster indices.
+    const parent = clusters.map((_, i) => i);
+    const find = (i) => (parent[i] === i ? i : (parent[i] = find(parent[i])));
+    const union = (a, b) => { const ra = find(a), rb = find(b); if (ra !== rb) parent[Math.max(ra, rb)] = Math.min(ra, rb); };
+    for (const idxs of byConf.values()) {
+      const list = [...idxs];
+      for (let i = 1; i < list.length; i++) union(list[0], list[i]);
+    }
+
+    const merged = new Map();
+    clusters.forEach((c, i) => {
+      const root = find(i);
+      if (!merged.has(root)) merged.set(root, { legs: [], end: 0 });
+      const m = merged.get(root);
+      m.legs.push(...c.legs);
+      m.end = Math.max(m.end, c.end);
+    });
+    const beforeUnion = clusters.length;
+    clusters = [...merged.values()].sort(
+      (a, b) => new Date(a.legs[0].departs_at) - new Date(b.legs[0].departs_at),
+    );
+    if (clusters.length !== beforeUnion) {
+      report.details.push(
+        `  (kept ${beforeUnion - clusters.length} split(s) together — shared confirmation number)`,
+      );
+    }
 
     if (clusters.length <= 1 && !undated.length) continue;
 
@@ -4132,14 +4175,31 @@ const INVARIANTS = [
   {
     name: "trip spanning more than 30 days",
     why: "Almost always a trip that has absorbed unrelated travel, not a real long journey.",
+    // "Needs review" and "Reservations" are deliberate HOLDER buckets for bookings
+    // we can't place in time. They are not trips and a span across them is
+    // meaningless — a junk drawer is supposed to look like a junk drawer. Excluded
+    // by name, narrowly, rather than by loosening the rule for everything.
     query: (email) => sql`
       SELECT t.id, t.title AS detail,
              ROUND(EXTRACT(EPOCH FROM (MAX(COALESCE(tl.arrives_at, tl.departs_at)) - MIN(tl.departs_at))) / 86400) AS days,
              COUNT(tl.id)::int AS legs
       FROM trips t JOIN trip_legs tl ON tl.trip_id = t.id
       WHERE t.user_email = ${email}
+        AND t.title NOT IN ('Needs review', 'Reservations')
       GROUP BY t.id, t.title
       HAVING MAX(COALESCE(tl.arrives_at, tl.departs_at)) - MIN(tl.departs_at) > INTERVAL '30 days'
+      LIMIT 5`,
+  },
+  {
+    name: "holder bucket is overflowing",
+    why: "'Needs review' is where bookings go when we can't place them in time. A big pile means the PARSER is failing, not that the bucket is broken. Worth looking at, not ignoring.",
+    query: (email) => sql`
+      SELECT t.id, t.title AS detail, COUNT(tl.id)::int AS legs
+      FROM trips t JOIN trip_legs tl ON tl.trip_id = t.id
+      WHERE t.user_email = ${email}
+        AND t.title IN ('Needs review', 'Reservations')
+      GROUP BY t.id, t.title
+      HAVING COUNT(tl.id) > 20
       LIMIT 5`,
   },
   {

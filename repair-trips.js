@@ -98,5 +98,21 @@ function printReport(rep) {
     console.log(`\n  ${RED}✗ ${live.status}: ${live.text.slice(0, 200)}${R}\n`);
     process.exit(1);
   }
-  console.log(`\n  ${GRN}Done.${R} Pull to refresh Trips in the app.\n`);
+  console.log(`\n  ${GRN}✓ Split.${R}`);
+
+  // ── Second pass: re-join anything a booking says belongs together ────────────
+  // Splitting on date gaps alone tears a round trip in half: the return leg on the
+  // same confirmation can easily sit 10+ days after the outbound. A shared
+  // confirmation number is the strongest signal there is, and it OVERRIDES the date
+  // heuristic. cleanup-trips merges trips that share one, so we always run it after
+  // a split — split, then reconcile.
+  const merge = await post("/admin/cleanup-trips?apply=true", null, token);
+  if (merge.status === 200 && merge.json) {
+    const m = merge.json.tripsMerged || 0;
+    console.log(`  ${GRN}✓ Reconciled${R} — ${m} trip(s) re-joined on a shared confirmation number.`);
+  } else {
+    console.log(`  ${YEL}! cleanup-trips returned ${merge.status} — round trips may still be split.${R}`);
+  }
+
+  console.log(`\n  ${GRN}Done.${R} Run ${B}node smoke-test.js${R} to confirm the invariants hold.\n`);
 })();
