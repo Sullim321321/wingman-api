@@ -24,7 +24,11 @@ const readline = require("readline");
 // Must match src/config.js in the app. A wrong host makes EVERY route 404, which
 // looks like "all endpoints broken" when really you're just talking to nobody.
 const API = process.env.API || "https://wingman-api-y39a.onrender.com";
-const DEFAULT_EMAIL = process.env.EMAIL || "maddie@welcometothefight.club";
+// This must be an account with REAL DATA. /auth/verify creates the user if it
+// doesn't exist, so signing in with the wrong address silently mints an empty
+// account and every endpoint returns a cheerful 200 over nothing. See the
+// zero-data guard below.
+const DEFAULT_EMAIL = process.env.EMAIL || "sullim321@gmail.com";
 
 const RESET = "\x1b[0m", RED = "\x1b[31m", GREEN = "\x1b[32m", YELLOW = "\x1b[33m", DIM = "\x1b[2m", BOLD = "\x1b[1m";
 
@@ -93,7 +97,8 @@ const STATIC_GETS = [
 ];
 
 const withTripId = (id) => [
-  `/trips/${id}/risk-profile`,
+  // No /risk-profile here: that route never existed server-side. api.js had a
+  // getTripRiskProfile() calling it, but nothing called that — dead code, deleted.
   `/trips/${id}/checklist`,
   `/trips/${id}/companions`,
   `/trips/${id}/standing-order`,   // Roadmap 2
@@ -147,8 +152,21 @@ async function hit(path, token) {
     tripId = d?.trips?.[0]?.id ?? null;
   } catch {}
 
-  const paths = [...STATIC_GETS, ...(tripId ? withTripId(tripId) : [])];
-  if (!tripId) console.log(`  ${YELLOW}!${RESET} No trips found — skipping per-trip endpoints.\n`);
+  // A zero-trip account is not a passing test — it's an untested one. /auth/verify
+  // creates users on demand, so a typo'd email mints an empty account and every
+  // endpoint returns 200 over nothing at all. That reads as sixteen green lines
+  // and tests approximately zero code. Refuse to continue.
+  if (!tripId) {
+    console.log(`  ${RED}✗ This account has no trips — even with ?all=true.${RESET}`);
+    console.log(`    That means the per-trip endpoints can't be tested, and a green run here`);
+    console.log(`    would be meaningless. It usually means you signed in as the wrong account`);
+    console.log(`    (sign-in CREATES the user if it doesn't exist, so typos look like success).`);
+    console.log(`\n    Re-run with the account that actually has your travel data:`);
+    console.log(`    ${DIM}EMAIL="you@example.com" node smoke-test.js${RESET}\n`);
+    process.exit(1);
+  }
+
+  const paths = [...STATIC_GETS, ...withTripId(tripId)];
 
   const results = [];
   for (const p of paths) results.push(await hit(p, token));
