@@ -2532,6 +2532,28 @@ function extractEmailBody(payload) {
 // (dining, activities, transfers) is a "loose" booking that belongs INSIDE a trip.
 const ANCHOR_TYPES = new Set(["flight", "hotel", "airbnb", "train", "ferry", "cruise", "car"]);
 
+// ── Sanity bounds on travel dates ────────────────────────────────────────────
+// A hotel booking parsed with the wrong check-out YEAR produces a leg spanning
+// hundreds of days ("11 Howard · 266 nights", "ModernHaus SoHo · 801 nights").
+// Such a leg overlaps essentially every date window, so it becomes a MAGNET:
+// every subsequent booking to that city matches it and gets absorbed into the
+// same trip. That is how one "New York" trip swallowed years of unrelated travel.
+//
+// So: any stay longer than this is treated as a parse error, not as a long
+// holiday. Its end date is discarded rather than trusted.
+const MAX_STAY_NIGHTS = 30;
+const MAX_TRIP_DAYS   = 30;   // a single trip should not span longer than this
+
+// True when a leg's own duration is implausible — i.e. the dates are wrong.
+function isImplausibleSpan(startISO, endISO) {
+  if (!startISO || !endISO) return false;
+  const s = new Date(startISO).getTime();
+  const e = new Date(endISO).getTime();
+  if (Number.isNaN(s) || Number.isNaN(e)) return false;
+  if (e < s) return true;                                   // ends before it starts
+  return (e - s) > MAX_STAY_NIGHTS * 86400000;
+}
+
 // Find a real trip (has an anchor leg) whose date window covers `whenISO`.
 // Prefers a trip whose city matches; falls back to any date-overlapping trip.
 async function findTripForLooseBooking(userEmail, whenISO, city) {
@@ -2556,6 +2578,12 @@ async function findTripForLooseBooking(userEmail, whenISO, city) {
     if (!r.has_anchor || !r.s) continue;      // only attach to real trips
     const start = new Date(r.s).getTime() - DAY;
     const end   = new Date(r.e || r.s).getTime() + DAY;
+
+    // A trip whose span is implausibly long has bad dates somewhere inside it
+    // (see MAX_STAY_NIGHTS). Its window would swallow almost any dinner booking,
+    // so refuse to attach to it rather than compound the mess.
+    if (end - start > (MAX_TRIP_DAYS + 2) * DAY) continue;
+
     if (when < start || when > end) continue;  // date must fall in the trip window
     if (cityLc && r.cities && r.cities.includes(cityLc)) {
       return { tripId: r.id, title: r.title };  // best: date + city match
@@ -2565,10 +2593,38 @@ async function findTripForLooseBooking(userEmail, whenISO, city) {
   return fallback;
 }
 
+/**
+ * Discard end dates that cannot be real, BEFORE they are stored or used to group.
+ *
+ * MUTATES `parsed` deliberately: every ingest path (Gmail, paste, forwarded mail)
+ * calls findOrCreateGroupedTrip with this same object and then inserts from it, so
+ * cleaning here fixes both the grouping AND what lands in trip_legs. Sanitising in
+ * only one of those places is how you get a tidy trip list built on bad rows.
+ *
+ * A "266-night" or "801-night" stay is not a long holiday. It is a check-out date
+ * parsed with the wrong year. Keeping it poisons everything downstream: the trip's
+ * date window, the grouping magnet, the nights count, and the ROI maths.
+ */
+function sanitizeLegDates(parsed, userEmail) {
+  if (!parsed || !parsed.departs_at || !parsed.arrives_at) return parsed;
+  if (!isImplausibleSpan(parsed.departs_at, parsed.arrives_at)) return parsed;
+
+  console.warn(
+    `[grouping] implausible span for ${userEmail}: ${parsed.type || "leg"} ` +
+    `${parsed.departs_at} → ${parsed.arrives_at} — discarding end date (likely wrong year)`,
+  );
+  // Keep the start (almost always right); drop the end rather than invent one.
+  parsed.arrives_at = null;
+  parsed.nights = null;
+  return parsed;
+}
+
 async function findOrCreateGroupedTrip(userEmail, parsed, emailId, source) {
   // Dedup by confirmation first, group anchors by destination, attach loose
   // bookings (dining/activities) to the trip they happen during, and never name
   // a trip after a carrier or a restaurant.
+  sanitizeLegDates(parsed, userEmail);
+
   const rawDest = (parsed.destination_city || parsed.destination || "").split(",")[0].trim();
   const dest = rawDest.toLowerCase();
   const confirmation = (parsed.confirmation || "").trim();
@@ -2611,36 +2667,43 @@ async function findOrCreateGroupedTrip(userEmail, parsed, emailId, source) {
     return rrows.length ? { tripId: rrows[0].id, isNew: true, tripTitle: HOLD } : null;
   }
 
-  // ── 3. Anchor booking — destination match (with date window when dates exist) ──
-  if (dest) {
-    let candidates;
-    if (startDate) {
-      const buffer = 2 * 24 * 60 * 60 * 1000;
-      const windowStart = new Date(startDate.getTime() - buffer);
-      const windowEnd   = endDate ? new Date(endDate.getTime() + buffer) : new Date(startDate.getTime() + buffer);
-      candidates = await sql`
-        SELECT DISTINCT t.id, t.title
-        FROM trips t
-        JOIN trip_legs tl ON tl.trip_id = t.id
-        WHERE t.user_email = ${userEmail}
-          AND LOWER(COALESCE(tl.destination_city, tl.destination, '')) LIKE ${'%' + dest + '%'}
-          AND tl.departs_at IS NOT NULL
-          AND tl.departs_at <= ${windowEnd.toISOString()}
-          AND COALESCE(tl.arrives_at, tl.departs_at) >= ${windowStart.toISOString()}
-        ORDER BY t.id ASC
-        LIMIT 1
-      `;
-    } else {
-      candidates = await sql`
-        SELECT DISTINCT t.id, t.title
-        FROM trips t
-        JOIN trip_legs tl ON tl.trip_id = t.id
-        WHERE t.user_email = ${userEmail}
-          AND LOWER(COALESCE(tl.destination_city, tl.destination, '')) LIKE ${'%' + dest + '%'}
-        ORDER BY t.id ASC
-        LIMIT 1
-      `;
-    }
+  // ── 3. Anchor booking — destination match, but ONLY within a real date window ──
+  //
+  // Two hard rules here, both learned the hard way:
+  //
+  //   (a) A candidate leg whose OWN span is implausible (a "266-night" hotel stay
+  //       from a mis-parsed year) is excluded as an anchor. Otherwise it overlaps
+  //       every window and drags every same-city booking into its trip.
+  //
+  //   (b) A booking with NO DATE never matches on destination alone. It used to:
+  //       the old `else` branch took the oldest trip to that city, which is how a
+  //       dateless "United ? → EWR" leg ended up filed under a trip from years
+  //       earlier. A booking we can't place in time is a booking we can't group —
+  //       it goes to "Needs review" instead of being guessed at.
+  if (dest && startDate) {
+    const buffer = 2 * 24 * 60 * 60 * 1000;
+    const windowStart = new Date(startDate.getTime() - buffer);
+    const windowEnd   = endDate ? new Date(endDate.getTime() + buffer) : new Date(startDate.getTime() + buffer);
+
+    const candidates = await sql`
+      SELECT DISTINCT t.id, t.title
+      FROM trips t
+      JOIN trip_legs tl ON tl.trip_id = t.id
+      WHERE t.user_email = ${userEmail}
+        AND LOWER(COALESCE(tl.destination_city, tl.destination, '')) LIKE ${'%' + dest + '%'}
+        AND tl.departs_at IS NOT NULL
+        AND tl.departs_at <= ${windowEnd.toISOString()}
+        AND COALESCE(tl.arrives_at, tl.departs_at) >= ${windowStart.toISOString()}
+        -- (a) never anchor to a leg with an implausible duration
+        AND COALESCE(tl.arrives_at, tl.departs_at) - tl.departs_at <= ${MAX_STAY_NIGHTS + " days"}::interval
+        -- and never join a trip that is ALREADY absurdly long
+        AND (
+          SELECT MAX(COALESCE(x.arrives_at, x.departs_at)) - MIN(x.departs_at)
+          FROM trip_legs x WHERE x.trip_id = t.id
+        ) <= ${MAX_TRIP_DAYS + " days"}::interval
+      ORDER BY t.id ASC
+      LIMIT 1
+    `;
     if (candidates && candidates.length > 0) {
       return { tripId: candidates[0].id, isNew: false, tripTitle: candidates[0].title };
     }
@@ -3875,6 +3938,142 @@ async function cleanupTrips(userEmail, { dryRun = true } = {}) {
   return report;
 }
 
+/**
+ * Undo the damage done by magnet legs: split trips that have swallowed years of
+ * unrelated travel back into real ones.
+ *
+ * How the mess happened: a hotel booking parsed with the wrong check-out year
+ * produced a leg spanning hundreds of days. That leg overlapped every date window,
+ * so every subsequent booking to the same city matched it and was absorbed. One
+ * "New York" trip ended up holding flights from April, September, November and
+ * February, plus an "801-night" stay.
+ *
+ * The repair, in order:
+ *   1. Fix the poison legs — discard end dates that cannot be real.
+ *   2. Re-cluster each over-long trip by DATE GAPS. Legs more than SPLIT_GAP_DAYS
+ *      apart belong to different journeys. The earliest cluster keeps the original
+ *      trip (preserving its id, ratings, and any standing orders); later clusters
+ *      become new trips titled from their own destination.
+ *   3. Legs with no date at all can't be clustered — park them in "Needs review"
+ *      rather than guessing, which is what caused this in the first place.
+ */
+const SPLIT_GAP_DAYS = 5;   // > 5 days between legs ⇒ a different trip
+
+async function unmergeMegaTrips(userEmail, { dryRun = true } = {}) {
+  const report = { dryRun, legsDatesFixed: 0, tripsSplit: 0, tripsCreated: 0, legsOrphaned: 0, details: [] };
+  const DAY = 86400000;
+
+  // ── 1. Neutralise the magnets ────────────────────────────────────────────────
+  const bad = await sql`
+    SELECT tl.id, tl.property_name, tl.departs_at, tl.arrives_at
+    FROM trip_legs tl JOIN trips t ON t.id = tl.trip_id
+    WHERE t.user_email = ${userEmail}
+      AND tl.departs_at IS NOT NULL
+      AND tl.arrives_at IS NOT NULL
+      AND (
+        tl.arrives_at < tl.departs_at
+        OR tl.arrives_at - tl.departs_at > ${MAX_STAY_NIGHTS + " days"}::interval
+      )
+  `;
+  for (const l of bad) {
+    const nights = Math.round((new Date(l.arrives_at) - new Date(l.departs_at)) / DAY);
+    report.legsDatesFixed++;
+    report.details.push(`leg #${l.id} "${l.property_name || "—"}": ${nights} nights is a bad year — dropping end date`);
+    if (!dryRun) {
+      await sql`UPDATE trip_legs SET arrives_at = NULL, nights = NULL WHERE id = ${l.id}`;
+    }
+  }
+
+  // ── 2. Re-cluster over-long trips ────────────────────────────────────────────
+  // Re-read spans AFTER the fix above, so a trip that is only long because of a
+  // poison leg isn't split unnecessarily.
+  const longTrips = await sql`
+    SELECT t.id, t.title
+    FROM trips t JOIN trip_legs tl ON tl.trip_id = t.id
+    WHERE t.user_email = ${userEmail}
+    GROUP BY t.id, t.title
+    HAVING MAX(COALESCE(tl.arrives_at, tl.departs_at)) - MIN(tl.departs_at)
+           > ${MAX_TRIP_DAYS + " days"}::interval
+  `;
+
+  for (const t of longTrips) {
+    const legs = await sql`
+      SELECT id, departs_at, arrives_at, destination_city, destination
+      FROM trip_legs WHERE trip_id = ${t.id}
+      ORDER BY departs_at ASC NULLS LAST
+    `;
+    const dated = legs.filter(l => l.departs_at);
+    const undated = legs.filter(l => !l.departs_at);
+
+    // Greedy clustering on date gaps.
+    const clusters = [];
+    let cur = null;
+    for (const l of dated) {
+      const start = new Date(l.departs_at).getTime();
+      const end   = new Date(l.arrives_at || l.departs_at).getTime();
+      if (!cur) { cur = { legs: [l], end }; continue; }
+      if (start - cur.end > SPLIT_GAP_DAYS * DAY) {
+        clusters.push(cur);
+        cur = { legs: [l], end };
+      } else {
+        cur.legs.push(l);
+        cur.end = Math.max(cur.end, end);
+      }
+    }
+    if (cur) clusters.push(cur);
+
+    if (clusters.length <= 1 && !undated.length) continue;
+
+    report.tripsSplit++;
+    report.details.push(`trip #${t.id} "${t.title}" (${dated.length} dated legs) → ${clusters.length} trips`);
+
+    // Cluster 0 keeps the original trip id — preserving ratings, standing orders,
+    // and anything else keyed to it.
+    for (let i = 1; i < clusters.length; i++) {
+      const c = clusters[i];
+      const destLeg = c.legs.find(l => l.destination_city || l.destination);
+      const title = destLeg
+        ? String(destLeg.destination_city || destLeg.destination).split(",")[0].trim()
+        : t.title;
+      const when = new Date(c.legs[0].departs_at).toISOString().slice(0, 10);
+      report.tripsCreated++;
+      report.details.push(`  → new trip "${title}" (${when}, ${c.legs.length} legs)`);
+      if (!dryRun) {
+        const [nt] = await sql`
+          INSERT INTO trips (user_email, title, source)
+          VALUES (${userEmail}, ${title}, 'unmerge')
+          RETURNING id
+        `;
+        for (const l of c.legs) {
+          await sql`UPDATE trip_legs SET trip_id = ${nt.id} WHERE id = ${l.id}`;
+        }
+      }
+    }
+
+    // ── 3. Undated legs: we cannot place them in time, so we do not guess. ──────
+    if (undated.length) {
+      report.legsOrphaned += undated.length;
+      report.details.push(`  → ${undated.length} undated leg(s) to "Needs review"`);
+      if (!dryRun) {
+        let [hold] = await sql`
+          SELECT id FROM trips WHERE user_email = ${userEmail} AND title = 'Needs review' LIMIT 1
+        `;
+        if (!hold) {
+          [hold] = await sql`
+            INSERT INTO trips (user_email, title, source)
+            VALUES (${userEmail}, 'Needs review', 'unmerge') RETURNING id
+          `;
+        }
+        for (const l of undated) {
+          await sql`UPDATE trip_legs SET trip_id = ${hold.id} WHERE id = ${l.id}`;
+        }
+      }
+    }
+  }
+
+  return report;
+}
+
 app.post("/admin/cleanup-trips", async (req, res) => {
   const email = await verifyAccessToken(req);
   if (!email) return res.status(401).json({ error: "unauthorized" });
@@ -3884,6 +4083,21 @@ app.post("/admin/cleanup-trips", async (req, res) => {
     res.json({ ok: true, ...report });
   } catch (e) {
     console.error("[cleanup-trips]", e.message);
+    res.status(500).json({ ok: false, error: e.message });
+  }
+});
+
+// POST /admin/unmerge-trips — split trips that swallowed unrelated travel.
+// Dry-run by default. Add ?apply=true to actually write.
+app.post("/admin/unmerge-trips", async (req, res) => {
+  const email = await verifyAccessToken(req);
+  if (!email) return res.status(401).json({ error: "unauthorized" });
+  try {
+    const dryRun = req.query.apply !== "true";
+    const report = await unmergeMegaTrips(email, { dryRun });
+    res.json({ ok: true, ...report });
+  } catch (e) {
+    console.error("[unmerge-trips]", e.message);
     res.status(500).json({ ok: false, error: e.message });
   }
 });
