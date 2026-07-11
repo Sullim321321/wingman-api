@@ -11049,6 +11049,110 @@ app.get("/destination/image", auth, async (req, res) => {
 });
 
 // ---------------------------------------------------------------------------
+// Cascade actions — the app's cascade cards call these to have Wingman draft the
+// message to a hotel/restaurant when a delay knocks the trip's chain out of line.
+// These routes did not exist: the buttons 404'd. Drafting is deterministic (no
+// LLM cost, and it still works if Anthropic credits run out).
+// ---------------------------------------------------------------------------
+function cascadeArrivalEstimate(delayMinutes) {
+  const d = Number(delayMinutes) || 0;
+  if (!d) return "later than planned";
+  if (d < 60) return `about ${d} minutes later than planned`;
+  const h = Math.floor(d / 60), m = d % 60;
+  return `about ${h}h${m ? ` ${m}m` : ""} later than planned`;
+}
+
+async function cascadeLookup(tripId, email, legId) {
+  const trips = await sql`SELECT id, title FROM trips WHERE id = ${tripId} AND user_email = ${email}`;
+  if (!trips.length) return null;
+  let leg = null;
+  if (legId) {
+    const rows = await sql`SELECT * FROM trip_legs WHERE id = ${legId} AND trip_id = ${tripId}`;
+    leg = rows[0] || null;
+  }
+  return { trip: trips[0], leg };
+}
+
+app.post("/trips/:tripId/cascade/hotel-notify", auth, async (req, res) => {
+  const email = req.email;
+  const { leg_id, delay_minutes, ident } = req.body || {};
+  try {
+    const ctx = await cascadeLookup(req.params.tripId, email, leg_id);
+    if (!ctx) return res.status(404).json({ error: "trip not found" });
+
+    // Prefer the named hotel leg; otherwise fall back to any stay on the trip.
+    let hotel = ctx.leg;
+    if (!hotel || !["hotel", "airbnb"].includes(hotel.type)) {
+      const rows = await sql`
+        SELECT * FROM trip_legs WHERE trip_id = ${req.params.tripId}
+          AND type IN ('hotel','airbnb') ORDER BY departs_at ASC LIMIT 1`;
+      hotel = rows[0] || null;
+    }
+    const hotelName = hotel?.carrier || hotel?.destination || "the property";
+    const conf = hotel?.confirmation ? ` My confirmation number is ${hotel.confirmation}.` : "";
+    const late = cascadeArrivalEstimate(delay_minutes);
+
+    const message =
+      `Hello,\n\nI have a reservation with you${hotel?.confirmation ? ` (confirmation ${hotel.confirmation})` : ""}. ` +
+      `My inbound flight${ident ? ` (${ident})` : ""} has been ${delay_minutes ? "delayed" : "disrupted"}, ` +
+      `so I now expect to arrive ${late}.\n\n` +
+      `Could you please hold my room for a late check-in?${conf}\n\n` +
+      `Thank you very much.`;
+
+    await logActivity(
+      email, "cascade", "Late check-in message drafted",
+      `Wingman drafted a message to ${hotelName} about your late arrival.`,
+      req.params.tripId, hotel?.id || null, { kind: "hotel_notify", delay_minutes: delay_minutes || 0 },
+    ).catch(() => {});
+
+    res.json({ ok: true, hotel_name: hotelName, message_drafted: message, phone: hotel?.property_address || null });
+  } catch (e) {
+    console.error("[cascade/hotel-notify]", e.message);
+    res.status(500).json({ error: e.message });
+  }
+});
+
+app.post("/trips/:tripId/cascade/restaurant-reschedule", auth, async (req, res) => {
+  const email = req.email;
+  const { leg_id, delay_minutes, ident } = req.body || {};
+  try {
+    const ctx = await cascadeLookup(req.params.tripId, email, leg_id);
+    if (!ctx) return res.status(404).json({ error: "trip not found" });
+
+    let resto = ctx.leg;
+    if (!resto || !["dining", "restaurant"].includes(resto.type)) {
+      const rows = await sql`
+        SELECT * FROM trip_legs WHERE trip_id = ${req.params.tripId}
+          AND type IN ('dining','restaurant') ORDER BY departs_at ASC LIMIT 1`;
+      resto = rows[0] || null;
+    }
+    const name = resto?.carrier || resto?.destination || "the restaurant";
+    const when = resto?.departs_at
+      ? new Date(resto.departs_at).toLocaleString("en-US", { weekday: "long", hour: "numeric", minute: "2-digit" })
+      : "my booking";
+    const late = cascadeArrivalEstimate(delay_minutes);
+
+    const message =
+      `Hello,\n\nI have a reservation${resto?.departs_at ? ` for ${when}` : ""}` +
+      `${resto?.confirmation ? ` (reference ${resto.confirmation})` : ""}. ` +
+      `My flight${ident ? ` (${ident})` : ""} has been delayed and I now expect to be ${late}.\n\n` +
+      `Would it be possible to move my table later, or should I rebook for another evening?\n\n` +
+      `Apologies for the short notice, and thank you.`;
+
+    await logActivity(
+      email, "cascade", "Reservation message drafted",
+      `Wingman drafted a message to ${name} about moving your table.`,
+      req.params.tripId, resto?.id || null, { kind: "restaurant_reschedule", delay_minutes: delay_minutes || 0 },
+    ).catch(() => {});
+
+    res.json({ ok: true, restaurant_name: name, message_drafted: message });
+  } catch (e) {
+    console.error("[cascade/restaurant-reschedule]", e.message);
+    res.status(500).json({ error: e.message });
+  }
+});
+
+// ---------------------------------------------------------------------------
 // GET /insights/roi/history — value protected per month (Roadmap 2, Design #10)
 // Powers the Insights sparkline/trend so the ROI is legible over time.
 // ---------------------------------------------------------------------------
