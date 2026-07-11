@@ -3887,6 +3887,34 @@ async function cleanupTrips(userEmail, { dryRun = true } = {}) {
   `;
   for (const row of sharedConf) {
     const ids = row.trip_ids;
+
+    // A confirmation number is strong evidence two legs belong together — but it
+    // is NOT proof. Some values in here are junk: a loyalty number, or a reference
+    // an airline recycled years later. Merging on one of those glues unrelated
+    // journeys into a single trip. (It produced an "Albany" trip spanning 5,188
+    // days from two legs fourteen years apart.)
+    //
+    // It also sets up a fight: unmergeMegaTrips() splits on date gaps, this merges
+    // on confirmations, and the two undo each other forever.
+    //
+    // So: sanity-check the merge before doing it. If joining these trips would
+    // create something longer than a plausible journey, the confirmation is a
+    // collision, not a booking. Trust the calendar over the string.
+    const [span] = await sql`
+      SELECT ROUND(EXTRACT(EPOCH FROM (
+               MAX(COALESCE(tl.arrives_at, tl.departs_at)) - MIN(tl.departs_at)
+             )) / 86400) AS days
+      FROM trip_legs tl
+      WHERE tl.trip_id = ANY(${ids})
+    `;
+    if (span && Number(span.days) > MAX_TRIP_DAYS) {
+      report.details.push(
+        `SKIP merge of trips ${ids.join(",")} — confirmation "${row.confirmation}" spans ` +
+        `${span.days} days. That's a recycled/garbage reference, not one booking.`,
+      );
+      continue;
+    }
+
     const keep = ids[0];
     const merge = ids.slice(1);
     report.tripsMerged += merge.length;
@@ -4042,8 +4070,29 @@ async function unmergeMegaTrips(userEmail, { dryRun = true } = {}) {
     const parent = clusters.map((_, i) => i);
     const find = (i) => (parent[i] === i ? i : (parent[i] = find(parent[i])));
     const union = (a, b) => { const ra = find(a), rb = find(b); if (ra !== rb) parent[Math.max(ra, rb)] = Math.min(ra, rb); };
-    for (const idxs of byConf.values()) {
+
+    const clusterStart = (i) => new Date(clusters[i].legs[0].departs_at).getTime();
+    const clusterEnd   = (i) => clusters[i].end;
+
+    for (const [conf, idxs] of byConf.entries()) {
       const list = [...idxs];
+      if (list.length < 2) continue;
+
+      // Guard: a confirmation shared by legs MONTHS or YEARS apart is not one
+      // booking — it's a recycled reference or a loyalty number that got parsed
+      // into the confirmation field. Uniting on it would rebuild the very mega-trip
+      // we're here to dismantle, and the splitter and merger would then undo each
+      // other forever. Dates beat strings when the string is implausible.
+      const earliest = Math.min(...list.map(clusterStart));
+      const latest   = Math.max(...list.map(clusterEnd));
+      if (latest - earliest > MAX_TRIP_DAYS * DAY) {
+        report.details.push(
+          `  (ignored confirmation "${conf}" — its legs span ` +
+          `${Math.round((latest - earliest) / DAY)} days; that's a collision, not a booking)`,
+        );
+        continue;
+      }
+
       for (let i = 1; i < list.length; i++) union(list[0], list[i]);
     }
 
