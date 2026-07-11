@@ -1742,7 +1742,7 @@ app.get("/me", async (req, res) => {
   const email = await verifyAccessToken(req);
   if (!email) return res.status(401).json({ error: "unauthorized" });
   try {
-    const rows = await sql`SELECT email, first_name, push_token, preferences, created_at FROM users WHERE email = ${email}`;
+    const rows = await sql`SELECT email, first_name, push_token, preferences, created_at, subscription_tier, subscription_status FROM users WHERE email = ${email}`;
     if (!rows[0]) return res.status(404).json({ error: "user not found" });
     // Track last app open for re-engagement logic
     await sql`UPDATE users SET last_opened_at = NOW() WHERE email = ${email}`.catch(() => {});
