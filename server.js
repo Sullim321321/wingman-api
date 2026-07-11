@@ -193,6 +193,10 @@ function auth(req, res, next) {
   try {
     const payload = jwt.verify(token, JWT_SECRET);
     req.email = payload.email;
+    // Much of the codebase reads req.user.email (55 call sites) while this middleware
+    // only ever set req.email — so every one of those threw a TypeError and 500'd.
+    // Populate both shapes so old and new call sites both work.
+    req.user = { email: payload.email };
     next();
   } catch (e) {
     return res.status(401).json({ error: "Invalid or expired token" });
@@ -607,6 +611,7 @@ async function bootstrapDB() {
     await sql`ALTER TABLE trips ADD COLUMN IF NOT EXISTS mode TEXT DEFAULT 'solo'`;
     await sql`ALTER TABLE trips ADD COLUMN IF NOT EXISTS raw_email_id TEXT`;
     await sql`ALTER TABLE trips ADD COLUMN IF NOT EXISTS updated_at TIMESTAMPTZ DEFAULT NOW()`;
+    await sql`ALTER TABLE trips ADD COLUMN IF NOT EXISTS metadata JSONB DEFAULT '{}'::jsonb`;
     await sql`ALTER TABLE trips ADD COLUMN IF NOT EXISTS companions_count INTEGER DEFAULT 1`;
     await sql`ALTER TABLE trips ADD COLUMN IF NOT EXISTS companion_names JSONB DEFAULT '[]'`;
     await sql`ALTER TABLE trips ADD COLUMN IF NOT EXISTS event_legs JSONB DEFAULT '[]'`;
