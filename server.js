@@ -11007,6 +11007,46 @@ app.get("/destination/image", auth, async (req, res) => {
 });
 
 // ---------------------------------------------------------------------------
+// GET /insights/roi/history — value protected per month (Roadmap 2, Design #10)
+// Powers the Insights sparkline/trend so the ROI is legible over time.
+// ---------------------------------------------------------------------------
+app.get("/insights/roi/history", auth, async (req, res) => {
+  const email = await verifyAccessToken(req);
+  if (!email) return res.status(401).json({ error: "unauthorized" });
+  const months = Math.min(parseInt(req.query.months || "12"), 24);
+  try {
+    const rows = await sql`
+      SELECT to_char(date_trunc('month', created_at), 'YYYY-MM') AS month,
+             COALESCE(SUM((metadata->>'value_saved')::numeric), 0)::int AS value,
+             COUNT(*) FILTER (WHERE (metadata->>'value_saved') IS NOT NULL)::int AS rescues
+      FROM activity_events
+      WHERE user_email = ${email}
+        AND created_at >= date_trunc('month', NOW()) - (${months - 1} || ' months')::interval
+      GROUP BY 1
+      ORDER BY 1 ASC
+    `;
+    // Fill gaps so the chart has a continuous axis.
+    const map = Object.fromEntries(rows.map(r => [r.month, r]));
+    const series = [];
+    const now = new Date();
+    for (let i = months - 1; i >= 0; i--) {
+      const d = new Date(now.getFullYear(), now.getMonth() - i, 1);
+      const key = `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, "0")}`;
+      series.push({
+        month: key,
+        label: d.toLocaleDateString("en-US", { month: "short" }),
+        value: map[key]?.value || 0,
+        rescues: map[key]?.rescues || 0,
+      });
+    }
+    res.json({ series, total: series.reduce((s, p) => s + p.value, 0) });
+  } catch (e) {
+    console.error("[insights/roi/history]", e.message);
+    res.status(500).json({ error: e.message });
+  }
+});
+
+// ---------------------------------------------------------------------------
 // Standing orders (Roadmap 2) — per-trip pre-authorized auto-rebooking rules.
 // ---------------------------------------------------------------------------
 app.get("/trips/:tripId/standing-order", auth, async (req, res) => {
