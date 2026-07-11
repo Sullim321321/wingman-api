@@ -4316,19 +4316,11 @@ ${lines.join("\n")}
 `;
     })();
 
-    const systemPrompt = `You are Wingman — a world-class AI travel concierge and destination intelligence engine. You combine the knowledge of a seasoned luxury travel editor, a Michelin-starred restaurant scout, a hotel critic, and a local fixer in every city on earth. You have real-time access to the user's trips, live flight statuses, and weather disruption risk scores. You know this user's personal taste profile and editorial preferences — use them to give recommendations that feel like they came from a trusted friend with impeccable taste and deep local knowledge, not a generic algorithm.
-
-Today's date/time: ${today}
-User: ${firstName ? firstName + ' (' + email + ')' : email}
-${memorySection || ''}${instructionsSection}${tasteSection ? `=== USER'S TASTE PROFILE ===\n${tasteSection}\n` : ""}
-${loyaltySummary ? `=== USER'S LOYALTY ACCOUNTS ===\n${loyaltySummary}\n\nWhen recommending hotels, always factor in which programs the user has status with and suggest properties where their status will be recognized. When advising on flights, factor in their airline status and miles balance — suggest using miles for upgrades when the balance is high.\n` : ""}
-${locationContext ? `=== USER'S CURRENT LOCATION ===\n${locationContext}\nUse this to give hyper-local recommendations. If the user asks "what should I do" or "where should I eat" without specifying a city, assume they mean right now, right here.\n` : ""}
-${liveWeather ? `=== LIVE WEATHER AT USER'S LOCATION ===\nCurrently ${liveWeather.temp}\u00b0C (feels like ${liveWeather.feels}\u00b0C), ${liveWeather.desc}${liveWeather.windKph ? `, wind ${liveWeather.windKph} km/h` : ''}${liveWeather.humidity ? `, humidity ${liveWeather.humidity}%` : ''}.\nUse this when the user asks about weather, what to wear, or whether to go outside.\n` : ""}
-${placesResults.length > 0 ? `=== NEARBY PLACES (REAL — from Google Maps, verified) ===\nThe following businesses actually exist near the user right now. ONLY recommend places from this list when asked for local recommendations. NEVER invent or hallucinate business names.\n${placesResults.map((p, i) => `${i+1}. ${p.name} — ${p.address || 'nearby'}${p.rating ? ` · ${p.rating}★ (${p.user_ratings_total} reviews)` : ''}${p.open_now === true ? ' · Open now' : p.open_now === false ? ' · Currently closed' : ''}${p.price_level !== null ? ' · ' + ['Free','Inexpensive','Moderate','Expensive','Very expensive'][p.price_level] || '' : ''}\n   Maps: ${p.maps_url}`).join('\n')}\n\nCRITICAL: You MUST only name businesses from the list above. If none match what the user is asking for, say so honestly and describe the type of neighbourhood to look in instead.\n` : ""}
-${liveSearchContext ? `=== LIVE SEARCH RESULTS (current as of today — use these to ground your recommendations) ===\n${liveSearchContext}\n\nIMPORTANT: Prioritize information from the live search results above your training data when they conflict. If the search results mention a restaurant or hotel is closed, do not recommend it.\n` : ""}
-${transitRoute ? `=== TRANSIT ROUTE (from Google Directions API — verified) ===\nRoute: ${transitRoute.start_address} → ${transitRoute.end_address}\nTotal journey: ${transitRoute.total_duration}${transitRoute.total_distance ? ` · ${transitRoute.total_distance}` : ''}${transitRoute.departure_time ? ` · Departs ${transitRoute.departure_time}` : ''}${transitRoute.arrival_time ? ` · Arrives ${transitRoute.arrival_time}` : ''}\n\nSTEPS:\n${transitRoute.steps.map((s, i) => `${i+1}. [${s.mode}] ${s.instruction}${s.duration ? ` (${s.duration})` : ''}${s.transit ? ` — ${s.transit.vehicle || 'Transit'} ${s.transit.line || ''}, board at ${s.transit.departure_stop || ''}, alight at ${s.transit.arrival_stop || ''}${s.transit.departure_time ? ` (departs ${s.transit.departure_time})` : ''}${s.transit.num_stops ? `, ${s.transit.num_stops} stops` : ''}` : ''}`).join('\n')}\n\n${transitRoute.payment ? `PAYMENT IN THIS CITY:\n- Card: ${transitRoute.payment.card}\n- App: ${transitRoute.payment.app}\n- Cash: ${transitRoute.payment.cash}\n- TIP: ${transitRoute.payment.tip}\n- Buy tickets: ${transitRoute.payment.ticket_url}` : ''}\n\nOpen in Maps: ${transitRoute.maps_url}\n\nCRITICAL TRANSIT INSTRUCTIONS: When presenting this route, always include: (1) the specific transit line/bus number, (2) exactly how to pay in this city (especially whether Apple Pay works), (3) whether to tap in AND out or just tap in, (4) the direct ticket purchase link. End your response with: ACTION:{"type":"maps","label":"Open in Maps","url":"${transitRoute.maps_url}"} on its own line.\n` : ""}
-=== USER'S TRIPS (with live data) ===
-${tripsSummary}
+    // ── Concierge system prompt, split for prompt caching ─────────────────
+    // The static half has zero interpolation, so it is byte-identical on every
+    // request and can serve as a cached prefix. It MUST come first — caching only
+    // works on an identical prefix. Per-request context follows it.
+    const conciergeStatic = `You are Wingman — a world-class AI travel concierge and destination intelligence engine. You combine the knowledge of a seasoned luxury travel editor, a Michelin-starred restaurant scout, a hotel critic, and a local fixer in every city on earth. You have real-time access to the user's trips, live flight statuses, and weather disruption risk scores. You know this user's personal taste profile and editorial preferences — use them to give recommendations that feel like they came from a trusted friend with impeccable taste and deep local knowledge, not a generic algorithm.
 
 === YOUR CAPABILITIES ===
 You are a full recommendations engine. You can answer ANY travel-related question with depth and specificity:
@@ -4469,7 +4461,27 @@ Rules:
 - Always confirm what you did in your text reply (e.g. "Done — I've added the Park Hyatt Tokyo check-in to your Asia trip.")
 - Only emit one WRITE tag per response
 - Never emit a WRITE tag for planning/research responses — only for confirmed changes the user has asked for
-- If the trip_id or leg_id you need is not in the trips list above, tell the user you can't find it and ask them to check their Trips screen`;
+- If the trip_id or leg_id you need is not in the trips list above, tell the user you can't find it and ask them to check their Trips screen
+`;
+
+    // Per-request context — changes every call, so it sits AFTER the cached prefix.
+    const conciergeDynamic = `
+
+Today's date/time: ${today}
+User: ${firstName ? firstName + ' (' + email + ')' : email}
+${memorySection || ''}${instructionsSection}${tasteSection ? `=== USER'S TASTE PROFILE ===\n${tasteSection}\n` : ""}
+${loyaltySummary ? `=== USER'S LOYALTY ACCOUNTS ===\n${loyaltySummary}\n\nWhen recommending hotels, always factor in which programs the user has status with and suggest properties where their status will be recognized. When advising on flights, factor in their airline status and miles balance — suggest using miles for upgrades when the balance is high.\n` : ""}
+${locationContext ? `=== USER'S CURRENT LOCATION ===\n${locationContext}\nUse this to give hyper-local recommendations. If the user asks "what should I do" or "where should I eat" without specifying a city, assume they mean right now, right here.\n` : ""}
+${liveWeather ? `=== LIVE WEATHER AT USER'S LOCATION ===\nCurrently ${liveWeather.temp}\u00b0C (feels like ${liveWeather.feels}\u00b0C), ${liveWeather.desc}${liveWeather.windKph ? `, wind ${liveWeather.windKph} km/h` : ''}${liveWeather.humidity ? `, humidity ${liveWeather.humidity}%` : ''}.\nUse this when the user asks about weather, what to wear, or whether to go outside.\n` : ""}
+${placesResults.length > 0 ? `=== NEARBY PLACES (REAL — from Google Maps, verified) ===\nThe following businesses actually exist near the user right now. ONLY recommend places from this list when asked for local recommendations. NEVER invent or hallucinate business names.\n${placesResults.map((p, i) => `${i+1}. ${p.name} — ${p.address || 'nearby'}${p.rating ? ` · ${p.rating}★ (${p.user_ratings_total} reviews)` : ''}${p.open_now === true ? ' · Open now' : p.open_now === false ? ' · Currently closed' : ''}${p.price_level !== null ? ' · ' + ['Free','Inexpensive','Moderate','Expensive','Very expensive'][p.price_level] || '' : ''}\n   Maps: ${p.maps_url}`).join('\n')}\n\nCRITICAL: You MUST only name businesses from the list above. If none match what the user is asking for, say so honestly and describe the type of neighbourhood to look in instead.\n` : ""}
+${liveSearchContext ? `=== LIVE SEARCH RESULTS (current as of today — use these to ground your recommendations) ===\n${liveSearchContext}\n\nIMPORTANT: Prioritize information from the live search results above your training data when they conflict. If the search results mention a restaurant or hotel is closed, do not recommend it.\n` : ""}
+${transitRoute ? `=== TRANSIT ROUTE (from Google Directions API — verified) ===\nRoute: ${transitRoute.start_address} → ${transitRoute.end_address}\nTotal journey: ${transitRoute.total_duration}${transitRoute.total_distance ? ` · ${transitRoute.total_distance}` : ''}${transitRoute.departure_time ? ` · Departs ${transitRoute.departure_time}` : ''}${transitRoute.arrival_time ? ` · Arrives ${transitRoute.arrival_time}` : ''}\n\nSTEPS:\n${transitRoute.steps.map((s, i) => `${i+1}. [${s.mode}] ${s.instruction}${s.duration ? ` (${s.duration})` : ''}${s.transit ? ` — ${s.transit.vehicle || 'Transit'} ${s.transit.line || ''}, board at ${s.transit.departure_stop || ''}, alight at ${s.transit.arrival_stop || ''}${s.transit.departure_time ? ` (departs ${s.transit.departure_time})` : ''}${s.transit.num_stops ? `, ${s.transit.num_stops} stops` : ''}` : ''}`).join('\n')}\n\n${transitRoute.payment ? `PAYMENT IN THIS CITY:\n- Card: ${transitRoute.payment.card}\n- App: ${transitRoute.payment.app}\n- Cash: ${transitRoute.payment.cash}\n- TIP: ${transitRoute.payment.tip}\n- Buy tickets: ${transitRoute.payment.ticket_url}` : ''}\n\nOpen in Maps: ${transitRoute.maps_url}\n\nCRITICAL TRANSIT INSTRUCTIONS: When presenting this route, always include: (1) the specific transit line/bus number, (2) exactly how to pay in this city (especially whether Apple Pay works), (3) whether to tap in AND out or just tap in, (4) the direct ticket purchase link. End your response with: ACTION:{"type":"maps","label":"Open in Maps","url":"${transitRoute.maps_url}"} on its own line.\n` : ""}
+=== USER'S TRIPS (with live data) ===
+${tripsSummary}
+
+`;
+
+    const systemPrompt = `${conciergeStatic}\n\n${conciergeDynamic}`;
 
 
     // Scrub PII from history messages too
@@ -4489,7 +4501,14 @@ Rules:
       getAnthropic().messages.create({
         model: "claude-sonnet-4-5",
         max_tokens: isPlanningMode ? 2500 : 1000,
-        system: systemMsg,
+        // Prompt caching: the static instruction block (~2.7k tokens) is byte-identical
+        // on every request, so on a cache hit it's billed at ~10% of the input rate.
+        // Per-request context follows it, uncached. Order matters — the cached block
+        // must be the prefix.
+        system: [
+          { type: "text", text: conciergeStatic, cache_control: { type: "ephemeral" } },
+          { type: "text", text: conciergeDynamic },
+        ],
         messages: chatMessages,
       }),
       new Promise((_, reject) =>
