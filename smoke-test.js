@@ -92,7 +92,8 @@ const STATIC_GETS = [
 
   "/me/memory",
   "/today-events",
-  "/me/data-export",          // was broken: phantom activity_log table
+  "/referral",                // mints the code on first call
+  "/me/data-export",          // was broken twice: phantom table, then phantom column
   "/destination/image?city=Paris",
 ];
 

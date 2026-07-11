@@ -259,6 +259,17 @@ async function bootstrapDB() {
     await sql`ALTER TABLE users ADD COLUMN IF NOT EXISTS subscription_status TEXT DEFAULT 'inactive'`;
     await sql`ALTER TABLE users ADD COLUMN IF NOT EXISTS stripe_customer_id TEXT`;
     await sql`ALTER TABLE users ADD COLUMN IF NOT EXISTS stripe_subscription_id TEXT`;
+    // ── Referral loop ──────────────────────────────────────────────────────────
+    // referral_code: this user's own code, minted lazily on first view.
+    // referred_by:   email of whoever invited them (set once, at signup only).
+    // referral_credited: guards the reward — paid on ACTIVATION, not signup, so a
+    //   pile of throwaway addresses earns nothing. See maybeCreditReferral().
+    await sql`ALTER TABLE users ADD COLUMN IF NOT EXISTS referral_code TEXT`;
+    await sql`ALTER TABLE users ADD COLUMN IF NOT EXISTS referred_by TEXT`;
+    await sql`ALTER TABLE users ADD COLUMN IF NOT EXISTS referral_credited BOOLEAN DEFAULT false`;
+    await sql`CREATE UNIQUE INDEX IF NOT EXISTS idx_users_referral_code ON users(referral_code) WHERE referral_code IS NOT NULL`;
+    await sql`CREATE INDEX IF NOT EXISTS idx_users_referred_by ON users(referred_by)`;
+
     await sql`ALTER TABLE users ADD COLUMN IF NOT EXISTS locale TEXT DEFAULT 'en'`;
     await sql`ALTER TABLE users ADD COLUMN IF NOT EXISTS currency TEXT DEFAULT 'USD'`;
     await sql`ALTER TABLE users ADD COLUMN IF NOT EXISTS weather_alerts BOOLEAN DEFAULT true`;
@@ -930,7 +941,87 @@ const POINT_RULES = {
   loyalty_connected:{ pts: 150, desc: "Connected loyalty account" },
   trip_completed:   { pts: 75,  desc: "Completed a trip" },
   gmail_trip_import:{ pts: 125, desc: "Trip imported from Gmail" },
+  // Referral. Paid on activation, never on signup — see maybeCreditReferral().
+  referral_joined:  { pts: 500, desc: "A friend you invited started travelling with Wingman" },
+  referral_welcome: { pts: 250, desc: "Joined on a friend's invitation" },
 };
+
+// Codes people have to read aloud, type on a phone, or squint at in a text
+// message. No 0/O/1/I/L — the characters that cause "it says invalid code".
+const REFERRAL_ALPHABET = "ABCDEFGHJKMNPQRSTUVWXYZ23456789";
+
+function newReferralCode() {
+  let s = "";
+  for (let i = 0; i < 6; i++) {
+    s += REFERRAL_ALPHABET[Math.floor(Math.random() * REFERRAL_ALPHABET.length)];
+  }
+  return s;
+}
+
+// Mint lazily and only once, on first view. Retries on the (vanishingly rare)
+// unique-index collision rather than trusting randomness.
+async function getOrCreateReferralCode(email) {
+  const [u] = await sql`SELECT referral_code FROM users WHERE email = ${email}`;
+  if (u?.referral_code) return u.referral_code;
+  for (let attempt = 0; attempt < 5; attempt++) {
+    const code = newReferralCode();
+    try {
+      const [row] = await sql`
+        UPDATE users SET referral_code = ${code}
+        WHERE email = ${email} AND referral_code IS NULL
+        RETURNING referral_code
+      `;
+      if (row?.referral_code) return row.referral_code;
+      // Lost a race — someone else set it. Read it back.
+      const [again] = await sql`SELECT referral_code FROM users WHERE email = ${email}`;
+      if (again?.referral_code) return again.referral_code;
+    } catch (e) {
+      if (attempt === 4) throw e; // collided 5x; something is genuinely wrong
+    }
+  }
+  return null;
+}
+
+/**
+ * Pay out a referral — but only once the invited person has actually DONE
+ * something (connected Gmail, or added a trip).
+ *
+ * Rewarding signup alone is what makes referral programmes farmable: you create
+ * ten throwaway addresses and collect ten payouts for ten dead accounts. Paying
+ * on activation means the referrer is rewarded for bringing a real traveller,
+ * which is the only thing worth paying for anyway.
+ *
+ * Idempotent twice over: the referral_credited flag, and awardPoints' own dedup.
+ */
+async function maybeCreditReferral(email) {
+  try {
+    const [u] = await sql`
+      SELECT referred_by, referral_credited FROM users WHERE email = ${email}
+    `;
+    if (!u?.referred_by || u.referral_credited) return;
+
+    // Claim the credit before awarding, so two concurrent activations can't
+    // both pay out.
+    const [claimed] = await sql`
+      UPDATE users SET referral_credited = true
+      WHERE email = ${email} AND referral_credited = false AND referred_by IS NOT NULL
+      RETURNING referred_by
+    `;
+    if (!claimed) return;
+
+    await awardPoints(claimed.referred_by, "referral_joined", `referral_joined:${email}`);
+    await awardPoints(email, "referral_welcome");
+
+    await sendPushToUser(
+      claimed.referred_by,
+      "Your invitation paid off",
+      "Someone you invited just started using Wingman. 500 points are yours.",
+      { type: "referral" },
+    ).catch(() => {});
+  } catch (e) {
+    console.error("[referral/credit]", e.message);
+  }
+}
 
 // Tier thresholds
 function getTier(balance) {
@@ -973,11 +1064,56 @@ async function awardPoints(email, action, dedupKey = null) {
             updated_at = NOW()
       RETURNING balance, tier
     `;
+
+    // "Activation" = the invited person did something real. Connecting Gmail or
+    // adding a trip both mean a live traveller, not a warm body. This is where a
+    // pending referral finally pays out. Fire-and-forget: a referral hiccup must
+    // never break the action that triggered it.
+    if (action === "gmail_connected" || action === "trip_added" || action === "gmail_trip_import") {
+      maybeCreditReferral(email).catch(() => {});
+    }
+
     return rows[0];
   } catch (e) {
     console.error("[points] award error:", e.message);
   }
 }
+
+// ── GET /referral — your code, and an honest account of what it's earned ──────
+// Deliberately reports invited vs. activated separately. "12 invited" feels good
+// and means nothing; "3 actually travelling" is the number that pays.
+app.get("/referral", auth, async (req, res) => {
+  const email = req.user.email;
+  try {
+    const code = await getOrCreateReferralCode(email);
+
+    const [stats] = await sql`
+      SELECT
+        COUNT(*)::int                                          AS invited,
+        COUNT(*) FILTER (WHERE referral_credited)::int         AS activated
+      FROM users
+      WHERE referred_by = ${email}
+    `;
+
+    const [earned] = await sql`
+      SELECT COALESCE(SUM(points), 0)::int AS points
+      FROM wingman_points_events
+      WHERE user_email = ${email} AND action LIKE 'referral_joined%'
+    `;
+
+    res.json({
+      code,
+      invited: stats?.invited || 0,
+      activated: stats?.activated || 0,
+      points_earned: earned?.points || 0,
+      reward_points: POINT_RULES.referral_joined.pts,
+      friend_points: POINT_RULES.referral_welcome.pts,
+    });
+  } catch (e) {
+    console.error("[referral]", e.message);
+    res.status(500).json({ error: "could not load referral" });
+  }
+});
 
 // GET /points — current balance, tier, recent events
 app.get("/points", auth, async (req, res) => {
@@ -1081,6 +1217,15 @@ app.post("/auth/request", authLimiter, async (req, res) => {
   }
   const code = String(Math.floor(100000 + Math.random() * 900000));
   try {
+    // Sign-in and sign-up are the same endpoint: /auth/verify creates the user if
+    // they don't exist. That means a typo'd address doesn't fail — it silently
+    // mints a fresh empty account, and the user concludes Wingman lost their data.
+    // (This is a real scenario for anyone with a work and a personal address.)
+    // We can't refuse to create accounts without breaking sign-up, so instead we
+    // tell the client which case this is and let it confirm first.
+    const [existing] = await sql`SELECT 1 FROM users WHERE email = ${email}`;
+    const isNewUser = !existing;
+
     await redis.set("otp:" + email, code, { ex: 600 });
     // Send via Resend if key is configured; otherwise log to console for dev/staging
     const resendKey = process.env.RESEND_API_KEY || "";
@@ -1101,7 +1246,9 @@ app.post("/auth/request", authLimiter, async (req, res) => {
       // Dev / staging fallback — log OTP so you can still test sign-in without Resend
       console.log(`[auth/request] OTP for ${email}: ${code}  (RESEND_API_KEY not configured — email not sent)`);
     }
-    res.json({ ok: true });
+    // Older shipped clients ignore is_new_user and behave exactly as before, so
+    // this is safe to deploy ahead of the app build.
+    res.json({ ok: true, is_new_user: isNewUser });
   } catch (e) {
     console.error("[auth/request]", e.message);
     res.status(500).json({ error: "failed to send OTP" });
@@ -1121,15 +1268,40 @@ app.post("/auth/verify", authLimiter, async (req, res) => {
       return res.status(401).json({ error: "invalid or expired code" });
     }
     await redis.del("otp:" + email);
-    await sql`
+    // RETURNING only yields a row when the INSERT actually happened, so this
+    // doubles as "is this a brand-new user?" — which is exactly when a referral
+    // may be attributed, and never again.
+    const [created] = await sql`
       INSERT INTO users (email) VALUES (${email})
       ON CONFLICT (email) DO NOTHING
+      RETURNING email
     `;
+    const isNewUser = !!created;
+
+    // Referral attribution. Deliberately signup-only and one-way: you cannot be
+    // re-attributed later, you cannot refer yourself, and a bad code is ignored
+    // rather than failing the sign-in — nobody should be locked out of their
+    // account because a friend mistyped a promo code.
+    const rawRef = String((req.body && (req.body.referralCode || req.body.referral_code)) || "")
+      .trim().toUpperCase();
+    if (isNewUser && rawRef) {
+      try {
+        const [referrer] = await sql`
+          SELECT email FROM users WHERE referral_code = ${rawRef}
+        `;
+        if (referrer && referrer.email !== email) {
+          await sql`UPDATE users SET referred_by = ${referrer.email} WHERE email = ${email}`;
+        }
+      } catch (e) {
+        console.error("[auth/verify] referral attribution:", e.message);
+      }
+    }
+
     const token = signAccessToken(email);
     const refreshToken = await issueRefreshToken(email);
     // Award signup points (idempotent)
     awardPoints(email, "signup").catch(() => {});
-    res.json({ ok: true, token, refreshToken, email });
+    res.json({ ok: true, token, refreshToken, email, is_new_user: isNewUser });
   } catch (e) {
     console.error("[auth/verify]", e.message);
     res.status(500).json({ error: "verification failed" });
