@@ -195,6 +195,43 @@ async function hit(path, token) {
   console.log(`  ${GREEN}No 500s. Every endpoint tested actually runs.${RESET}\n`);
 
   // ───────────────────────────────────────────────────────────────────────────
+  // PART 1b — the CONCIERGE (a POST, so nothing above has ever touched it)
+  //
+  // Everything above is GET-only and therefore blind to the single most important
+  // endpoint in the product. Opt-in, because a real call costs a cent of Anthropic
+  // credit:
+  //     CONCIERGE=1 node smoke-test.js
+  // ───────────────────────────────────────────────────────────────────────────
+  if (process.env.CONCIERGE === "1") {
+    console.log(`  ${BOLD}Concierge${RESET} ${DIM}— a real POST, real Anthropic call (~1¢)${RESET}\n`);
+    const started = Date.now();
+    try {
+      const r = await fetch(`${API}/concierge`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json", Authorization: `Bearer ${token}` },
+        body: JSON.stringify({ message: "Say only the word: pong", history: [] }),
+        signal: AbortSignal.timeout(90000),
+      });
+      const ms = Date.now() - started;
+      const text = await r.text();
+      if (r.status === 200) {
+        let reply = "";
+        try { reply = (JSON.parse(text).reply || "").slice(0, 80); } catch { reply = text.slice(0, 80); }
+        console.log(`  ${GREEN}200${RESET}  /concierge  ${DIM}${ms}ms${RESET}`);
+        console.log(`       ${DIM}reply: ${reply.replace(/\s+/g, " ")}${RESET}\n`);
+      } else {
+        console.log(`  ${RED}${r.status}${RESET}  /concierge  ${DIM}${ms}ms${RESET}`);
+        console.log(`  ${RED}${text.slice(0, 400).replace(/\s+/g, " ")}${RESET}\n`);
+        console.log(`  ${DIM}This is the error the app hides behind "That didn't go through."${RESET}\n`);
+      }
+    } catch (e) {
+      console.log(`  ${RED}ERR${RESET}  /concierge — ${e.message}  ${DIM}(${Date.now() - started}ms)${RESET}\n`);
+    }
+  } else {
+    console.log(`  ${DIM}Concierge not tested (POST + costs credit). Run: CONCIERGE=1 node smoke-test.js${RESET}\n`);
+  }
+
+  // ───────────────────────────────────────────────────────────────────────────
   // PART 2 — is the answer POSSIBLE?
   //
   // Everything above only proves the server responded. But "266 nights" came back
