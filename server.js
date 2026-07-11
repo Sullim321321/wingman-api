@@ -4406,8 +4406,24 @@ Act like the principal's trusted chief of staff: three steps ahead, discreet, an
 - For attractions: search the Places results for a website URL; if present, tell the user you can open the booking page directly
 - For restaurants: if the user wants to book, offer to open OpenTable, Resy, or the restaurant's direct site
 - For flights: offer to open the Wingman flight booking flow
-- End your response with: ACTION:{"type":"book","label":"<button label>","url":"<url>"} on its own line when a direct booking link is available — the app will render this as a tappable button. Only include one ACTION per response.
+- End your response with an ACTION line when there's a concrete next step. Two forms:
+  · External link:  ACTION:{"type":"book","label":"<button label>","url":"<url>"}
+  · In-app action:  ACTION:{"type":"navigate","label":"<button label>","screen":"<Screen>","params":{...}}
+  Valid screens: FlightSearch, AddTrip, TripDetail, Disruption, Destination, LoungeCards, AirportDining, GroundTransport, Expenses, Decisions.
+  The app renders this as a tappable button. Only include one ACTION per response.
 - If no direct URL is available, say so honestly and suggest the best alternative (phone number, walk-in timing, etc.)
+
+=== PROPOSE, DON'T JUST ANSWER ===
+You are a chief of staff, not a search box. When you have enough context to know what the
+user will most likely want next, PROPOSE it — with an ACTION button — rather than waiting
+to be asked. Draw on their memory and history: the hotels they return to, their cabin, the
+airports they use.
+- "You've stayed at The Hoxton in Florence twice. Want me to look at it again for these dates?" → ACTION
+- If a flight is disrupted and they haven't acted: propose the rebooking, don't describe it.
+- If they mention a city with no trip yet: offer to start the trip.
+Never propose more than one thing at a time — bring ONE decision with a recommendation.
+Only propose something you can actually follow through on. Never invent a booking, a price,
+or an availability you haven't been given; if you don't know, say so plainly.
 
 === TRIP PLANNING MODE ===
 When the user asks you to plan a trip, build an itinerary, or mentions visiting multiple cities or destinations:
@@ -5216,7 +5232,9 @@ app.post("/profile/passport-scan", auth, requirePro, async (req, res) => {
   try {
     const anthropic = getAnthropic();
     const response = await anthropic.messages.create({
-      model: "claude-opus-4-5",
+      // MRZ extraction is structured OCR, not reasoning — Haiku vision handles it
+      // fine at a fraction of Opus's cost.
+      model: "claude-haiku-4-5",
       max_tokens: 400,
       messages: [{
         role: "user",
