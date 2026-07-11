@@ -648,6 +648,10 @@ async function bootstrapDB() {
     await sql`ALTER TABLE trip_legs ADD COLUMN IF NOT EXISTS pickup_location TEXT`;
     await sql`ALTER TABLE trip_legs ADD COLUMN IF NOT EXISTS dropoff_location TEXT`;
     await sql`ALTER TABLE trip_legs ADD COLUMN IF NOT EXISTS vehicle_class TEXT`;
+    // property_name was referenced by the concierge trip write-back INSERT and the
+    // leg PATCH allow-list, but never actually created — so adding a booking from
+    // chat threw every time. It belongs alongside property_address.
+    await sql`ALTER TABLE trip_legs ADD COLUMN IF NOT EXISTS property_name TEXT`;
     await sql`ALTER TABLE trip_legs ADD COLUMN IF NOT EXISTS property_address TEXT`;
     await sql`ALTER TABLE trip_legs ADD COLUMN IF NOT EXISTS price_total NUMERIC(12,2)`;
     await sql`ALTER TABLE trip_legs ADD COLUMN IF NOT EXISTS currency TEXT`;
@@ -10449,7 +10453,9 @@ app.delete("/me", auth, async (req, res) => {
     // Cascade delete — all tables reference users(email) with ON DELETE CASCADE
     // but we do it explicitly for clarity and to handle any missing FK constraints
     await sql`DELETE FROM concierge_threads WHERE user_email = ${email}`;
-    await sql`DELETE FROM activity_log WHERE user_email = ${email}`;
+    // NOTE: this said activity_log, which is not a real table — account deletion
+    // threw here every time. The table is activity_events.
+    await sql`DELETE FROM activity_events WHERE user_email = ${email}`;
     await sql`DELETE FROM trip_legs WHERE trip_id IN (SELECT id FROM trips WHERE user_email = ${email})`;
     await sql`DELETE FROM trips WHERE user_email = ${email}`;
     await sql`DELETE FROM loyalty_accounts WHERE user_email = ${email}`;
@@ -10474,7 +10480,9 @@ app.get("/me/data-export", auth, async (req, res) => {
     const trips      = await sql`SELECT * FROM trips WHERE user_email = ${email}`;
     const legs       = await sql`SELECT tl.* FROM trip_legs tl JOIN trips t ON t.id = tl.trip_id WHERE t.user_email = ${email}`;
     const loyalty    = await sql`SELECT program, points_balance, elite_status, updated_at FROM loyalty_accounts WHERE user_email = ${email}`;
-    const activity   = await sql`SELECT event_type, summary, created_at FROM activity_log WHERE user_email = ${email} ORDER BY created_at DESC LIMIT 500`;
+    // Was: activity_log (nonexistent table) with event_type/summary (nonexistent
+    // columns) — data export threw every time. Correct table is activity_events.
+    const activity   = await sql`SELECT type AS event_type, title AS summary, body, created_at FROM activity_events WHERE user_email = ${email} ORDER BY created_at DESC LIMIT 500`;
     const points     = await sql`SELECT balance, tier, updated_at FROM wingman_points WHERE user_email = ${email}`;
 
     const export_data = {
