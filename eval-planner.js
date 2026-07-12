@@ -41,6 +41,24 @@ let nextId = 1;
 const TABLE = [];
 function fakeSql(strings, ...v) {
   const q = strings.join("?");
+
+  // addConstraint() now checks for an existing identical belief before inserting.
+  // The stub must answer THAT query honestly, not hand back a row for anything it's
+  // asked — a test double that answers questions it wasn't asked is one more system
+  // reporting confidently on evidence it never checked, and it took five green tests
+  // to red before I noticed.
+  if (/SELECT \* FROM constraints/i.test(q)) {
+    const [user_email, trip_id, kind, pred, , scope] = v;
+    const hit = TABLE.find((r) =>
+      r.user_email === user_email &&
+      r.trip_id === trip_id &&
+      r.kind === kind &&
+      JSON.stringify(r.predicate) === pred &&
+      (r.scope || null) === (scope || null) &&
+      r.superseded_by === null);
+    return Promise.resolve(hit ? [hit] : []);
+  }
+
   if (/INSERT INTO\s+constraints/i.test(q)) {
     const row = {
       id: nextId++, user_email: v[0], trip_id: v[1], intent_id: v[2], kind: v[3],

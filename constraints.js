@@ -247,6 +247,47 @@ async function addConstraint(sql, {
   const ceiling = MAX_CONFIDENCE[source];
   const conf = Math.min(confidence == null ? ceiling : confidence, ceiling);
 
+  // ── Idempotence ────────────────────────────────────────────────────────────
+  // The graph is a SET of beliefs, not a log of them. Holding the same fact twice is
+  // not harmless bookkeeping: scoreOption() sums weights across constraints, so a
+  // duplicated 'must' is worth 200 instead of 100 and every rescue ranking quietly
+  // bends toward whichever preference happened to get recorded twice.
+  //
+  // The Plan tab surfaced this immediately — "Dietary: vegetarian, vegan" and
+  // "Prefer marriott properties" each appearing twice, because backfill-graph.js had
+  // no idempotence and a second --apply wrote a second copy of everything.
+  //
+  // Dedupe belongs HERE, at the only door into the table, not in each caller. Callers
+  // forget. The door cannot.
+  const [existing] = await sql`
+    SELECT * FROM constraints
+    WHERE user_email = ${user_email}
+      AND trip_id IS NOT DISTINCT FROM ${trip_id}
+      AND kind = ${kind}
+      AND predicate @> ${JSON.stringify(predicate)}::jsonb
+      AND ${JSON.stringify(predicate)}::jsonb @> predicate
+      AND scope IS NOT DISTINCT FROM ${scope}
+      AND superseded_by IS NULL
+    LIMIT 1`;
+
+  if (existing) {
+    // Same belief. But if the newcomer arrives with better provenance — a source URL
+    // where we had only the user's word, or an expiry we lacked — that IS new
+    // information. Enrich the row; never fork it.
+    const betterEvidence = evidence?.url && !existing.evidence?.url;
+    const newExpiry      = expires_at && !existing.expires_at;
+    if (betterEvidence || newExpiry) {
+      const [upgraded] = await sql`
+        UPDATE constraints
+           SET evidence   = COALESCE(${JSON.stringify(evidence)}::jsonb, evidence),
+               expires_at = COALESCE(${expires_at}::TIMESTAMPTZ, expires_at)
+         WHERE id = ${existing.id}
+        RETURNING *`;
+      return upgraded;
+    }
+    return existing;
+  }
+
   const [row] = await sql`
     INSERT INTO constraints
       (user_email, trip_id, intent_id, kind, predicate, rationale, hardness,

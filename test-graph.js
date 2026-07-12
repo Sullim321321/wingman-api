@@ -77,8 +77,15 @@ async function is(what, actual, expected) {
   //
   // A rule that punishes honesty gets dishonesty. So the constraint is now stored at
   // its TRUE weight, as 'proposed', gating nothing until a human confirms it.
+  // The stub must answer only the query it was ASKED. The first version returned a
+  // row for everything, so addConstraint's new idempotence SELECT got a hit and
+  // concluded the constraint already existed — five tests failed on a stub that was
+  // lying, not on code that was wrong. A test double that answers questions it wasn't
+  // asked is just another confident system reporting on evidence it never checked.
   let cap = null;
   const grab = (strings, ...vals) => {
+    const q = strings.join("?");
+    if (/SELECT \* FROM constraints/i.test(q)) return [];   // nothing exists yet
     cap = vals;
     return [{ id: 1, hardness: vals[6], source: vals[7], status: vals[12] }];
   };
@@ -122,7 +129,12 @@ async function is(what, actual, expected) {
 
   // The clamp: an inferred constraint claiming 0.99 is the 266-night stay in a suit.
   let captured = null;
-  const capture = (strings, ...vals) => { captured = vals; return [{ id: 1 }]; };
+  const capture = (strings, ...vals) => {
+    const q = strings.join("?");
+    if (/SELECT \* FROM constraints/i.test(q)) return [];   // answer only what's asked
+    captured = vals;
+    return [{ id: 1 }];
+  };
 
   await graph.addConstraint(capture, {
     user_email: "t@t.com", kind: "lodging",
