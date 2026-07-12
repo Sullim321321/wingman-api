@@ -6,13 +6,16 @@
   "type": "commonjs",
   "scripts": {
     "start": "node server.js",
-    "dev": "node --watch server.js"
+    "dev": "node --watch server.js",
+    "test:graph": "node test-graph.js",
+    "backfill": "node backfill-graph.js",
+    "eval": "node --env-file=.env eval-planner.js"
   },
   "engines": {
     "node": ">=18"
   },
   "dependencies": {
-    "@anthropic-ai/sdk": "^0.39.0",
+    "@anthropic-ai/sdk": "^0.111.0",
     "@duffel/api": "^4.27.1",
     "@neondatabase/serverless": "^1.1.0",
     "@upstash/redis": "^1.38.0",

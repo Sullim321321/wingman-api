@@ -21,6 +21,12 @@ const rateLimit = require("express-rate-limit");
 const validator = require("validator");
 const crypto = require("crypto");
 
+// ── The constraint graph (see TRIP_MODEL.md) ─────────────────────────────────
+// Intents → constraints (with their reasons) → commitments. Plan, Book and Protect
+// are three readings of the same graph. `.bind(sql)` is called just below the sql
+// client so the invariant closures can use it like the existing ones do.
+const graph = require("./constraints");
+
 const app = express();
 
 // ── Security headers (helmet) ─────────────────────────────────────────────────
@@ -212,13 +218,26 @@ const redis = new Redis({
 });
 // Fallback placeholder keeps server from crashing at startup when env vars aren't set yet
 const sql = neon(process.env.DATABASE_URL || "postgresql://placeholder:placeholder@placeholder/placeholder");
+graph.bind(sql);   // constraint-graph invariants close over the same sql client
 const resend = new Resend(process.env.RESEND_API_KEY || "re_placeholder");
 // Anthropic lazy-loaded so server starts even if key is missing
 let _anthropic = null;
 function getAnthropic() {
   if (!_anthropic) {
     if (!process.env.ANTHROPIC_API_KEY) throw new Error("ANTHROPIC_API_KEY not set");
-    _anthropic = new Anthropic({ apiKey: process.env.ANTHROPIC_API_KEY });
+    // The SDK was pinned at 0.39.0 (early 2025) while we call claude-sonnet-4-5 and
+    // claude-haiku-4-5 — models that postdate it. The symptom was a socket dying
+    // mid-response ("Invalid response body ... Premature close"), which surfaced to
+    // the user as the concierge's "that didn't go through". Not a timeout, not auth:
+    // a stale transport.
+    //
+    // maxRetries covers the transport failures that are not the model's fault. The
+    // default of 2 is thin for a 55s concierge call.
+    _anthropic = new Anthropic({
+      apiKey: process.env.ANTHROPIC_API_KEY,
+      maxRetries: 4,
+      timeout: 120000,
+    });
   }
   return _anthropic;
 }
@@ -612,6 +631,14 @@ async function bootstrapDB() {
         updated_at TIMESTAMPTZ DEFAULT NOW()
       )
     `;
+    // ── The constraint graph (TRIP_MODEL.md, Phase 0) ────────────────────────
+    // intents · constraints · satisfies · depends_on · deliberations, plus the
+    // trip_legs columns that make PLANNING possible (state, cost, cancellable_until).
+    // Additive only. Nothing below this line changes existing behaviour — the graph
+    // is born, populated by dual-write, and proved honest by its invariants long
+    // before any screen reads from it.
+    await graph.ensureConstraintSchema(sql);
+
     await sql`ALTER TABLE users ADD COLUMN IF NOT EXISTS revealed_preferences JSONB DEFAULT '{}'`;
     await sql`ALTER TABLE users ADD COLUMN IF NOT EXISTS apple_sub TEXT`;
     await sql`ALTER TABLE users ADD COLUMN IF NOT EXISTS phone TEXT`;
@@ -4637,6 +4664,13 @@ const INVARIANTS = [
         AND tl.departs_at > NOW() + INTERVAL '2 years'
       LIMIT 5`,
   },
+
+  // ── The constraint graph's own promises (see constraints.js) ───────────────
+  // The old invariants ask "is this data possible?". These ask a harder question:
+  // "is Wingman entitled to believe this?" — no inferred rule may be non-negotiable,
+  // no researched fact may lack a source, no cascade node may assert an impact it
+  // cannot evidence, and no autonomous action may fail to name what it protected.
+  ...graph.CONSTRAINT_INVARIANTS,
 ];
 
 app.get("/admin/invariants", async (req, res) => {
@@ -4644,6 +4678,7 @@ app.get("/admin/invariants", async (req, res) => {
   if (!email) return res.status(401).json({ error: "unauthorized" });
   try {
     const violations = [];
+    const findings = [];      // `soft` invariants: reported, do NOT fail the suite
     for (const inv of INVARIANTS) {
       let rows = [];
       try {
@@ -4653,13 +4688,19 @@ app.get("/admin/invariants", async (req, res) => {
         continue;
       }
       if (rows.length) {
-        violations.push({ name: inv.name, why: inv.why, count: rows.length, examples: rows });
+        const hit = { name: inv.name, why: inv.why, count: rows.length, examples: rows };
+        (inv.soft ? findings : violations).push(hit);
       }
     }
     res.json({
+      // A soft invariant is a DIAGNOSIS, not a defect. "Booked commitment with no
+      // reason attached" will be large on the first run — that is the point of the
+      // whole exercise, not a failure of it. Failing the suite on it would teach us
+      // to ignore the suite.
       ok: violations.length === 0,
       checked: INVARIANTS.length,
       violations,
+      findings,
     });
   } catch (e) {
     console.error("[invariants]", e.message);
@@ -12871,5 +12912,122 @@ setInterval(async () => {
     // Silently ignore — this is best-effort
   }
 }, 10 * 60 * 1000); // every 10 minutes
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// PLAN — the front door.  (TRIP_MODEL.md · planner.js)
+//
+// Wingman could file a trip. It could never MAKE one. So the most valuable forty
+// turns of a user's life — the conversation where the trip actually gets decided —
+// happened in somebody else's chat window, and we met the trip afterwards, as a pile
+// of receipts with no reasons attached.
+//
+// These three endpoints are that missing half. A conversation goes in; a constraint
+// graph comes out, with the WHY on every line.
+// ═══════════════════════════════════════════════════════════════════════════════
+const planner = require("./planner");
+
+// POST /plan/message — one turn of planning.
+app.post("/plan/message", conciergeLimiter, async (req, res) => {
+  const email = await verifyAccessToken(req);
+  if (!email) return res.status(401).json({ error: "unauthorized" });
+
+  const { message: raw, tripId, history = [] } = req.body || {};
+  if (!raw) return res.status(400).json({ error: "message required" });
+  const message = scrubPII(raw);
+
+  try {
+    // A planning conversation needs somewhere to put its constraints. Create the
+    // trip as a *draft* — state 'considered', not 'booked'. This is the thing the
+    // old schema could not express, and it is why planning was impossible.
+    let trip_id = tripId;
+    if (!trip_id) {
+      const [t] = await sql`
+        INSERT INTO trips (user_email, title, status, source)
+        VALUES (${email}, 'Untitled trip', 'draft', 'planner')
+        RETURNING id`;
+      trip_id = t.id;
+    }
+
+    const known = await graph.constraintsFor(sql, { user_email: email, trip_id });
+
+    // Look it up rather than recall it. Entry rules and alliance cutoffs go stale,
+    // and a wrong one leaves someone at a border.
+    let findings = null;
+    if (planner.NEEDS_LOOKUP.test(message)) {
+      try {
+        const r = await planner.research(message, history.map((h) => h.content));
+        if (r.text && !/^nothing to check/i.test(r.text)) findings = r.text;
+      } catch (e) {
+        console.warn("[plan] research failed:", e.message);   // degrade, never block
+      }
+    }
+
+    const out = await planner.converse({ message, known, history, findings });
+    const wrote = await planner.commit(sql, {
+      user_email: email, trip_id, proposals: out, known,
+    });
+
+    // Refusals are not errors. They are the schema declining to store something the
+    // model had not earned — and the user should be able to see that happen.
+    if (wrote.refused.length) {
+      console.warn("[plan] refused:", wrote.refused.map((r) => r.why).join(" | "));
+    }
+
+    const live = await graph.constraintsFor(sql, { user_email: email, trip_id });
+
+    res.json({
+      trip_id,
+      reply: out.reply,
+      gaps: out.gaps,
+      constraints: live,
+      added: wrote.written.map((w) => ({ id: w.id, rationale: w.rationale, hardness: w.hardness, status: w.status, scope: w.scope })),
+      proposed: wrote.proposed.map((p) => ({ id: p.id, rationale: p.rationale, hardness: p.hardness })),
+      kept: wrote.kept,
+      refused: wrote.refused.map((r) => ({ rationale: r.rationale, why: r.why })),
+    });
+  } catch (e) {
+    console.error("[plan/message]", e.message);
+    res.status(500).json({ error: "plan_failed", detail: e.message });
+  }
+});
+
+// GET /plan/:tripId — the document, as it stands.
+app.get("/plan/:tripId", async (req, res) => {
+  const email = await verifyAccessToken(req);
+  if (!email) return res.status(401).json({ error: "unauthorized" });
+  try {
+    const trip_id = parseInt(req.params.tripId, 10);
+    const [trip] = await sql`SELECT * FROM trips WHERE id = ${trip_id} AND user_email = ${email}`;
+    if (!trip) return res.status(404).json({ error: "not_found" });
+
+    const constraints = await graph.constraintsFor(sql, { user_email: email, trip_id });
+    const legs = await sql`SELECT * FROM trip_legs WHERE trip_id = ${trip_id} ORDER BY departs_at NULLS LAST`;
+    res.json({
+      trip,
+      legs,
+      constraints,
+      // The two the UI must treat differently: things awaiting your word, and things
+      // Wingman thinks are non-negotiable but only inferred.
+      proposed: constraints.filter((c) => c.status === "proposed"),
+    });
+  } catch (e) {
+    console.error("[plan/get]", e.message);
+    res.status(500).json({ error: e.message });
+  }
+});
+
+// POST /plan/constraint/:id/confirm — an inference becomes a fact.
+// The ONLY way that ever happens.
+app.post("/plan/constraint/:id/confirm", async (req, res) => {
+  const email = await verifyAccessToken(req);
+  if (!email) return res.status(401).json({ error: "unauthorized" });
+  try {
+    const row = await graph.confirm(sql, parseInt(req.params.id, 10), { user_email: email });
+    if (!row) return res.status(404).json({ error: "not_found_or_not_proposed" });
+    res.json({ ok: true, constraint: row });
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
 
 app.listen(PORT, () => console.log("Wingman API on http://localhost:" + PORT));
