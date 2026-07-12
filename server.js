@@ -2709,10 +2709,33 @@ async function findTripForLooseBooking(userEmail, whenISO, city) {
     if (end - start > (MAX_TRIP_DAYS + 2) * DAY) continue;
 
     if (when < start || when > end) continue;  // date must fall in the trip window
+
     if (cityLc && r.cities && r.cities.includes(cityLc)) {
       return { tripId: r.id, title: r.title };  // best: date + city match
     }
-    if (!fallback) fallback = { tripId: r.id, title: r.title }; // date-only match
+
+    // ── The date-only fallback, and why it is now conditional ─────────────────
+    //
+    // This used to fire whenever the dates overlapped, whatever the city. So a
+    // restaurant booking in London, on a date when a Stockholm trip happened to be
+    // open, got filed under Stockholm. That is how a trip fills up with things
+    // that have nothing to do with it.
+    //
+    // The distinction that matters:
+    //
+    //   • Booking has a city, and it DOESN'T match this trip → this is positive
+    //     evidence it belongs somewhere else. Do NOT attach. Silence beats a
+    //     confident mis-file.
+    //
+    //   • Booking has NO city at all → a dinner reservation with no location, on a
+    //     date inside a trip, most likely IS part of that trip. Attaching is a fair
+    //     inference and the only one available.
+    //
+    // The old code treated "wrong city" and "no city" identically. They are not the
+    // same: one is evidence against, the other is merely absence of evidence.
+    if (!cityLc && !fallback) {
+      fallback = { tripId: r.id, title: r.title };
+    }
   }
   return fallback;
 }
@@ -4136,6 +4159,62 @@ async function unmergeMegaTrips(userEmail, { dryRun = true } = {}) {
     }
   }
 
+  // ── 1b. Evict bookings filed under a trip to the wrong city ──────────────────
+  // The loose-booking matcher used to fall back to a date-only match when no city
+  // matched — so a dinner in London landed in a Stockholm trip that happened to
+  // overlap the dates. Move those out. If a trip to the RIGHT city exists on those
+  // dates, they go there; otherwise to "Reservations", where they can be folded in
+  // later. We do not guess a second time.
+  const misfiled = await sql`
+    WITH trip_cities AS (
+      SELECT tl.trip_id,
+             STRING_AGG(DISTINCT LOWER(SPLIT_PART(COALESCE(tl.destination_city, tl.destination, ''), ',', 1)), ' ') AS cities
+      FROM trip_legs tl
+      WHERE tl.type IN ('flight','hotel','airbnb','train','ferry','cruise','car')
+      GROUP BY tl.trip_id
+    )
+    SELECT tl.id, tl.departs_at, tl.property_name,
+           LOWER(SPLIT_PART(COALESCE(tl.destination_city, tl.destination), ',', 1)) AS city,
+           t.id AS trip_id, t.title
+    FROM trip_legs tl
+    JOIN trips t ON t.id = tl.trip_id
+    JOIN trip_cities tc ON tc.trip_id = tl.trip_id
+    WHERE t.user_email = ${userEmail}
+      AND tl.type NOT IN ('flight','hotel','airbnb','train','ferry','cruise','car')
+      AND COALESCE(tl.destination_city, tl.destination, '') <> ''
+      AND tc.cities IS NOT NULL
+      AND POSITION(LOWER(SPLIT_PART(COALESCE(tl.destination_city, tl.destination), ',', 1)) IN tc.cities) = 0
+  `;
+
+  report.misfiledMoved = 0;
+  for (const l of misfiled) {
+    const better = await findTripForLooseBooking(userEmail, l.departs_at, l.city);
+    const destTripId = better && better.tripId !== l.trip_id ? better.tripId : null;
+
+    report.misfiledMoved++;
+    report.details.push(
+      `"${l.property_name || l.city}" (${l.city}) was filed under "${l.title}" — ` +
+      (destTripId ? `moving to the ${l.city} trip` : `moving to "Reservations"`),
+    );
+
+    if (!dryRun) {
+      let target = destTripId;
+      if (!target) {
+        let [hold] = await sql`
+          SELECT id FROM trips WHERE user_email = ${userEmail} AND title = 'Reservations' LIMIT 1
+        `;
+        if (!hold) {
+          [hold] = await sql`
+            INSERT INTO trips (user_email, title, source)
+            VALUES (${userEmail}, 'Reservations', 'unmerge') RETURNING id
+          `;
+        }
+        target = hold.id;
+      }
+      await sql`UPDATE trip_legs SET trip_id = ${target} WHERE id = ${l.id}`;
+    }
+  }
+
   // ── 2. Re-cluster over-long trips ────────────────────────────────────────────
   // Re-read spans AFTER the fix above, so a trip that is only long because of a
   // poison leg isn't split unnecessarily.
@@ -4427,6 +4506,30 @@ const INVARIANTS = [
       WHERE t.user_email = ${email} AND tl.confirmation IS NOT NULL AND tl.confirmation <> ''
       GROUP BY tl.confirmation
       HAVING COUNT(DISTINCT t.id) > 1
+      LIMIT 5`,
+  },
+  {
+    name: "booking filed under a trip to a different city",
+    why: "A dinner in London sitting inside a Stockholm trip. The grouping fell back to a date-only match and ignored the city — so the trip fills up with things that have nothing to do with it.",
+    query: (email) => sql`
+      WITH trip_cities AS (
+        SELECT tl.trip_id,
+               STRING_AGG(DISTINCT LOWER(SPLIT_PART(COALESCE(tl.destination_city, tl.destination, ''), ',', 1)), ' ') AS cities
+        FROM trip_legs tl
+        WHERE tl.type IN ('flight','hotel','airbnb','train','ferry','cruise','car')
+        GROUP BY tl.trip_id
+      )
+      SELECT tl.id, t.title AS detail,
+             COALESCE(tl.property_name, tl.destination_city, tl.destination) AS booking,
+             LOWER(SPLIT_PART(COALESCE(tl.destination_city, tl.destination), ',', 1)) AS booking_city
+      FROM trip_legs tl
+      JOIN trips t  ON t.id = tl.trip_id
+      JOIN trip_cities tc ON tc.trip_id = tl.trip_id
+      WHERE t.user_email = ${email}
+        AND tl.type NOT IN ('flight','hotel','airbnb','train','ferry','cruise','car')
+        AND COALESCE(tl.destination_city, tl.destination, '') <> ''
+        AND tc.cities IS NOT NULL
+        AND POSITION(LOWER(SPLIT_PART(COALESCE(tl.destination_city, tl.destination), ',', 1)) IN tc.cities) = 0
       LIMIT 5`,
   },
   {
