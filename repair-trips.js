@@ -58,6 +58,7 @@ async function login() {
 }
 
 function printReport(rep) {
+  console.log(`  ${B}Multi-city trips retitled:${R}        ${rep.tripsRetitled ?? 0}`);
   console.log(`  ${B}Poison legs (bad check-out year):${R} ${rep.legsDatesFixed}`);
   console.log(`  ${B}Bookings in the wrong city:${R}       ${rep.misfiledMoved ?? 0}`);
   console.log(`  ${B}Trips to split:${R}                   ${rep.tripsSplit}`);
@@ -85,7 +86,8 @@ function printReport(rep) {
 
   // Every counter, not just the ones I remembered. An "all clear" that only checks
   // two of four fields is how a repair silently skips the thing you asked it to fix.
-  if (!dry.json.tripsSplit && !dry.json.legsDatesFixed && !dry.json.misfiledMoved && !dry.json.legsOrphaned) {
+  if (!dry.json.tripsSplit && !dry.json.legsDatesFixed && !dry.json.misfiledMoved &&
+      !dry.json.legsOrphaned && !dry.json.tripsRetitled && !dry.json.reservationsRehomed) {
     console.log(`  ${GRN}Nothing to repair.${R}\n`);
     return;
   }

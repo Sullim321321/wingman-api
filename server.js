@@ -931,20 +931,7 @@ async function verifyAccessToken(req) {
 
 // ─── Wingman Points ────────────────────────────────────────────────────────────
 // Earn rules: each action can only award points once (deduped by action key)
-const POINT_RULES = {
-  signup:           { pts: 200, desc: "Joined Wingman" },
-  gmail_connected:  { pts: 300, desc: "Connected Gmail" },
-  trip_added:       { pts: 100, desc: "Added a trip" },
-  profile_complete: { pts: 150, desc: "Completed profile" },
-  push_enabled:     { pts: 100, desc: "Enabled push notifications" },
-  concierge_first:  { pts: 50,  desc: "First concierge message" },
-  loyalty_connected:{ pts: 150, desc: "Connected loyalty account" },
-  trip_completed:   { pts: 75,  desc: "Completed a trip" },
-  gmail_trip_import:{ pts: 125, desc: "Trip imported from Gmail" },
-  // Referral. Paid on activation, never on signup — see maybeCreditReferral().
-  referral_joined:  { pts: 500, desc: "A friend you invited started travelling with Wingman" },
-  referral_welcome: { pts: 250, desc: "Joined on a friend's invitation" },
-};
+;
 
 // Codes people have to read aloud, type on a phone, or squint at in a text
 // message. No 0/O/1/I/L — the characters that cause "it says invalid code".
@@ -983,15 +970,16 @@ async function getOrCreateReferralCode(email) {
 }
 
 /**
- * Pay out a referral — but only once the invited person has actually DONE
- * something (connected Gmail, or added a trip).
+ * Mark a referral as having come good — the person you introduced is actually
+ * travelling with Wingman, not just registered.
  *
- * Rewarding signup alone is what makes referral programmes farmable: you create
- * ten throwaway addresses and collect ten payouts for ten dead accounts. Paying
- * on activation means the referrer is rewarded for bringing a real traveller,
- * which is the only thing worth paying for anyway.
+ * There is NO REWARD any more. This used to pay 500 points to the referrer and
+ * 250 to the newcomer; that was the gamification layer, and it's gone. A private
+ * travel office does not run a referral programme. It grows because one member
+ * introduces another, and the introduction is the whole of it.
  *
- * Idempotent twice over: the referral_credited flag, and awardPoints' own dedup.
+ * What we still do is TELL you — quietly, once — that the person you vouched for
+ * is being looked after. Which is the thing you actually wanted to know.
  */
 async function maybeCreditReferral(email) {
   try {
@@ -1000,8 +988,7 @@ async function maybeCreditReferral(email) {
     `;
     if (!u?.referred_by || u.referral_credited) return;
 
-    // Claim the credit before awarding, so two concurrent activations can't
-    // both pay out.
+    // Claim it first, so two concurrent activations can't both notify.
     const [claimed] = await sql`
       UPDATE users SET referral_credited = true
       WHERE email = ${email} AND referral_credited = false AND referred_by IS NOT NULL
@@ -1009,13 +996,10 @@ async function maybeCreditReferral(email) {
     `;
     if (!claimed) return;
 
-    await awardPoints(claimed.referred_by, "referral_joined", `referral_joined:${email}`);
-    await awardPoints(email, "referral_welcome");
-
     await sendPushToUser(
       claimed.referred_by,
-      "Your invitation paid off",
-      "Someone you invited just started using Wingman. 500 points are yours.",
+      "Your introduction landed",
+      "Someone you introduced is travelling with Wingman now. They're in good hands.",
       { type: "referral" },
     ).catch(() => {});
   } catch (e) {
@@ -1023,65 +1007,14 @@ async function maybeCreditReferral(email) {
   }
 }
 
-// Tier thresholds
-function getTier(balance) {
-  if (balance >= 2000) return "elite";
-  if (balance >= 800)  return "navigator";
-  if (balance >= 300)  return "flyer";
-  return "explorer";
-}
-
-// Award points (idempotent by action key — pass unique key for repeatable actions)
-async function awardPoints(email, action, dedupKey = null) {
-  const rule = POINT_RULES[action];
-  if (!rule) return;
-  const key = dedupKey || action;
-  try {
-    // Check if already awarded this key
-    const existing = await sql`
-      SELECT id FROM wingman_points_events
-      WHERE user_email = ${email} AND action = ${key}
-      LIMIT 1
-    `;
-    if (existing.length > 0) return; // already awarded
-    // Insert event
-    await sql`
-      INSERT INTO wingman_points_events (user_email, action, points, description)
-      VALUES (${email}, ${key}, ${rule.pts}, ${rule.desc})
-    `;
-    // Upsert balance
-    const rows = await sql`
-      INSERT INTO wingman_points (user_email, balance, tier)
-      VALUES (${email}, ${rule.pts}, ${getTier(rule.pts)})
-      ON CONFLICT (user_email) DO UPDATE
-        SET balance = wingman_points.balance + ${rule.pts},
-            tier = CASE
-              WHEN wingman_points.balance + ${rule.pts} >= 2000 THEN 'elite'
-              WHEN wingman_points.balance + ${rule.pts} >= 800  THEN 'navigator'
-              WHEN wingman_points.balance + ${rule.pts} >= 300  THEN 'flyer'
-              ELSE 'explorer'
-            END,
-            updated_at = NOW()
-      RETURNING balance, tier
-    `;
-
-    // "Activation" = the invited person did something real. Connecting Gmail or
-    // adding a trip both mean a live traveller, not a warm body. This is where a
-    // pending referral finally pays out. Fire-and-forget: a referral hiccup must
-    // never break the action that triggered it.
-    if (action === "gmail_connected" || action === "trip_added" || action === "gmail_trip_import") {
-      maybeCreditReferral(email).catch(() => {});
-    }
-
-    return rows[0];
-  } catch (e) {
-    console.error("[points] award error:", e.message);
-  }
-}
-
-// ── GET /referral — your code, and an honest account of what it's earned ──────
-// Deliberately reports invited vs. activated separately. "12 invited" feels good
-// and means nothing; "3 actually travelling" is the number that pays.
+// ── GET /referral — your invitation code, and one honest number ───────────────
+//
+// No points, no rewards, no tier. This used to return reward_points and
+// friend_points; there is nothing to earn any more.
+//
+// It returns `activated` — how many of the people you introduced are ACTUALLY
+// travelling with Wingman. Not "invited", which counts people who did nothing and
+// exists only to make the number look bigger.
 app.get("/referral", auth, async (req, res) => {
   const email = req.user.email;
   try {
@@ -1089,25 +1022,16 @@ app.get("/referral", auth, async (req, res) => {
 
     const [stats] = await sql`
       SELECT
-        COUNT(*)::int                                          AS invited,
-        COUNT(*) FILTER (WHERE referral_credited)::int         AS activated
+        COUNT(*)::int                                  AS invited,
+        COUNT(*) FILTER (WHERE referral_credited)::int AS activated
       FROM users
       WHERE referred_by = ${email}
-    `;
-
-    const [earned] = await sql`
-      SELECT COALESCE(SUM(points), 0)::int AS points
-      FROM wingman_points_events
-      WHERE user_email = ${email} AND action LIKE 'referral_joined%'
     `;
 
     res.json({
       code,
       invited: stats?.invited || 0,
       activated: stats?.activated || 0,
-      points_earned: earned?.points || 0,
-      reward_points: POINT_RULES.referral_joined.pts,
-      friend_points: POINT_RULES.referral_welcome.pts,
     });
   } catch (e) {
     console.error("[referral]", e.message);
@@ -1116,97 +1040,14 @@ app.get("/referral", auth, async (req, res) => {
 });
 
 // GET /points — current balance, tier, recent events
-app.get("/points", auth, async (req, res) => {
-  try {
-    const email = req.email;
-    const [balRows, events] = await Promise.all([
-      sql`SELECT balance, tier FROM wingman_points WHERE user_email = ${email}`,
-      sql`SELECT action, points, description, created_at FROM wingman_points_events
-          WHERE user_email = ${email} ORDER BY created_at DESC LIMIT 20`,
-    ]);
-    const balance = balRows[0]?.balance || 0;
-    const tier    = balRows[0]?.tier    || getTier(balance);
-    // Compute progress to next tier
-    const TIERS = [
-      { name: "explorer",  min: 0,    max: 299,  next: "flyer",     nextMin: 300  },
-      { name: "flyer",     min: 300,  max: 799,  next: "navigator", nextMin: 800  },
-      { name: "navigator", min: 800,  max: 1999, next: "elite",     nextMin: 2000 },
-      { name: "elite",     min: 2000, max: null, next: null,        nextMin: null },
-    ];
-    const tierInfo = TIERS.find(t => t.name === tier) || TIERS[0];
-    const pct = tierInfo.nextMin
-      ? Math.round(((balance - tierInfo.min) / (tierInfo.nextMin - tierInfo.min)) * 100)
-      : 100;
-    res.json({
-      ok: true,
-      balance,
-      tier,
-      next_tier: tierInfo.next,
-      points_to_next: tierInfo.nextMin ? Math.max(0, tierInfo.nextMin - balance) : 0,
-      progress_pct: Math.min(100, pct),
-      events: events.map(e => ({
-        action: e.action,
-        points: e.points,
-        description: e.description,
-        date: e.created_at,
-      })),
-    });
-  } catch (e) {
-    res.status(500).json({ error: e.message });
-  }
-});
+
 
 // POST /points/award — internal endpoint to award points from other flows
 // Also called by the app when user completes an action
-app.post("/points/award", auth, async (req, res) => {
-  try {
-    const email = req.email;
-    const { action, dedup_key } = req.body || {};
-    if (!action || !POINT_RULES[action]) return res.status(400).json({ error: "unknown action" });
-    const result = await awardPoints(email, action, dedup_key);
-    res.json({ ok: true, awarded: !!result, result });
-  } catch (e) {
-    res.status(500).json({ error: e.message });
-  }
-});
+
 
 // POST /points/redeem — redeem Wingman Points for a perk
-app.post("/points/redeem", auth, async (req, res) => {
-  try {
-    const email = req.email;
-    const { perk_id } = req.body || {};
-    const REDEEMABLE_PERKS = {
-      "free_month":        { cost: 500,  label: "1 Month Free",        description: "One month of Wingman Premium" },
-      "priority_support":  { cost: 300,  label: "Priority Support",     description: "Jump to the front of the support queue" },
-      "upgrade_boost":     { cost: 400,  label: "Upgrade Bid Boost",    description: "2x points on your next upgrade bid" },
-      "lounge_day_pass":   { cost: 600,  label: "Lounge Day Pass",      description: "One-day Priority Pass lounge access" },
-      "concierge_call":    { cost: 800,  label: "Concierge Call",       description: "30-min call with a Wingman travel expert" },
-    };
-    if (!perk_id || !REDEEMABLE_PERKS[perk_id]) {
-      return res.status(400).json({ error: "unknown perk" });
-    }
-    const perk = REDEEMABLE_PERKS[perk_id];
-    const balRows = await sql`SELECT balance FROM wingman_points WHERE user_email = ${email}`;
-    const balance = balRows[0]?.balance || 0;
-    if (balance < perk.cost) {
-      return res.status(400).json({ error: "insufficient_points", balance, required: perk.cost });
-    }
-    const newBalance = balance - perk.cost;
-    await sql`
-      INSERT INTO wingman_points (user_email, balance, tier)
-      VALUES (${email}, ${newBalance}, ${getTier(newBalance)})
-      ON CONFLICT (user_email) DO UPDATE
-      SET balance = ${newBalance}, tier = ${getTier(newBalance)}, updated_at = NOW()
-    `;
-    await sql`
-      INSERT INTO wingman_points_events (user_email, action, points, description)
-      VALUES (${email}, ${'redeem_' + perk_id}, ${-perk.cost}, ${`Redeemed: ${perk.label}`})
-    `;
-    res.json({ ok: true, perk_id, perk_label: perk.label, cost: perk.cost, new_balance: newBalance });
-  } catch (e) {
-    res.status(500).json({ error: e.message });
-  }
-});
+
 
 // POST /auth/request — send OTP
 // ---------------------------------------------------------------------------
@@ -1300,7 +1141,6 @@ app.post("/auth/verify", authLimiter, async (req, res) => {
     const token = signAccessToken(email);
     const refreshToken = await issueRefreshToken(email);
     // Award signup points (idempotent)
-    awardPoints(email, "signup").catch(() => {});
     res.json({ ok: true, token, refreshToken, email, is_new_user: isNewUser });
   } catch (e) {
     console.error("[auth/verify]", e.message);
@@ -1337,7 +1177,6 @@ app.post("/auth/apple", authLimiter, async (req, res) => {
         display_name = COALESCE(users.display_name, EXCLUDED.display_name)
     `;
     const token = signAccessToken(resolvedEmail);
-    awardPoints(resolvedEmail, "signup").catch(() => {});
     res.json({ ok: true, token, email: resolvedEmail });
   } catch (e) {
     console.error("[auth/apple]", e.message);
@@ -1394,7 +1233,6 @@ app.post("/auth/sms/verify", async (req, res) => {
       await sql`INSERT INTO users (email, phone) VALUES (${email}, ${phone}) ON CONFLICT (email) DO NOTHING`;
     }
     const token = signAccessToken(email);
-    awardPoints(email, "signup").catch(() => {});
     res.json({ ok: true, token, email, phone });
   } catch (e) {
     console.error("[auth/sms/verify]", e.message);
@@ -2823,6 +2661,66 @@ async function findTripForLooseBooking(userEmail, whenISO, city) {
 }
 
 /**
+ * Retitle a trip to match the journey it actually became.
+ *
+ * A trip's title is set from the FIRST booking that lands in it, and then never
+ * revisited. So a fortnight of Stockholm → Edinburgh → London stayed called
+ * "Stockholm" — because a Stockholm hotel happened to be imported first.
+ *
+ * That's more corrosive than it looks. The trip is CORRECT — those legs really do
+ * belong together — but the title makes every London booking inside it look
+ * misfiled, and the user reasonably concludes the grouping is broken. A wrong label
+ * on right data destroys trust just as fast as wrong data.
+ *
+ * So: the title follows the anchors, in the order you travelled them.
+ *   one city      → "Stockholm"
+ *   two or three  → "Stockholm → Edinburgh → London"
+ *   more          → "Stockholm → … → Tokyo"
+ *
+ * Holder buckets keep their names. Manually-renamed trips are left alone.
+ */
+async function retitleTripFromLegs(tripId) {
+  try {
+    const [trip] = await sql`SELECT id, title, source FROM trips WHERE id = ${tripId}`;
+    if (!trip) return;
+    if (trip.title === "Needs review" || trip.title === "Reservations") return;
+    if (trip.source === "manual") return;   // the user named it; don't argue
+
+    const legs = await sql`
+      SELECT COALESCE(destination_city, destination) AS city, departs_at
+      FROM trip_legs
+      WHERE trip_id = ${tripId}
+        AND type IN ('flight','hotel','airbnb','train','ferry','cruise')
+        AND COALESCE(destination_city, destination, '') <> ''
+      ORDER BY departs_at ASC NULLS LAST
+    `;
+    if (!legs.length) return;
+
+    // Distinct cities, in travel order, alias-aware (Milano and Milan are one stop).
+    const stops = [];
+    for (const l of legs) {
+      const c = canonicalCity(l.city);
+      if (!c) continue;
+      if (stops.some((s) => sameCity(s.canon, c))) continue;
+      stops.push({ canon: c, label: String(l.city).split(",")[0].trim() });
+    }
+    if (!stops.length) return;
+
+    let title;
+    if (stops.length === 1) title = stops[0].label;
+    else if (stops.length <= 3) title = stops.map((s) => s.label).join(" → ");
+    else title = `${stops[0].label} → … → ${stops[stops.length - 1].label}`;
+
+    if (title && title !== trip.title) {
+      await sql`UPDATE trips SET title = ${title} WHERE id = ${tripId}`;
+      console.log(`[retitle] #${tripId}: "${trip.title}" → "${title}"`);
+    }
+  } catch (e) {
+    console.error("[retitle]", e.message);
+  }
+}
+
+/**
  * Discard end dates that cannot be real, BEFORE they are stored or used to group.
  *
  * MUTATES `parsed` deliberately: every ingest path (Gmail, paste, forwarded mail)
@@ -3162,6 +3060,11 @@ Return this exact JSON structure:
         ${parsed.cabin_class  || null}
       )
     `;
+
+    // The trip may have just become a different journey. A Stockholm trip that
+    // gains an Edinburgh hotel and a London one is no longer "Stockholm" — and
+    // leaving it named that makes every London booking inside it look misfiled.
+    await retitleTripFromLegs(tripId);
 
     const typeLabel = {
       flight: "Flight", hotel: "Hotel", airbnb: "Airbnb", car: "Car rental",
@@ -3536,6 +3439,9 @@ Return this exact JSON structure:
     )
   `;
 
+  // Same as the Gmail path: the trip may have just become a multi-city journey.
+  await retitleTripFromLegs(tripId);
+
   const typeLabel = {
     flight: "Flight", hotel: "Hotel", airbnb: "Airbnb", car: "Car rental",
     train: "Train", ferry: "Ferry", cruise: "Cruise", activity: "Activity",
@@ -3776,7 +3682,6 @@ app.post("/trips", async (req, res) => {
       tripId
     );
     // Award points for adding a trip (idempotent per trip)
-    awardPoints(email, "trip_added", "trip_added_" + tripId).catch(() => {});
     res.json({ ok: true, trip: result[0] });
   } catch (e) {
     console.error("[trips/create]", e.message);
@@ -4239,6 +4144,47 @@ async function unmergeMegaTrips(userEmail, { dryRun = true } = {}) {
     if (!dryRun) {
       await sql`UPDATE trip_legs SET arrives_at = NULL, nights = NULL WHERE id = ${l.id}`;
     }
+  }
+
+  // ── 0. Retitle multi-city trips ──────────────────────────────────────────────
+  // A trip is named after whichever booking landed first. A fortnight of
+  // Stockholm → Edinburgh → London therefore stayed called "Stockholm", which made
+  // every London booking inside it look misfiled — when the trip was correct all
+  // along. A wrong label on right data destroys trust exactly as fast as wrong data.
+  report.tripsRetitled = 0;
+  const titleCandidates = await sql`
+    SELECT DISTINCT t.id, t.title
+    FROM trips t JOIN trip_legs tl ON tl.trip_id = t.id
+    WHERE t.user_email = ${userEmail}
+      AND t.title NOT IN ('Needs review', 'Reservations')
+      AND COALESCE(t.source, '') <> 'manual'
+  `;
+  for (const t of titleCandidates) {
+    const legs = await sql`
+      SELECT COALESCE(destination_city, destination) AS city
+      FROM trip_legs
+      WHERE trip_id = ${t.id}
+        AND type IN ('flight','hotel','airbnb','train','ferry','cruise')
+        AND COALESCE(destination_city, destination, '') <> ''
+      ORDER BY departs_at ASC NULLS LAST
+    `;
+    const stops = [];
+    for (const l of legs) {
+      const c = canonicalCity(l.city);
+      if (!c || stops.some((s) => sameCity(s.canon, c))) continue;
+      stops.push({ canon: c, label: String(l.city).split(",")[0].trim() });
+    }
+    if (!stops.length) continue;
+    const title = stops.length === 1
+      ? stops[0].label
+      : stops.length <= 3
+        ? stops.map((s) => s.label).join(" → ")
+        : `${stops[0].label} → … → ${stops[stops.length - 1].label}`;
+    if (title === t.title) continue;
+
+    report.tripsRetitled++;
+    report.details.push(`retitle #${t.id}: "${t.title}" → "${title}"`);
+    if (!dryRun) await sql`UPDATE trips SET title = ${title} WHERE id = ${t.id}`;
   }
 
   // ── 1a. RECOVERY: put back anything wrongly evicted to "Reservations" ────────
@@ -5650,7 +5596,6 @@ ${tripsSummary}
       .replace(/\n{3,}/g, '\n\n')               // collapse triple newlines
       .trim();
     // Award points for first concierge message (idempotent)
-    awardPoints(email, "concierge_first").catch(() => {});
     res.json({ ok: true, reply, places: placesResults.length > 0 ? placesResults : undefined, weather: liveWeather || undefined, action: bookingAction || undefined, transit: transitRoute || undefined, plan: tripPlan || undefined, write: writeResult || undefined });
   } catch (e) {
     console.error("[concierge]", e.message);
@@ -10188,7 +10133,6 @@ app.post("/email/inbound", async (req, res) => {
     console.log(`[email/inbound] ${fromAddr} → ${tripsAdded} trip(s) created from forwarded email`);
     // Award points for the import
     if (tripsAdded > 0) {
-      awardPoints(userEmail, "gmail_trip_import").catch(() => {});
     }
     res.json({ ok: true, trips_created: tripsAdded });
   } catch (e) {
