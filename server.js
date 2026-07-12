@@ -2668,6 +2668,85 @@ const ANCHOR_TYPES = new Set(["flight", "hotel", "airbnb", "train", "ferry", "cr
 const MAX_STAY_NIGHTS = 30;
 const MAX_TRIP_DAYS   = 30;   // a single trip should not span longer than this
 
+/**
+ * Do two place names refer to the same place?
+ *
+ * Naive string equality does NOT work, and I proved it the hard way: a first cut
+ * of this check "helpfully" evicted a Roma booking from a trip titled Roma, nine
+ * New York bookings from a Brooklyn trip, and every Milano booking from Milan.
+ * All of them were filed correctly. The check was wrong, not the data.
+ *
+ * Three things make two names the same place:
+ *   1. An alias — Milano/Milan, Roma/Rome, München/Munich.
+ *   2. Containment — a borough or district inside its city (Brooklyn ⊂ New York).
+ *   3. One string containing the other — "New York, NY" vs "New York".
+ *
+ * When in doubt, this returns TRUE. A booking left in a slightly-wrong trip is a
+ * cosmetic annoyance; a booking ripped out of the RIGHT trip is data loss the user
+ * has to repair by hand. The asymmetry should always favour leaving things alone.
+ */
+const CITY_ALIASES = [
+  ["milan", "milano"],
+  ["rome", "roma"],
+  ["florence", "firenze"],
+  ["venice", "venezia"],
+  ["naples", "napoli"],
+  ["turin", "torino"],
+  ["munich", "muenchen", "münchen"],
+  ["cologne", "koln", "köln"],
+  ["vienna", "wien"],
+  ["prague", "praha"],
+  ["warsaw", "warszawa"],
+  ["lisbon", "lisboa"],
+  ["seville", "sevilla"],
+  ["copenhagen", "kobenhavn", "københavn"],
+  ["gothenburg", "goteborg", "göteborg"],
+  ["zurich", "zuerich", "zürich"],
+  ["geneva", "geneve", "genève"],
+  ["brussels", "bruxelles", "brussel"],
+  ["antwerp", "antwerpen"],
+  ["the hague", "den haag"],
+  ["moscow", "moskva"],
+  ["athens", "athina"],
+  ["istanbul", "constantinople"],
+  ["cairo", "al qahirah"],
+  ["mumbai", "bombay"],
+  ["kolkata", "calcutta"],
+  ["chennai", "madras"],
+  ["beijing", "peking"],
+  ["guangzhou", "canton"],
+  ["ho chi minh city", "saigon"],
+  ["mexico city", "ciudad de mexico", "cdmx"],
+  ["seoul", "soul"],
+  // Boroughs / districts that ARE the city for travel purposes.
+  ["new york", "nyc", "manhattan", "brooklyn", "queens", "bronx", "staten island"],
+  ["london", "westminster", "camden", "shoreditch", "soho"],
+  ["paris", "montmartre", "le marais"],
+  ["tokyo", "shibuya", "shinjuku", "ginza"],
+];
+
+const CITY_ALIAS_MAP = (() => {
+  const m = new Map();
+  for (const group of CITY_ALIASES) {
+    for (const name of group) m.set(name, group[0]); // canonical = first entry
+  }
+  return m;
+})();
+
+function canonicalCity(s) {
+  const c = String(s || "").toLowerCase().split(",")[0].trim();
+  if (!c) return "";
+  return CITY_ALIAS_MAP.get(c) || c;
+}
+
+function sameCity(a, b) {
+  const ca = canonicalCity(a);
+  const cb = canonicalCity(b);
+  if (!ca || !cb) return true;              // no evidence either way → don't act
+  if (ca === cb) return true;
+  return ca.includes(cb) || cb.includes(ca); // "new york ny" vs "new york"
+}
+
 // True when a leg's own duration is implausible — i.e. the dates are wrong.
 function isImplausibleSpan(startISO, endISO) {
   if (!startISO || !endISO) return false;
@@ -2696,7 +2775,7 @@ async function findTripForLooseBooking(userEmail, whenISO, city) {
   const when = new Date(whenISO).getTime();
   if (Number.isNaN(when)) return null;
   const DAY = 86400000;
-  const cityLc = (city || "").toLowerCase().split(",")[0].trim();
+  const cityLc = canonicalCity(city);
   let fallback = null;
   for (const r of rows) {
     if (!r.has_anchor || !r.s) continue;      // only attach to real trips
@@ -2710,7 +2789,10 @@ async function findTripForLooseBooking(userEmail, whenISO, city) {
 
     if (when < start || when > end) continue;  // date must fall in the trip window
 
-    if (cityLc && r.cities && r.cities.includes(cityLc)) {
+    // Alias-aware, and the trip TITLE counts as evidence alongside the anchor legs'
+    // cities. Raw string matching here is what made "Milano" fail to match "Milan".
+    const places = [r.title, ...String(r.cities || "").split(/\s+/).filter(Boolean)];
+    if (cityLc && places.some((p) => sameCity(cityLc, p))) {
       return { tripId: r.id, title: r.title };  // best: date + city match
     }
 
@@ -4159,32 +4241,69 @@ async function unmergeMegaTrips(userEmail, { dryRun = true } = {}) {
     }
   }
 
+  // ── 1a. RECOVERY: put back anything wrongly evicted to "Reservations" ────────
+  //
+  // An earlier version of the eviction below compared city names as raw strings. It
+  // did not know that Milano is Milan, that Brooklyn is in New York, or that a
+  // booking in Roma inside a trip named "Roma" is obviously fine. It dumped a pile
+  // of correctly-filed bookings into "Reservations".
+  //
+  // This puts them back. It runs FIRST, so a repair run both undoes that damage and
+  // then re-applies the (now alias-aware) check.
+  report.reservationsRehomed = 0;
+  const stranded = await sql`
+    SELECT tl.id, tl.departs_at, tl.property_name,
+           COALESCE(tl.destination_city, tl.destination) AS city
+    FROM trip_legs tl JOIN trips t ON t.id = tl.trip_id
+    WHERE t.user_email = ${userEmail}
+      AND t.title = 'Reservations'
+      AND tl.departs_at IS NOT NULL
+  `;
+  for (const l of stranded) {
+    const home = await findTripForLooseBooking(userEmail, l.departs_at, l.city);
+    if (!home) continue;   // genuinely homeless — leave it in Reservations
+    report.reservationsRehomed++;
+    report.details.push(`"${l.property_name || l.city}" → back into "${home.title}"`);
+    if (!dryRun) {
+      await sql`UPDATE trip_legs SET trip_id = ${home.tripId} WHERE id = ${l.id}`;
+    }
+  }
+
   // ── 1b. Evict bookings filed under a trip to the wrong city ──────────────────
   // The loose-booking matcher used to fall back to a date-only match when no city
   // matched — so a dinner in London landed in a Stockholm trip that happened to
   // overlap the dates. Move those out. If a trip to the RIGHT city exists on those
   // dates, they go there; otherwise to "Reservations", where they can be folded in
   // later. We do not guess a second time.
-  const misfiled = await sql`
-    WITH trip_cities AS (
-      SELECT tl.trip_id,
-             STRING_AGG(DISTINCT LOWER(SPLIT_PART(COALESCE(tl.destination_city, tl.destination, ''), ',', 1)), ' ') AS cities
-      FROM trip_legs tl
-      WHERE tl.type IN ('flight','hotel','airbnb','train','ferry','cruise','car')
-      GROUP BY tl.trip_id
-    )
+  // Pull the CANDIDATES in SQL, then decide in JS — because "is this the same
+  // place?" needs an alias table (Milano = Milan) and containment (Brooklyn ⊂ New
+  // York), and SQL string matching knows neither. A first version of this check did
+  // it in SQL and evicted a Roma booking from a trip called Roma.
+  const looseWithCity = await sql`
     SELECT tl.id, tl.departs_at, tl.property_name,
-           LOWER(SPLIT_PART(COALESCE(tl.destination_city, tl.destination), ',', 1)) AS city,
-           t.id AS trip_id, t.title
+           COALESCE(tl.destination_city, tl.destination) AS city,
+           t.id AS trip_id, t.title,
+           (SELECT STRING_AGG(DISTINCT COALESCE(a.destination_city, a.destination, ''), '|')
+            FROM trip_legs a
+            WHERE a.trip_id = t.id
+              AND a.type IN ('flight','hotel','airbnb','train','ferry','cruise','car')) AS anchor_cities
     FROM trip_legs tl
     JOIN trips t ON t.id = tl.trip_id
-    JOIN trip_cities tc ON tc.trip_id = tl.trip_id
     WHERE t.user_email = ${userEmail}
       AND tl.type NOT IN ('flight','hotel','airbnb','train','ferry','cruise','car')
       AND COALESCE(tl.destination_city, tl.destination, '') <> ''
-      AND tc.cities IS NOT NULL
-      AND POSITION(LOWER(SPLIT_PART(COALESCE(tl.destination_city, tl.destination), ',', 1)) IN tc.cities) = 0
+      AND t.title NOT IN ('Reservations', 'Needs review')
   `;
+
+  const misfiled = looseWithCity.filter((l) => {
+    const anchors = String(l.anchor_cities || "").split("|").filter(Boolean);
+    // The trip TITLE counts as evidence too — a booking in Roma inside a trip named
+    // "Roma" is obviously correctly filed, and the first version missed that entirely.
+    const candidates = [l.title, ...anchors];
+    if (!candidates.length) return false;
+    // Mis-filed only if it matches NOTHING. Any match at all means leave it alone.
+    return !candidates.some((c) => sameCity(l.city, c));
+  });
 
   report.misfiledMoved = 0;
   for (const l of misfiled) {
@@ -4510,27 +4629,34 @@ const INVARIANTS = [
   },
   {
     name: "booking filed under a trip to a different city",
-    why: "A dinner in London sitting inside a Stockholm trip. The grouping fell back to a date-only match and ignored the city — so the trip fills up with things that have nothing to do with it.",
-    query: (email) => sql`
-      WITH trip_cities AS (
-        SELECT tl.trip_id,
-               STRING_AGG(DISTINCT LOWER(SPLIT_PART(COALESCE(tl.destination_city, tl.destination, ''), ',', 1)), ' ') AS cities
+    why: "A dinner in Stockholm sitting inside a Brooklyn trip. The grouping fell back to a date-only match and ignored the city. NOTE: this is alias-aware — Milano IS Milan, Brooklyn IS New York — because a check that evicts correctly-filed bookings is worse than no check.",
+    // Deliberately NOT a pure-SQL string comparison. See sameCity(): the first
+    // version of this invariant did compare strings, and it flagged a Roma booking
+    // inside a trip named Roma as mis-filed.
+    query: async (email) => {
+      const rows = await sql`
+        SELECT tl.id, t.title AS detail,
+               COALESCE(tl.property_name, tl.destination_city, tl.destination) AS booking,
+               COALESCE(tl.destination_city, tl.destination) AS booking_city,
+               (SELECT STRING_AGG(DISTINCT COALESCE(a.destination_city, a.destination, ''), '|')
+                FROM trip_legs a
+                WHERE a.trip_id = t.id
+                  AND a.type IN ('flight','hotel','airbnb','train','ferry','cruise','car')) AS anchor_cities
         FROM trip_legs tl
-        WHERE tl.type IN ('flight','hotel','airbnb','train','ferry','cruise','car')
-        GROUP BY tl.trip_id
-      )
-      SELECT tl.id, t.title AS detail,
-             COALESCE(tl.property_name, tl.destination_city, tl.destination) AS booking,
-             LOWER(SPLIT_PART(COALESCE(tl.destination_city, tl.destination), ',', 1)) AS booking_city
-      FROM trip_legs tl
-      JOIN trips t  ON t.id = tl.trip_id
-      JOIN trip_cities tc ON tc.trip_id = tl.trip_id
-      WHERE t.user_email = ${email}
-        AND tl.type NOT IN ('flight','hotel','airbnb','train','ferry','cruise','car')
-        AND COALESCE(tl.destination_city, tl.destination, '') <> ''
-        AND tc.cities IS NOT NULL
-        AND POSITION(LOWER(SPLIT_PART(COALESCE(tl.destination_city, tl.destination), ',', 1)) IN tc.cities) = 0
-      LIMIT 5`,
+        JOIN trips t ON t.id = tl.trip_id
+        WHERE t.user_email = ${email}
+          AND tl.type NOT IN ('flight','hotel','airbnb','train','ferry','cruise','car')
+          AND COALESCE(tl.destination_city, tl.destination, '') <> ''
+          AND t.title NOT IN ('Reservations', 'Needs review')
+      `;
+      return rows
+        .filter((r) => {
+          const candidates = [r.detail, ...String(r.anchor_cities || "").split("|").filter(Boolean)];
+          return candidates.length > 0 && !candidates.some((c) => sameCity(r.booking_city, c));
+        })
+        .slice(0, 5)
+        .map(({ anchor_cities, ...rest }) => rest);
+    },
   },
   {
     name: "trip named after an airline",
