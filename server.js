@@ -4337,10 +4337,15 @@ async function unmergeMegaTrips(userEmail, { dryRun = true } = {}) {
   // ── 2. Re-cluster over-long trips ────────────────────────────────────────────
   // Re-read spans AFTER the fix above, so a trip that is only long because of a
   // poison leg isn't split unnecessarily.
+  // "Needs review" and "Reservations" are holder buckets, not trips. Splitting them
+  // is meaningless — and worse, the old code "moved" their undated legs INTO
+  // themselves and reported it as work every single run. A repair that can never
+  // say "nothing to do" trains you to skim past the runs where something IS wrong.
   const longTrips = await sql`
     SELECT t.id, t.title
     FROM trips t JOIN trip_legs tl ON tl.trip_id = t.id
     WHERE t.user_email = ${userEmail}
+      AND t.title NOT IN ('Needs review', 'Reservations')
     GROUP BY t.id, t.title
     HAVING MAX(COALESCE(tl.arrives_at, tl.departs_at)) - MIN(tl.departs_at)
            > ${MAX_TRIP_DAYS + " days"}::interval
