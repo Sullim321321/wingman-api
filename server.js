@@ -1573,6 +1573,130 @@ app.get("/loyalty", async (req, res) => {
   }
 });
 
+/**
+ * GET /loyalty/insights — make the connected accounts actually DO something.
+ *
+ * Until now, connecting a frequent-flyer account got you a list of numbers back.
+ * That is a promise the app was quietly breaking.
+ *
+ * WHAT THIS DELIBERATELY DOES NOT DO
+ * ----------------------------------
+ * The roadmap asks for "best card per booking" and "award availability". We hold
+ * no earning rates and no award inventory, so both would mean inventing numbers
+ * and telling someone to put a $4,000 booking on the wrong card. A chief of staff
+ * who guesses confidently is worse than one who says nothing.
+ *
+ * So every insight below is derived STRICTLY from data we actually have, and each
+ * one carries the evidence it was derived from.
+ */
+const POINTS_EXPIRY_WARN_DAYS = 90;
+
+async function loyaltyInsights(email) {
+  const [accounts, upcoming] = await Promise.all([
+    sql`SELECT * FROM loyalty_accounts WHERE user_email = ${email} ORDER BY program ASC`,
+    sql`
+      SELECT tl.id, tl.type, tl.carrier, tl.flight_number, tl.departs_at,
+             tl.destination_city, tl.destination, tl.nights, t.id AS trip_id, t.title
+      FROM trip_legs tl JOIN trips t ON t.id = tl.trip_id
+      WHERE t.user_email = ${email}
+        AND tl.departs_at >= NOW()
+        AND tl.departs_at <= NOW() + INTERVAL '180 days'
+      ORDER BY tl.departs_at ASC
+    `,
+  ]);
+
+  const insights = [];
+  const DAY = 86400000;
+  const now = Date.now();
+
+  for (const a of accounts) {
+    // ── 1. Points about to expire ────────────────────────────────────────────
+    // The single most valuable thing here, and pure fact: the date is in the row.
+    // Points expire quietly and nobody notices until they're gone.
+    if (a.expiration_date && Number(a.points_balance) > 0) {
+      const days = Math.round((new Date(a.expiration_date).getTime() - now) / DAY);
+      if (days > 0 && days <= POINTS_EXPIRY_WARN_DAYS) {
+        insights.push({
+          kind: "points_expiring",
+          urgency: days <= 30 ? "high" : "medium",
+          program: a.program,
+          title: `${Number(a.points_balance).toLocaleString()} ${a.program} points expire in ${days} days`,
+          body: `Any qualifying activity usually resets the clock — a flight, a points purchase, or a dining/shopping partner. Worth ten minutes.`,
+          evidence: { points: Number(a.points_balance), expires: a.expiration_date, days_left: days },
+        });
+      }
+    }
+
+    // ── 2. Status within reach ───────────────────────────────────────────────
+    // points_to_next_level and elite_level_next are both stored. If an upcoming
+    // trip on this carrier would plausibly close the gap, that is worth saying —
+    // but we say what we KNOW (the gap, the trip), not a computed projection we'd
+    // be inventing.
+    if (a.elite_level_next && Number(a.points_to_next_level) > 0) {
+      const carrierLegs = upcoming.filter(
+        (l) => l.carrier && a.program &&
+               a.program.toLowerCase().includes(String(l.carrier).toLowerCase().split(" ")[0]),
+      );
+      insights.push({
+        kind: "status_gap",
+        urgency: carrierLegs.length ? "medium" : "low",
+        program: a.program,
+        title: `${Number(a.points_to_next_level).toLocaleString()} points from ${a.elite_level_next}`,
+        body: carrierLegs.length
+          ? `You have ${carrierLegs.length} upcoming ${a.program} booking${carrierLegs.length > 1 ? "s" : ""} — make sure your number is on ${carrierLegs.length > 1 ? "them" : "it"}, or the credit won't land.`
+          : `No upcoming bookings on ${a.program}. If a status run matters to you, this is the gap to close.`,
+        evidence: {
+          points_to_next: Number(a.points_to_next_level),
+          next_level: a.elite_level_next,
+          current: a.elite_status || null,
+          upcoming_legs: carrierLegs.map((l) => ({ trip_id: l.trip_id, leg_id: l.id, departs_at: l.departs_at })),
+        },
+      });
+    }
+  }
+
+  // ── 3. Upcoming bookings on a carrier you HAVE an account with ─────────────
+  // The most concrete, most actionable, and most commonly missed: you're flying an
+  // airline you have status with, and the booking may not carry your number. We
+  // can't see whether the number is attached (we don't store it per-leg), so we
+  // ASK rather than assert.
+  const programNames = accounts.map((a) => String(a.program || "").toLowerCase());
+  const matchable = upcoming.filter((l) => {
+    if (!l.carrier) return false;
+    const c = String(l.carrier).toLowerCase();
+    return programNames.some((p) => p && (p.includes(c.split(" ")[0]) || c.includes(p.split(" ")[0])));
+  });
+  for (const l of matchable.slice(0, 5)) {
+    insights.push({
+      kind: "attach_number",
+      urgency: "low",
+      program: l.carrier,
+      title: `${l.carrier}${l.flight_number ? " " + l.flight_number : ""} on ${new Date(l.departs_at).toLocaleDateString("en-US", { month: "short", day: "numeric" })}`,
+      body: `You have a ${l.carrier} account. Check your number is on this booking — credit doesn't apply retroactively without a claim.`,
+      evidence: { trip_id: l.trip_id, leg_id: l.id, departs_at: l.departs_at },
+    });
+  }
+
+  const order = { high: 0, medium: 1, low: 2 };
+  insights.sort((a, b) => order[a.urgency] - order[b.urgency]);
+
+  return {
+    insights,
+    accounts_connected: accounts.length,
+    // Said plainly, so the UI never has to pretend it knows more than it does.
+    not_covered: "Earning rates and award availability aren't something we hold, so we don't guess at them.",
+  };
+}
+
+app.get("/loyalty/insights", auth, async (req, res) => {
+  try {
+    res.json(await loyaltyInsights(req.user.email));
+  } catch (e) {
+    console.error("[loyalty/insights]", e.message);
+    res.status(500).json({ error: "could not load loyalty insights" });
+  }
+});
+
 // POST /loyalty/connect — connect a loyalty account (manual entry: member number + status tier)
 app.post("/loyalty/connect", async (req, res) => {
   const email = await verifyAccessToken(req);

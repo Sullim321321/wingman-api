@@ -87,6 +87,7 @@ const STATIC_GETS = [
   "/profile/passenger",
   "/subscription/plans",
   "/loyalty",
+  "/loyalty/insights",       // new: expiring points, status gaps, missing numbers
   "/points",
   "/me/travel-profile",       // NOT /travel-profile — that route doesn't exist
 
