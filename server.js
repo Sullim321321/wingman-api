@@ -4223,13 +4223,43 @@ async function unmergeMegaTrips(userEmail, { dryRun = true } = {}) {
     const merged = new Map();
     clusters.forEach((c, i) => {
       const root = find(i);
-      if (!merged.has(root)) merged.set(root, { legs: [], end: 0 });
-      const m = merged.get(root);
-      m.legs.push(...c.legs);
-      m.end = Math.max(m.end, c.end);
+      if (!merged.has(root)) merged.set(root, []);
+      merged.get(root).push(i);   // keep the CONSTITUENT date-clusters, not just their legs
     });
+
+    // ── Enforce the constraint on the RESULT, not on each hop ─────────────────
+    //
+    // Union-find is transitive, and that quietly defeats a per-confirmation guard:
+    // conf A joins clusters 1→2 (3 days apart, fine), conf B joins 2→3 (fine),
+    // C joins 3→4... every individual union passes a 30-day check, but the CHAIN
+    // drags fifteen legs across 687 days into one cluster. unmergeMegaTrips then
+    // sees a single cluster, concludes there's nothing to split, and skips the trip.
+    // That's how "London — 687 days, 15 legs" survived three repair runs.
+    //
+    // So: after unioning, look at what we actually built. If a merged group spans
+    // longer than a plausible journey, the confirmations that built it were
+    // collisions. Throw the union away for that group and keep the date clusters,
+    // which are the thing we can actually trust.
     const beforeUnion = clusters.length;
-    clusters = [...merged.values()].sort(
+    const rebuilt = [];
+    for (const idxs of merged.values()) {
+      const legs = idxs.flatMap((i) => clusters[i].legs);
+      const starts = legs.map((l) => new Date(l.departs_at).getTime());
+      const ends   = legs.map((l) => new Date(l.arrives_at || l.departs_at).getTime());
+      const span   = Math.max(...ends) - Math.min(...starts);
+
+      if (idxs.length > 1 && span > MAX_TRIP_DAYS * DAY) {
+        report.details.push(
+          `  (rejected a ${Math.round(span / DAY)}-day merge — confirmations chained across ` +
+          `unrelated trips; keeping the ${idxs.length} date clusters)`,
+        );
+        for (const i of idxs) rebuilt.push(clusters[i]);   // undo the union
+        continue;
+      }
+      rebuilt.push({ legs, end: Math.max(...ends) });
+    }
+
+    clusters = rebuilt.sort(
       (a, b) => new Date(a.legs[0].departs_at) - new Date(b.legs[0].departs_at),
     );
     if (clusters.length !== beforeUnion) {
