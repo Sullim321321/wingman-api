@@ -207,7 +207,9 @@ async function research(turn, history = []) {
         `the rule applies from/until. If nothing here needs checking, reply "nothing to check".`,
     }],
   });
-  const text = res.content.filter((b) => b.type === "text").map((b) => b.text).join("\n").trim();
+  // join(""), not join("\n") — see converse(). Search splits prose around citations,
+  // and a newline between the halves lands inside a sentence.
+  const text = res.content.filter((b) => b.type === "text").map((b) => b.text).join("").trim();
   // Cap the findings. The full research transcript ran to thousands of tokens and was
   // then re-sent into readTurn — 449k input tokens across a 25-turn run, $1.68 for one
   // eval. The constraint we want out of it is two sentences and a URL; the rest is the
@@ -598,7 +600,18 @@ async function converse({ message, known = [], history = [], findings = null }) 
     ],
   });
 
-  let reply = res.content.filter((b) => b.type === "text").map((b) => b.text).join("\n").trim();
+  // ── Join text blocks with NOTHING, not a newline ───────────────────────────
+  // With web_search on, the model's prose comes back split into several text blocks —
+  // the split points fall around citations, i.e. mid-sentence. Joining them with "\n"
+  // inserted a line break inside sentences, which is why the reply read:
+  //
+  //     ...and Seoul (Oct 3)
+  //     .
+  //     Beijing is actually the first stop on September 20
+  //     , not the 26th.
+  //
+  // The model wrote perfectly good prose. We chopped it up on the way out.
+  let reply = res.content.filter((b) => b.type === "text").map((b) => b.text).join("").trim();
   const use = res.content.find((b) => b.type === "tool_use" && b.name === "record");
   const out = use?.input || {};
 

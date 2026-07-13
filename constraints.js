@@ -241,8 +241,25 @@ async function addConstraint(sql, {
   // truthfully, as PROPOSED: it says what it thinks, it gates nothing, and it waits
   // for a human. That is what a chief of staff does — "I think you need a visa;
   // confirm?" — rather than either inventing a rule or pretending it doesn't matter.
+  // ── Only YOU can make something non-negotiable ─────────────────────────────
+  // An inferred 'must' waits for your word. A RESEARCHED one used to sail straight
+  // through as active — and that is worse, because "sourced" reads like "verified."
+  //
+  // The planner looked up the LANY Asia tour and recorded six shows as MUST · sourced.
+  // Four dates were right. It invented Beijing and Guangzhou, and dropped Osaka and
+  // Tokyo. Every one of them anchored the trip.
+  //
+  // Two failures stacked. The model can find a real page and still summarise it wrong.
+  // But the deeper one is categorical: a tour SCHEDULE is not the same fact as which
+  // shows YOU are attending. No amount of searching can establish the second. Wingman
+  // can bring you the candidates; only you can say which ones are yours.
+  //
+  // So: a 'must' may only be ACTIVE if you stated it. Everything else is proposed —
+  // visible, at its true weight, gating nothing until confirmed.
   let status = "active";
-  if (source === "inferred" && hardness === "must") status = "proposed";
+  if (hardness === "must" && source !== "stated" && source !== "observed") {
+    status = "proposed";
+  }
 
   const ceiling = MAX_CONFIDENCE[source];
   const conf = Math.min(confidence == null ? ceiling : confidence, ceiling);

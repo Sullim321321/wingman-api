@@ -99,6 +99,22 @@ async function is(what, actual, expected) {
   await is("an inferred visa keeps its 'must' — no laundering", visa.hardness, "must");
   await is("...and is held as 'proposed' until you confirm it", visa.status, "proposed");
 
+  // A RESEARCHED must is not ground truth either, and "sourced" reads like "verified".
+  // The planner looked up the LANY Asia tour, got four dates right, invented Beijing
+  // and Guangzhou, dropped Osaka and Tokyo — and filed all six as MUST, active,
+  // anchoring the trip. Worse than the inference case, because the badge invited trust.
+  //
+  // And the deeper point is categorical: a tour SCHEDULE is not the fact "which shows
+  // am I attending". No search can establish the second. Only she can.
+  const researched = await graph.addConstraint(grab, {
+    user_email: "t@t.com", kind: "timing",
+    predicate: { op: "arrive_before", place: "Beijing", at: "2026-09-20T19:00:00Z" },
+    rationale: "LANY concert in Beijing on September 20",
+    hardness: "must", source: "researched",
+    evidence: { url: "https://example.com/tour", retrieved_at: "2026-07-13" },
+  });
+  await is("a RESEARCHED must also waits for your word", researched.status, "proposed");
+
   const told = await graph.addConstraint(grab, {
     user_email: "t@t.com", kind: "party",
     predicate: { op: "rooms", value: 2 }, rationale: "Two rooms",
