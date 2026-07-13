@@ -13391,19 +13391,12 @@ app.post("/plan/message", conciergeLimiter, async (req, res) => {
 
     const known = await graph.constraintsFor(sql, { user_email: email, trip_id });
 
-    // Look it up rather than recall it. Entry rules and alliance cutoffs go stale,
-    // and a wrong one leaves someone at a border.
-    let findings = null;
-    if (planner.NEEDS_LOOKUP.test(message)) {
-      try {
-        const r = await planner.research(message, history.map((h) => h.content));
-        if (r.text && !/^nothing to check/i.test(r.text)) findings = r.text;
-      } catch (e) {
-        console.warn("[plan] research failed:", e.message);   // degrade, never block
-      }
-    }
-
-    const out = await planner.converse({ message, known, history, findings });
+    // The regex prefilter is GONE. converse() now carries web_search itself, so the
+    // model looks things up when IT judges they need looking up — not when a pattern
+    // I wrote in advance happens to match. The regex missed "LANY Sept 26 to Oct 17",
+    // no search ran, and the model announced it had the tour dates anyway. A filter
+    // that decides what needs checking can only ever check what its author imagined.
+    const out = await planner.converse({ message, known, history });
     const wrote = await planner.commit(sql, {
       user_email: email, trip_id, proposals: out, known,
     });

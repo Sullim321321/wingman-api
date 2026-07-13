@@ -547,7 +547,14 @@ ASK BEFORE YOU BUILD. If you don't yet know something you genuinely need, ask fo
 
 NEVER pad. No "Great question!". No summarising back what they just said. No numbered lists of options nobody asked for. If the honest answer is one sentence, write one sentence.
 
-Never invent a fact. If you don't know whether a hotel has a cold plunge or whether a passport needs a visa, say you'll check — don't guess and don't quietly downgrade its importance.`;
+LOOK IT UP — DON'T CLAIM YOU DID.
+You have web_search. Use it whenever the answer turns on a fact about the world you cannot verify from memory: tour dates, entry requirements, alliance cutoffs, what a specific hotel actually has, whether a route exists.
+
+NEVER say "let me check" and then answer from memory. NEVER say "I have the dates" unless you searched and actually have them. If you searched, give the ANSWER — the cities, the dates, the specifics — not a status update. If you couldn't find it, say so plainly and ask them for it.
+
+A status update is not an answer. "Let me check the exact dates" followed by "Yes, I have the dates" — with no dates — is the single most damaging thing you can do here, because it teaches them to trust you when you haven't earned it.
+
+ALWAYS REPLY IN TEXT. Even when you record constraints, say something. A tool call with no words is a silent turn, and a silent turn reads as a broken app.`;
 
 async function converse({ message, known = [], history = [], findings = null }) {
   const gaps = coverage(known);
@@ -557,9 +564,22 @@ async function converse({ message, known = [], history = [], findings = null }) 
 
   const res = await anthropic.messages.create({
     model: MODEL,
-    max_tokens: 1600,
+    max_tokens: 2000,
     system: [{ type: "text", text: CONVERSE_SYSTEM + "\n\n" + SYSTEM, cache_control: { type: "ephemeral" } }],
-    tools: TOOLS,
+    // ── Give it a real way to look things up ───────────────────────────────────
+    // Research used to be gated by a REGEX I wrote in advance — NEEDS_LOOKUP. Which
+    // means it could only check the things I had thought of. Ask it about a band's
+    // tour dates and the regex misses, no search runs, and the model — having said
+    // "let me check the exact dates" — comes back with "Yes, I have the LANY Asia
+    // dates." It never checked. It couldn't. So it just said it had.
+    //
+    // That is not the model misbehaving. That is me building a system where claiming
+    // to have checked was the only available move. A prefilter cannot know what needs
+    // checking; only the thing doing the reasoning can. So it gets the tool.
+    tools: [
+      { type: "web_search_20250305", name: "web_search", max_uses: 3 },
+      ...TOOLS,
+    ],
     // auto, NOT forced: a turn can be pure conversation ("what does recovery-grade
     // mean?") and recording nothing is the correct answer to it.
     tool_choice: { type: "auto" },
@@ -578,14 +598,36 @@ async function converse({ message, known = [], history = [], findings = null }) 
     ],
   });
 
-  const reply = res.content.filter((b) => b.type === "text").map((b) => b.text).join("\n").trim();
-  const use = res.content.find((b) => b.type === "tool_use");
+  let reply = res.content.filter((b) => b.type === "text").map((b) => b.text).join("\n").trim();
+  const use = res.content.find((b) => b.type === "tool_use" && b.name === "record");
   const out = use?.input || {};
+
+  const constraints = asArray(out.constraints).map(normalize);
+
+  // ── A silent turn must never reach the screen ──────────────────────────────
+  // The model can legitimately return a tool call with no text — it happened, and the
+  // app rendered an empty WINGMAN bubble. To the user that is not "the model chose
+  // brevity", it is a broken app: they said something and the assistant stared back.
+  //
+  // If it recorded but didn't speak, say what it heard. Never render silence.
+  if (!reply) {
+    if (constraints.length) {
+      const said = constraints.map((c) => c.rationale).filter(Boolean).slice(0, 3);
+      reply = said.length
+        ? `Noted — ${said.join("; ").replace(/\.$/, "")}.` +
+          (gaps.length ? ` Still need to know ${gaps.slice(0, 2).join(" and ")}.` : "")
+        : "Noted.";
+    } else {
+      reply = gaps.length
+        ? `Tell me ${gaps.slice(0, 2).join(" and ")} and I can start putting this together.`
+        : "Tell me a little more.";
+    }
+  }
 
   return {
     reply,
     intents: asArray(out.intents),
-    constraints: asArray(out.constraints).map(normalize),
+    constraints,
     shape: asArray(out.shape).map(stripShape),
     gaps,
     usage: res.usage,
