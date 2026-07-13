@@ -5144,7 +5144,7 @@ If nothing new was learned, return {}. Do not repeat things already in the exist
 app.post("/concierge", conciergeLimiter, async (req, res) => {
   const email = await verifyAccessToken(req);
   if (!email) return res.status(401).json({ error: "unauthorized" });
-  const { message: rawMessage, history, location } = req.body || {};
+  const { message: rawMessage, history, location, now, timezone, localTime } = req.body || {};
   if (!rawMessage) return res.status(400).json({ error: "message required" });
   // Scrub PII from user message before it reaches Anthropic
   const message = scrubPII(rawMessage);
@@ -5170,11 +5170,48 @@ app.post("/concierge", conciergeLimiter, async (req, res) => {
     const revealedPrefs = userRows[0]?.revealed_preferences || {};
     const firstName = userRows[0]?.first_name || null;
     const userMemory = memoryRows[0]?.memory || {};
-    const today = new Date().toISOString();
-    const locationContext = location?.city
-      ? `User's current location: ${location.city}${location.country ? ', ' + location.country : ''}${location.lat ? ` (${location.lat.toFixed(3)}, ${location.lon?.toFixed(3) || location.lng?.toFixed(3)})` : ''}`
+    // ── The clock ──────────────────────────────────────────────────────────────
+    // This used to be `new Date().toISOString()` — the SERVER's clock, and Render runs
+    // in UTC. At 6:30am Pacific the model was told 13:30, concluded it was afternoon,
+    // and recommended somewhere for dinner. Not a hallucination: it was misinformed,
+    // confidently, by us.
+    //
+    // The device is the only thing in this system that knows what time it is where the
+    // user is standing. Trust it; fall back to UTC only if it says nothing, and SAY
+    // that we're falling back rather than quietly pretending.
+    const nowISO = now || new Date().toISOString();
+    const tz     = timezone || null;
+    const local  = localTime
+      || (tz ? new Date(nowISO).toLocaleString("en-US", { timeZone: tz, weekday: "long", hour: "numeric", minute: "2-digit", hour12: true }) : null);
+
+    const hour = (() => {
+      try {
+        return parseInt(new Date(nowISO).toLocaleString("en-US", { timeZone: tz || "UTC", hour: "2-digit", hour12: false }), 10);
+      } catch { return null; }
+    })();
+    const partOfDay = hour == null ? null
+      : hour < 5  ? "the middle of the night"
+      : hour < 11 ? "morning"
+      : hour < 14 ? "midday"
+      : hour < 17 ? "afternoon"
+      : hour < 21 ? "evening"
+      : "night";
+
+    const today = local
+      ? `${local}${tz ? ` (${tz})` : ""} — it is ${partOfDay} where the user is. Do not suggest a meal that does not fit this hour.`
+      : `${nowISO} (UTC — the device did not report its local time, so you do NOT reliably know the user's hour. Ask, rather than assuming.)`;
+
+    // ── Where they actually are ────────────────────────────────────────────────
+    // We were sending bare coordinates and letting the model infer the neighbourhood.
+    // It infers by guessing. "48.8584, 2.2945" is not something a person can act on.
+    // The device now reverse-geocodes before sending, so we lead with the place — and
+    // when we only have numbers, we say plainly that we don't know the area.
+    const place = [location?.street, location?.district, location?.city, location?.region, location?.country]
+      .filter(Boolean).filter((v, i, a) => a.indexOf(v) === i);
+    const locationContext = place.length
+      ? `User is at: ${place.join(", ")}${location?.lat ? ` (${location.lat.toFixed(4)}, ${(location.lon || location.lng || 0).toFixed(4)})` : ""}. Recommendations must be genuinely near HERE — walking distance unless they ask otherwise.`
       : location?.lat
-      ? `User's current coordinates: ${location.lat.toFixed(4)}, ${(location.lon || location.lng || 0).toFixed(4)}`
+      ? `User's coordinates: ${location.lat.toFixed(4)}, ${(location.lon || location.lng || 0).toFixed(4)}. You do NOT know the neighbourhood — do not guess at one, and do not name streets or areas you cannot verify.`
       : null;
     // Detect planning intent — used to switch to planning mode (more tokens, targeted Perplexity queries)
     const isPlanningMode = /\b(plan|planning|itinerary|trip to|travel to|tour|cities|nights?|days?|schedule|route)\b/i.test(message) && message.length > 30;
@@ -13062,6 +13099,115 @@ app.get("/situation/:legId", auth, async (req, res) => {
     });
   } catch (e) {
     console.error("[situation]", e.message);
+    res.status(500).json({ error: e.message });
+  }
+});
+
+// GET /brief — "nothing needs you," as a fact rather than a sentiment.
+//
+// The Brief's whole claim is that it can tell you, in one line, whether you are needed.
+// Every travel app says something like that on its home screen. Almost none of them
+// have computed it — it's a greeting with a timestamp.
+//
+// Here it is a query. You are needed if, and only if:
+//
+//   · something downstream is BROKEN or TIGHT (a real cascade walk, measured slack), or
+//   · a 'must' constraint is unresolved — Wingman is about to act on a trip while
+//     genuinely unsure of something you told it was non-negotiable, or
+//   · a PROPOSED constraint is waiting on your word (the China visa), or
+//   · a decision is pending.
+//
+// If none of those hold, Wingman says nothing needs you — and that sentence is true,
+// which is the entire difference between a chief of staff and a dashboard.
+app.get("/brief", auth, async (req, res) => {
+  const email = req.email;
+  try {
+    const trips = await sql`
+      SELECT DISTINCT t.id, t.title
+      FROM trips t JOIN trip_legs tl ON tl.trip_id = t.id
+      WHERE t.user_email = ${email}
+        AND tl.state = 'booked'
+        AND tl.departs_at > NOW()
+        AND COALESCE(t.archived, false) = false`;
+
+    const needs = [];
+
+    // 1. Anything downstream actually in trouble, on any upcoming trip.
+    for (const t of trips) {
+      const legs = await sql`
+        SELECT id, carrier, flight_number FROM trip_legs
+        WHERE trip_id = ${t.id} AND type = 'flight' AND departs_at > NOW()`;
+      for (const leg of legs) {
+        const nodes = await graph.cascadeFrom(sql, leg.id, { delayMinutes: 0 });
+        for (const n of nodes) {
+          // At zero delay, only a genuinely tight connection or an unknown edge is
+          // worth surfacing. "Holds" is not news.
+          if (n.verdict === "broken" || n.verdict === "at_risk") {
+            needs.push({ kind: "cascade", trip_id: t.id, leg_id: leg.id,
+              what: n.label, why: n.why, severity: n.verdict === "broken" ? "high" : "medium" });
+          }
+        }
+      }
+    }
+
+    // 2. Inferences waiting on your word. The visa Wingman thinks you need.
+    const proposed = await sql`
+      SELECT id, rationale, hardness, trip_id FROM constraints
+      WHERE user_email = ${email} AND status = 'proposed' AND superseded_by IS NULL`;
+    for (const p of proposed) {
+      needs.push({ kind: "confirm", constraint_id: p.id, trip_id: p.trip_id,
+        what: p.rationale, why: "I worked this out rather than being told. It doesn't count until you say so.",
+        severity: p.hardness === "must" ? "high" : "low" });
+    }
+
+    // 3. Decisions already surfaced and still pending.
+    const decisions = await sql`
+      SELECT id, headline FROM decisions
+      WHERE user_email = ${email} AND status = 'pending'
+        AND (expires_at IS NULL OR expires_at > NOW())`;
+    for (const d of decisions) {
+      needs.push({ kind: "decision", decision_id: d.id, what: d.headline,
+        why: "Waiting on you.", severity: "high" });
+    }
+
+    // The next thing that actually happens, across every trip.
+    const [next] = await sql`
+      SELECT tl.id, tl.type, tl.carrier, tl.flight_number, tl.origin, tl.destination,
+             tl.property_name, tl.departs_at, t.id AS trip_id, t.title AS trip_title
+      FROM trip_legs tl JOIN trips t ON t.id = tl.trip_id
+      WHERE t.user_email = ${email} AND tl.state = 'booked' AND tl.departs_at > NOW()
+      ORDER BY tl.departs_at ASC
+      LIMIT 1`;
+
+    const watching = await sql`
+      SELECT t.id, t.title, COUNT(tl.id)::int AS legs,
+             MIN(tl.departs_at) AS starts
+      FROM trips t JOIN trip_legs tl ON tl.trip_id = t.id
+      WHERE t.user_email = ${email} AND tl.state = 'booked' AND tl.departs_at > NOW()
+        AND COALESCE(t.archived, false) = false
+      GROUP BY t.id, t.title
+      ORDER BY MIN(tl.departs_at) ASC
+      LIMIT 5`;
+
+    const high = needs.filter((n) => n.severity === "high").length;
+
+    res.json({
+      // The one line. Earned, not asserted.
+      headline: needs.length === 0
+        ? (trips.length ? "Nothing needs you." : "Nothing on the horizon.")
+        : high
+          ? `${high} ${high === 1 ? "thing needs" : "things need"} you.`
+          : `${needs.length} ${needs.length === 1 ? "thing" : "things"} worth a look.`,
+      needs_you: needs.length > 0,
+      needs,
+      next: next || null,
+      watching,
+      // Deliberately explicit: an empty forward book is NOT the same as "all clear".
+      // 0 out of 0 is 100%, and it means nothing. We have shipped that lie before.
+      has_upcoming: trips.length > 0,
+    });
+  } catch (e) {
+    console.error("[brief]", e.message);
     res.status(500).json({ error: e.message });
   }
 });
