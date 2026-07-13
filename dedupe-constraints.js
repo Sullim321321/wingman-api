@@ -34,7 +34,16 @@ const c = { d:"\x1b[2m", g:"\x1b[32m", y:"\x1b[33m", r:"\x1b[31m", b:"\x1b[1m", 
     WHERE user_email = ${email} AND superseded_by IS NULL
     ORDER BY created_at ASC, id ASC`;
 
-  const key = (r) => JSON.stringify([r.trip_id, r.kind, r.predicate, r.scope || null]);
+  // ── The key deliberately OMITS trip_id ─────────────────────────────────────
+  // The first version keyed on it, and so it could not see the very duplicate the
+  // Plan tab was showing: a standing constraint ("Dietary: vegetarian, vegan",
+  // trip_id NULL) sitting beside a trip-scoped copy of the identical fact. Different
+  // trip_id, different key, "0 duplicated" — a clean bill of health from a check
+  // structurally incapable of detecting the disease.
+  //
+  // A standing constraint ALREADY applies to every trip. A trip-scoped copy of it is
+  // the same belief, held twice, and scoreOption() will weigh it twice.
+  const key = (r) => JSON.stringify([r.kind, r.predicate, r.scope || null]);
   const groups = {};
   for (const r of rows) (groups[key(r)] ||= []).push(r);
 
@@ -52,9 +61,11 @@ const c = { d:"\x1b[2m", g:"\x1b[32m", y:"\x1b[33m", r:"\x1b[31m", b:"\x1b[1m", 
 
   let removed = 0;
   for (const g of dupes) {
-    // Keep the best-evidenced copy, not merely the oldest: a row carrying a source URL
-    // or an expiry knows strictly more than one that doesn't.
-    const score = (r) => (r.evidence?.url ? 2 : 0) + (r.expires_at ? 1 : 0);
+    // Keep the STANDING copy where one exists — it applies to every trip, so it is
+    // strictly the more useful row. Then prefer the best-evidenced: a constraint
+    // carrying a source URL or an expiry knows strictly more than one that doesn't.
+    const score = (r) =>
+      (r.trip_id === null ? 4 : 0) + (r.evidence?.url ? 2 : 0) + (r.expires_at ? 1 : 0);
     const keeper = g.slice().sort((a, b) => score(b) - score(a) || a.id - b.id)[0];
     const losers = g.filter((r) => r.id !== keeper.id);
 

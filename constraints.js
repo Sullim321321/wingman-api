@@ -259,15 +259,27 @@ async function addConstraint(sql, {
   //
   // Dedupe belongs HERE, at the only door into the table, not in each caller. Callers
   // forget. The door cannot.
+  // Match a constraint on THIS trip — or a STANDING one (trip_id NULL) that already
+  // says the same thing.
+  //
+  // The first version keyed on trip_id, which meant a trip-scoped copy of a standing
+  // fact was, by definition, not a duplicate. "Dietary: vegetarian, vegan" would sit
+  // in the list twice — once as always-true-of-you, once as true-of-this-trip — and
+  // the dedupe script would report zero duplicates, because its key couldn't see the
+  // pair. A clean bill of health from a check that cannot detect the disease.
+  //
+  // A standing constraint already applies to every trip. Re-recording it against one
+  // of them adds nothing and double-counts in scoreOption().
   const [existing] = await sql`
     SELECT * FROM constraints
     WHERE user_email = ${user_email}
-      AND trip_id IS NOT DISTINCT FROM ${trip_id}
+      AND (trip_id IS NOT DISTINCT FROM ${trip_id} OR trip_id IS NULL)
       AND kind = ${kind}
       AND predicate @> ${JSON.stringify(predicate)}::jsonb
       AND ${JSON.stringify(predicate)}::jsonb @> predicate
       AND scope IS NOT DISTINCT FROM ${scope}
       AND superseded_by IS NULL
+    ORDER BY (trip_id IS NULL) DESC
     LIMIT 1`;
 
   if (existing) {
