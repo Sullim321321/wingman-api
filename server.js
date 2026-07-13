@@ -13065,6 +13065,42 @@ app.get("/situation/:legId", auth, async (req, res) => {
   }
 });
 
+// POST /admin/simulate-delay — fire a delay at one of YOUR OWN legs.
+//
+// Runs the real triggerCascadeCheck: the real graph walk, the real push, the real
+// activity rows. Nothing is mocked, because a test that reimplements the thing it
+// tests only proves you can write the same bug twice.
+//
+// Scoped to the caller's own trips. You cannot delay somebody else's flight.
+app.post("/admin/simulate-delay", auth, async (req, res) => {
+  const email = req.email;
+  try {
+    const legId   = parseInt(req.body?.legId, 10);
+    const minutes = parseInt(req.body?.minutes ?? 75, 10);
+    if (!legId) return res.status(400).json({ error: "legId required" });
+
+    const [leg] = await sql`
+      SELECT tl.*, t.user_email
+      FROM trip_legs tl JOIN trips t ON t.id = tl.trip_id
+      WHERE tl.id = ${legId} AND t.user_email = ${email}`;
+    if (!leg) return res.status(404).json({ error: "not_found" });
+
+    await triggerCascadeCheck({ ...leg, user_email: email }, "delayed", minutes);
+
+    const nodes = await graph.cascadeFrom(sql, legId, { delayMinutes: minutes });
+    res.json({
+      ok: true, legId, minutes,
+      nodes: nodes.map((n) => ({
+        label: n.label, verdict: n.verdict, why: n.why, slack_minutes: n.slack_minutes,
+      })),
+      note: "Push sent. Open the notification — it should land you in Situation.",
+    });
+  } catch (e) {
+    console.error("[simulate-delay]", e.message);
+    res.status(500).json({ error: e.message });
+  }
+});
+
 // GET /situation/:legId/options — the rescue, ranked by what it protects.
 //
 // The existing auto-rebook asks Duffel for offers with sort:"total_amount" and takes
