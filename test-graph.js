@@ -173,6 +173,22 @@ async function is(what, actual, expected) {
   const by = Object.fromEntries(out.map((o) => [o.label, o.verdict]));
 
   await is("confident edge + 75min delay vs 40min slack → broken", by["Seaplane transfer"], "broken");
+
+  // ── "at risk" has to MEAN something ─────────────────────────────────────────
+  // The seeded trip exposed this: a 30-minute delay against a hotel with 180 minutes
+  // of buffer came back "AT RISK — 150 min of slack left", and Wingman would push
+  // about it. That is not a risk, it is a non-event. An assistant that cries wolf
+  // whenever a flight slips gets muted — and then it is muted on the day it matters.
+  const roomy = [{
+    from_commitment: 1, to_commitment: 5, kind: "requires_by", slack_minutes: 180,
+    source: "observed", confidence: 0.95, leg_id: 5, property_name: "Palace Hotel",
+    departs_at: "2026-08-14T18:00:00Z",
+  }];
+  let served2 = false;
+  const stub2 = () => { if (served2) return []; served2 = true; return roomy; };
+  const calm = await graph.cascadeFrom(stub2, 1, { delayMinutes: 30 });
+  await is("30min delay vs 180min slack → NOT at risk", calm[0].verdict, "safe");
+  console.log(`      ${d}"${calm[0].why}" — and Wingman stays quiet.${x}`);
   await is("INFERRED edge refuses to assert an impact → unknown", by["Aman Villas"], "unknown");
   await is("no departure time → unknown, never a guess", by["Kikunoi"], "unknown");
 

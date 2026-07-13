@@ -492,10 +492,31 @@ async function cascadeFrom(sql, commitment_id, { delayMinutes = 0, maxDepth = 6 
           ? "I don't have a departure time for this — I can't say whether the delay reaches it."
           : "I inferred this link rather than confirming it. I won't claim an impact I haven't checked.";
       } else if (e.kind === "requires_by" && e.slack_minutes != null) {
-        verdict = delayMinutes > e.slack_minutes ? "broken" : "at_risk";
-        why = verdict === "broken"
-          ? `Needs ${e.slack_minutes} min of slack. The delay is ${delayMinutes}.`
-          : `${e.slack_minutes - delayMinutes} min of slack left.`;
+        // ── "at risk" must MEAN something ────────────────────────────────────
+        // The first version had two states: broken, or at_risk. So a 30-minute delay
+        // against a hotel with 180 minutes of buffer came back "AT RISK — 150 min of
+        // slack left," and Wingman would push about it.
+        //
+        // That is not a risk. That is fine. And an assistant that cries wolf every
+        // time a flight slips half an hour gets muted — and then it is muted on the
+        // day it actually matters. The old cascade shouted about everything
+        // downstream; shouting only about everything downstream that hasn't broken
+        // YET is the same disease with better manners.
+        //
+        // So there is a third state. Something is only at risk when the buffer it has
+        // left is genuinely thin: under 30 minutes, or less than a third of what it
+        // started with. Otherwise it holds, and we say so quietly.
+        const left = e.slack_minutes - delayMinutes;
+        if (left < 0) {
+          verdict = "broken";
+          why = `Needs ${e.slack_minutes} min of slack. The delay is ${delayMinutes}.`;
+        } else if (left < 30 || left < e.slack_minutes / 3) {
+          verdict = "at_risk";
+          why = `${left} min of slack left. Tight.`;
+        } else {
+          verdict = "safe";
+          why = `${left} min of slack left. It holds.`;
+        }
       } else {
         verdict = "at_risk";
         why = "Same-day dependency — worth watching, not yet broken.";

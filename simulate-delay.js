@@ -39,6 +39,7 @@ const say = (s = "") => console.log(s);
 const MARK = {
   broken:  `${c.r}✗ BROKEN ${c.x}`,
   at_risk: `${c.y}~ AT RISK${c.x}`,
+  safe:    `${c.g}✓ HOLDS  ${c.x}`,   // has slack to spare. Wingman does NOT push about these.
   unknown: `${c.d}? UNKNOWN${c.x}`,
 };
 
@@ -77,10 +78,14 @@ const MARK = {
 
   const broken  = nodes.filter((n) => n.verdict === "broken");
   const atRisk  = nodes.filter((n) => n.verdict === "at_risk");
+  const safe    = nodes.filter((n) => n.verdict === "safe");
   const unknown = nodes.filter((n) => n.verdict === "unknown");
 
   say(`${c.d}──────────────────────────────────────────────────────────────${c.x}`);
-  say(`  ${broken.length} broken · ${atRisk.length} at risk · ${unknown.length} unknown`);
+  say(`  ${broken.length} broken · ${atRisk.length} at risk · ${safe.length} holds · ${unknown.length} unknown`);
+  if (!broken.length && !atRisk.length && !unknown.length) {
+    say(`  ${c.d}Wingman stays quiet. Nothing here is worth waking you for.${c.x}`);
+  }
 
   // The claim the whole rewrite rests on. If a delay smaller than every slack value
   // still breaks something, the cascade is guessing.

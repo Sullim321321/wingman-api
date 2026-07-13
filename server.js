@@ -13056,6 +13056,7 @@ app.get("/situation/:legId", auth, async (req, res) => {
       summary: {
         broken:  nodes.filter((n) => n.verdict === "broken").length,
         at_risk: nodes.filter((n) => n.verdict === "at_risk").length,
+        safe:    nodes.filter((n) => n.verdict === "safe").length,
         unknown: nodes.filter((n) => n.verdict === "unknown").length,
       },
     });
