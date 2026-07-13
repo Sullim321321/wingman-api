@@ -9,7 +9,8 @@
     "dev": "node --watch server.js",
     "test:graph": "node test-graph.js",
     "backfill": "node backfill-graph.js",
-    "eval": "node --env-file=.env eval-planner.js"
+    "eval": "node --env-file=.env eval-planner.js",
+    "test:inbound": "node test-inbound.js"
   },
   "engines": {
     "node": ">=18"

@@ -492,6 +492,11 @@ async function cascadeFrom(sql, commitment_id, { delayMinutes = 0, maxDepth = 6 
       out.push({
         leg_id: e.leg_id, depth, verdict, why,
         kind: e.kind, confidence: e.confidence, source: e.source,
+        // The measured gap this booking can absorb before it breaks. rescue.js scores
+        // every alternative against it — an option arriving 90 minutes later than
+        // planned eats 90 minutes of slack, and a 40-minute seaplane transfer dies.
+        // Without this number "ranked by what they protect" is just a slogan.
+        slack_minutes: e.slack_minutes,
         label: e.property_name || [e.carrier, e.flight_number].filter(Boolean).join(" ") || e.type,
         departs_at: e.departs_at, cancellable_until: e.cancellable_until,
       });

@@ -26,6 +26,8 @@ const crypto = require("crypto");
 // are three readings of the same graph. `.bind(sql)` is called just below the sql
 // client so the invariant closures can use it like the existing ones do.
 const graph = require("./constraints");
+// "Ranked by what they protect, not by price." The slide, made literal.
+const rescue = require("./rescue");
 
 const app = express();
 
@@ -638,6 +640,11 @@ async function bootstrapDB() {
     // is born, populated by dual-write, and proved honest by its invariants long
     // before any screen reads from it.
     await graph.ensureConstraintSchema(sql);
+
+    // Per-user secret for inbound mail. Identity for forwarded bookings comes from
+    // THIS, not from a forgeable From: header. Minted lazily, on first request.
+    await sql`ALTER TABLE users ADD COLUMN IF NOT EXISTS inbound_token TEXT`;
+    await sql`CREATE UNIQUE INDEX IF NOT EXISTS idx_users_inbound_token ON users(inbound_token) WHERE inbound_token IS NOT NULL`;
 
     await sql`ALTER TABLE users ADD COLUMN IF NOT EXISTS revealed_preferences JSONB DEFAULT '{}'`;
     await sql`ALTER TABLE users ADD COLUMN IF NOT EXISTS apple_sub TEXT`;
@@ -3604,43 +3611,69 @@ app.get("/trips", async (req, res) => {
 // SendGrid inbound payload shape (multipart/form-data):
 //   req.body.from, req.body.subject, req.body.text, req.body.html
 // ---------------------------------------------------------------------------
+// ⚠️ SECURITY — this endpoint used to identify the user from the `From:` header.
+//
+// `From:` is a string the sender types. Anyone could forge it — or skip email
+// entirely and POST JSON straight at this URL — and inject arbitrary bookings into
+// ANY user's account. And because those bookings are then fed to the concierge, it
+// was also a prompt-injection channel into somebody else's assistant.
+//
+// Two fixes, both required:
+//
+//   1. AUTHENTICATE THE WEBHOOK. Only our email provider may call this.
+//   2. IDENTITY COMES FROM A SECRET, NOT A HEADER. Each user gets a private address,
+//      import+<token>@wingmantravel.app. The token — not the From: line — says who
+//      this is. Forging the From: header now buys you nothing.
+//
+// The old behaviour is not kept as a fallback. A fallback to the insecure path is
+// the insecure path.
 app.post("/inbound/email", async (req, res) => {
-  // Accept both JSON (Resend) and form-encoded (SendGrid)
+  // ── 1. Is this actually our provider? ──────────────────────────────────────
+  const secret = process.env.INBOUND_WEBHOOK_SECRET;
+  if (!secret) {
+    console.error("[inbound/email] INBOUND_WEBHOOK_SECRET not set — refusing all inbound mail");
+    return res.status(503).json({ ok: false, reason: "inbound not configured" });
+  }
+  const presented = req.get("x-wingman-inbound-secret") || req.query.k || "";
+  const a = Buffer.from(String(presented));
+  const b = Buffer.from(secret);
+  if (a.length !== b.length || !crypto.timingSafeEqual(a, b)) {
+    console.warn("[inbound/email] rejected: bad or missing webhook secret");
+    return res.status(401).json({ ok: false });
+  }
+
   const from    = req.body?.from    || req.body?.envelope?.from || "";
+  const toRaw   = req.body?.to      || req.body?.envelope?.to   || req.body?.recipient || "";
   const subject = req.body?.subject || "";
   const text    = req.body?.text    || req.body?.plain || "";
   const html    = req.body?.html    || "";
 
-  // Extract the sender email address
-  const senderMatch = from.match(/[a-zA-Z0-9._%+\-]+@[a-zA-Z0-9.\-]+\.[a-zA-Z]{2,}/);
+  const senderMatch = String(from).match(/[a-zA-Z0-9._%+\-]+@[a-zA-Z0-9.\-]+\.[a-zA-Z]{2,}/);
   const senderEmail = senderMatch ? senderMatch[0].toLowerCase() : null;
 
-  if (!senderEmail) {
-    console.warn("[inbound/email] no sender email found in from:", from);
-    return res.status(200).json({ ok: false, reason: "no sender email" });
+  // ── 2. Who is this? The TOKEN says so — not the From: line. ────────────────
+  // import+a1b2c3…@wingmantravel.app  →  the part after the '+' is the user's secret.
+  const tokenMatch = String(Array.isArray(toRaw) ? toRaw.join(",") : toRaw)
+    .toLowerCase()
+    .match(/\+([a-z0-9]{16,})@/);
+  const token = tokenMatch ? tokenMatch[1] : null;
+
+  if (!token) {
+    console.warn("[inbound/email] rejected: no per-user token in recipient address");
+    return res.status(200).json({ ok: false, reason: "no token" });
   }
 
-  // Look up the Wingman user by sender email
-  // We check both the primary account email and connected Gmail accounts
   let userEmail = null;
   try {
-    const userRows = await sql`
-      SELECT user_email FROM gmail_tokens WHERE account_email = ${senderEmail}
-      UNION
-      SELECT email AS user_email FROM users WHERE email = ${senderEmail}
-      LIMIT 1
-    `;
-    if (userRows.length > 0) {
-      userEmail = userRows[0].user_email;
-    }
+    const rows = await sql`SELECT email FROM users WHERE inbound_token = ${token} LIMIT 1`;
+    if (rows.length) userEmail = rows[0].email;
   } catch (e) {
     console.error("[inbound/email] user lookup error:", e.message);
   }
 
   if (!userEmail) {
-    // Unknown sender — still return 200 so the webhook doesn't retry
-    console.warn(`[inbound/email] unknown sender: ${senderEmail}`);
-    return res.status(200).json({ ok: false, reason: "unknown sender" });
+    console.warn("[inbound/email] rejected: token matched no user");
+    return res.status(200).json({ ok: false, reason: "unknown token" });
   }
 
   // Build the body to parse — prefer plain text, fall back to HTML stripped of tags
@@ -3653,7 +3686,7 @@ app.post("/inbound/email", async (req, res) => {
 
   try {
     const count = await parsePastedEmailBody(userEmail, `Subject: ${subject}\n\n${body}`, "email_forward");
-    console.log(`[inbound/email] ${senderEmail} → ${userEmail}: ${count} booking(s) created`);
+    console.log(`[inbound/email] token→${userEmail} (from ${senderEmail || "unknown"}): ${count} booking(s)`);
     return res.status(200).json({ ok: true, bookings_created: count });
   } catch (e) {
     console.error("[inbound/email] parse error:", e.message);
@@ -6691,67 +6724,123 @@ async function sendPushToUser(userEmail, title, body, data = {}, categoryId = nu
 // Checks: connecting flights, hotel check-in, restaurant reservations
 // Sends proactive push notifications for each impacted item.
 // ---------------------------------------------------------------------------
+/**
+ * Build the dependency edges for a trip, if they don't exist yet.
+ *
+ * An edge is only real when we can MEASURE the slack: how much delay this booking can
+ * absorb before it breaks. That number is the arrival-to-departure gap, and without it
+ * there is no honest way to say whether a delay reaches downstream.
+ *
+ * Everything here is source 'inferred' at 0.6 — which means cascadeFrom() will render
+ * it as UNKNOWN and refuse to assert an impact. That is correct. An edge we guessed
+ * from two timestamps has not earned the right to tell someone their hotel is gone.
+ * It gets promoted when a human or a live feed confirms it.
+ */
+async function ensureTripEdges(tripId) {
+  const legs = await sql`
+    SELECT id, type, departs_at, arrives_at
+    FROM trip_legs
+    WHERE trip_id = ${tripId} AND departs_at IS NOT NULL AND state = 'booked'
+    ORDER BY departs_at`;
+
+  for (const a of legs) {
+    if (a.type !== "flight" || !a.arrives_at) continue;
+    const landed = new Date(a.arrives_at);
+    for (const b of legs) {
+      if (b.id === a.id) continue;
+      const gapMin = (new Date(b.departs_at) - landed) / 60000;
+      if (gapMin < 0 || gapMin > 14 * 60) continue;
+      // A flight ten hours later is not a connection, it's just Tuesday.
+      if (b.type === "flight" && gapMin > 6 * 60) continue;
+
+      await graph.depend(sql, a.id, b.id, {
+        kind: "requires_by",
+        slack_minutes: Math.round(gapMin),   // measured, never assumed
+        source: "inferred",
+        confidence: 0.6,
+      });
+    }
+  }
+}
+
+/**
+ * The cascade. This is the deck's core promise and it is now a graph walk.
+ *
+ * ── What this REPLACED, and why it mattered ──────────────────────────────────
+ * The old version took every leg scheduled after the delayed one and declared it at
+ * risk. A hotel check-in five days later got "you'll likely reach it late." It never
+ * computed whether the delay actually reached anything — it just assumed that later
+ * meant affected, and then said so with total confidence, in a push notification, to
+ * someone standing in an airport.
+ *
+ * That is the same bug as the 266-night stay and the 687-day New York trip, shipped
+ * inside the one feature the entire company is built on.
+ *
+ * Now: walk the dependency edges. Compare the delay against MEASURED slack. And when
+ * we cannot evidence an impact — an inferred edge, a missing departure time — say
+ * UNKNOWN. "I don't know whether your seaplane is affected; want me to call?" is
+ * honest, useful, and still ahead of every other travel app on earth. It is certainly
+ * better than a confident lie.
+ */
 async function triggerCascadeCheck(leg, eventType, delayMins) {
   try {
     const email = leg.user_email;
     if (!email || !leg.trip_id || !leg.departs_at) return;
 
-    // Everything downstream on this trip — the chain a slipped flight puts at risk.
-    const downstream = await sql`
-      SELECT id, type, carrier, destination, departs_at, confirmation
-      FROM trip_legs
-      WHERE trip_id = ${leg.trip_id}
-        AND id <> ${leg.id}
-        AND departs_at IS NOT NULL
-        AND departs_at >= ${leg.departs_at}
-      ORDER BY departs_at ASC
-    `;
-    if (!downstream.length) return;
+    await ensureTripEdges(leg.trip_id);
 
-    const impacted = [];
-    for (const d of downstream) {
-      const name = d.carrier || d.destination || d.type;
-      let title = null, body = null;
-      if (d.type === "flight") {
-        title = "Connection at risk";
-        body = eventType === "cancelled"
-          ? `Your onward flight ${name} is at risk. I'm lining up alternatives.`
-          : `Your connection to ${name} is at risk with a ${delayMins}m delay. I'm on it.`;
-      } else if (d.type === "hotel" || d.type === "airbnb") {
-        title = "Late check-in";
-        body = `You'll likely reach ${name} late. I can let them know to hold your room.`;
-      } else if (d.type === "dining" || d.type === "restaurant") {
-        title = "Reservation at risk";
-        body = `Your table at ${name} is at risk. Want me to move it?`;
-      } else if (d.type === "car" || d.type === "transfer") {
-        title = "Pickup no longer lines up";
-        body = `Your ${name} pickup no longer matches your new arrival. I can shift it.`;
-      } else if (d.type === "activity" || d.type === "event") {
-        title = "Booking at risk";
-        body = `${name} may no longer fit your revised arrival.`;
-      }
-      if (title) impacted.push({ leg: d, title, body });
+    const delay = eventType === "cancelled" ? 24 * 60 : (delayMins || 0);
+    const nodes = await graph.cascadeFrom(sql, leg.id, { delayMinutes: delay });
+    if (!nodes.length) return;
+
+    const broken  = nodes.filter((n) => n.verdict === "broken");
+    const atRisk  = nodes.filter((n) => n.verdict === "at_risk");
+    const unknown = nodes.filter((n) => n.verdict === "unknown");
+
+    // Nothing we can stand behind. Say THAT — do not manufacture an alarm to look busy.
+    if (!broken.length && !atRisk.length && !unknown.length) return;
+
+    let title, body;
+    if (broken.length) {
+      const f = broken[0];
+      title = broken.length === 1 ? `${f.label} won't survive this`
+                                  : `${broken.length} bookings won't survive this`;
+      body  = `${f.why} I'm working the alternatives now.`;
+    } else if (atRisk.length) {
+      const f = atRisk[0];
+      title = `${f.label} is tight`;
+      body  = `${f.why} Watching it.`;
+    } else {
+      // ONLY unknowns. The honest headline — and the offer to go find out.
+      const f = unknown[0];
+      title = `${leg.carrier || "Your flight"} is delayed — I can't yet tell what it breaks`;
+      body  = `${f.label}: ${f.why} Want me to check?`;
     }
-    if (!impacted.length) return;
 
-    // One consolidated push — a chief of staff reports the chain, not a barrage.
-    const first = impacted[0];
-    const extra = impacted.length - 1;
-    await sendPushToUser(
-      email,
-      impacted.length === 1 ? first.title : `${impacted.length} bookings affected downstream`,
-      extra > 0 ? `${first.body} (+${extra} more affected)` : first.body,
-      { route: "TripDetail", tripId: String(leg.trip_id), legId: String(leg.id), type: "cascade" },
-    );
+    // Straight into the Situation. A disruption push that dumps you on a trip
+    // itinerary makes you do the diagnosis yourself — which is the job.
+    await sendPushToUser(email, title, body, {
+      route: "Situation", legId: String(leg.id), delay: String(delay),
+      tripId: String(leg.trip_id), type: "cascade",
+    });
 
-    // And a signal per impacted booking, so the chain is visible in the app.
-    for (const i of impacted) {
+    // One signal per node — INCLUDING the unknowns. A thing Wingman cannot assess is
+    // exactly the thing the user most needs to know it cannot assess.
+    for (const n of [...broken, ...atRisk, ...unknown]) {
       await logActivity(
-        email, "cascade", i.title, i.body, leg.trip_id, i.leg.id,
-        { cascade_from_leg: String(leg.id), event: eventType, delay_minutes: delayMins || 0 },
+        email, "cascade",
+        n.verdict === "broken"  ? `${n.label} — broken`
+        : n.verdict === "at_risk" ? `${n.label} — at risk`
+        : `${n.label} — unknown`,
+        n.why, leg.trip_id, n.leg_id,
+        {
+          cascade_from_leg: String(leg.id), event: eventType, delay_minutes: delay,
+          verdict: n.verdict, confidence: n.confidence, edge_source: n.source,
+        },
       ).catch(() => {});
     }
-    console.log(`[cascade] flagged ${impacted.length} downstream item(s) for ${email}`);
+
+    console.log(`[cascade] ${email}: ${broken.length} broken · ${atRisk.length} at risk · ${unknown.length} unknown`);
   } catch (err) {
     console.error("[triggerCascadeCheck] error:", err.message);
   }
@@ -12912,6 +13001,162 @@ setInterval(async () => {
     // Silently ignore — this is best-effort
   }
 }, 10 * 60 * 1000); // every 10 minutes
+
+// GET /situation/:legId — the cascade, as a graph walk.
+//
+// Everything the Situation screen renders. Each node carries a VERDICT it can defend:
+// broken (we measured the slack and the delay exceeds it), at_risk, or — crucially —
+// unknown, when the edge was merely inferred or we have no departure time downstream.
+//
+// No node asserts an impact it cannot evidence. That rule is the entire difference
+// between a chief of staff and an alarm clock that guesses.
+app.get("/situation/:legId", auth, async (req, res) => {
+  const email = req.email;
+  try {
+    const legId = parseInt(req.params.legId, 10);
+    const delay = parseInt(req.query.delay || "0", 10);
+
+    const [leg] = await sql`
+      SELECT tl.*, t.title AS trip_title, t.user_email
+      FROM trip_legs tl JOIN trips t ON t.id = tl.trip_id
+      WHERE tl.id = ${legId} AND t.user_email = ${email}`;
+    if (!leg) return res.status(404).json({ error: "not_found" });
+
+    await ensureTripEdges(leg.trip_id);
+    const nodes = await graph.cascadeFrom(sql, legId, { delayMinutes: delay });
+
+    // The reason each downstream booking exists. This is what lets a rescue DEFEND
+    // the trip instead of merely rebooking it — "the Palace has the cold plunge and
+    // sits on the Imperial Palace loop" is why you can't just swap in any hotel.
+    for (const n of nodes) {
+      n.reasons = await graph.reasonsFor(sql, n.leg_id);
+    }
+
+    const constraints = await graph.constraintsFor(sql, {
+      user_email: email, trip_id: leg.trip_id,
+    });
+
+    res.json({
+      leg, delay,
+      nodes,
+      constraints,
+      summary: {
+        broken:  nodes.filter((n) => n.verdict === "broken").length,
+        at_risk: nodes.filter((n) => n.verdict === "at_risk").length,
+        unknown: nodes.filter((n) => n.verdict === "unknown").length,
+      },
+    });
+  } catch (e) {
+    console.error("[situation]", e.message);
+    res.status(500).json({ error: e.message });
+  }
+});
+
+// GET /situation/:legId/options — the rescue, ranked by what it protects.
+//
+// The existing auto-rebook asks Duffel for offers with sort:"total_amount" and takes
+// the cheapest. On the Asia trip that would rebook Maddie onto a flight landing after
+// the seaplane has gone — cancelling a night at Aman to save $80 — and report success.
+//
+// Here, price is a TIEBREAK. The ranking is: what survives, weighted by why it matters.
+// Every option is a real Duffel offer with a real id. Every option names what it costs
+// you. And if we can't stand behind the top one, we say so instead of recommending it.
+app.get("/situation/:legId/options", auth, async (req, res) => {
+  const email = req.email;
+  try {
+    const legId = parseInt(req.params.legId, 10);
+    const delay = parseInt(req.query.delay || "0", 10);
+
+    const [leg] = await sql`
+      SELECT tl.*, t.user_email FROM trip_legs tl JOIN trips t ON t.id = tl.trip_id
+      WHERE tl.id = ${legId} AND t.user_email = ${email}`;
+    if (!leg) return res.status(404).json({ error: "not_found" });
+    if (!leg.origin || !leg.destination) {
+      return res.json({ options: [], recommended_id: null,
+        no_recommendation_because: "I don't have a route for this leg, so I can't search alternatives." });
+    }
+    if (!process.env.DUFFEL_API_KEY) {
+      // No fabricated fallback. An invented flight beside real ones is the worst
+      // thing this system could show someone standing in an airport.
+      return res.json({ options: [], recommended_id: null,
+        no_recommendation_because: "Flight search isn't configured, so I can't offer you real alternatives — and I won't invent any." });
+    }
+
+    await ensureTripEdges(leg.trip_id);
+    const nodes = await graph.cascadeFrom(sql, legId, { delayMinutes: delay });
+    for (const n of nodes) n.reasons = await graph.reasonsFor(sql, n.leg_id);
+
+    const constraints = await graph.constraintsFor(sql, { user_email: email, trip_id: leg.trip_id });
+
+    // Search from the delayed departure onward — there is no point offering a flight
+    // that has already left.
+    const from = leg.departs_at
+      ? new Date(new Date(leg.departs_at).getTime() + (delay || 0) * 60000)
+      : new Date();
+
+    const duffel = getDuffel();
+    const offerRequest = await duffel.offerRequests.create({
+      slices: [{
+        origin: leg.origin,
+        destination: leg.destination,
+        departure_date: from.toISOString().slice(0, 10),
+      }],
+      passengers: [{ type: "adult" }],
+      // Deliberately NOT filtered to the user's cabin here. We want to SEE the options
+      // that break a constraint, so we can tell them what each one costs — rather than
+      // silently hiding them and pretending the trade-off doesn't exist.
+    });
+    const offersResp = await duffel.offers.list({
+      offer_request_id: offerRequest.data.id,
+      limit: 12,
+    });
+
+    const ranked = rescue.rank({
+      offers: offersResp.data || [],
+      constraints,
+      nodes,
+      originalArrival: leg.arrives_at,
+    });
+
+    res.json({ leg, delay, ...ranked });
+  } catch (e) {
+    console.error("[situation/options]", e.message);
+    res.status(500).json({ error: e.message });
+  }
+});
+
+// GET /me/inbound-address — the user's private forwarding address.
+//
+// This is the whole reason we may not need Gmail's `readonly` scope at all.
+//
+// `gmail.readonly` is a RESTRICTED scope: it triggers a mandatory annual CASA
+// security assessment by a Google-approved third-party assessor — real money, real
+// weeks, repeated every 12 months, forever. Forwarding needs zero Google scopes.
+//
+// And it isn't even the worse experience: a Gmail filter that auto-forwards booking
+// confirmations here is set up once and then it is ambient. "The best interface is no
+// interface" — without handing us the keys to the entire mailbox.
+app.get("/me/inbound-address", auth, async (req, res) => {
+  const email = req.email;   // auth() sets req.email, not req.userEmail
+  try {
+    let [row] = await sql`SELECT inbound_token FROM users WHERE email = ${email}`;
+    if (!row?.inbound_token) {
+      // 20 hex chars ≈ 80 bits. This token IS the credential; guessing it must be
+      // hopeless, because knowing it means being able to write to someone's trips.
+      const token = crypto.randomBytes(10).toString("hex");
+      await sql`UPDATE users SET inbound_token = ${token} WHERE email = ${email}`;
+      row = { inbound_token: token };
+    }
+    const domain = process.env.INBOUND_DOMAIN || "wingmantravel.app";
+    res.json({
+      address: `import+${row.inbound_token}@${domain}`,
+      hint: "Forward any booking confirmation here. Or set a Gmail filter to forward them automatically — then you never think about it again.",
+    });
+  } catch (e) {
+    console.error("[me/inbound-address]", e.message);
+    res.status(500).json({ error: e.message });
+  }
+});
 
 // ═══════════════════════════════════════════════════════════════════════════════
 // PLAN — the front door.  (TRIP_MODEL.md · planner.js)
