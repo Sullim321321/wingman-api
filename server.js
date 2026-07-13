@@ -3885,12 +3885,20 @@ async function getPlacesGrounding(userMessage, location) {
   const msg = userMessage.toLowerCase();
   let placeType = null;
   let keyword = null;
-  if (/bakery|croissant|pastry|bread/.test(msg))              { placeType = 'bakery'; keyword = 'bakery'; }
-  else if (/coffee|cafe|caf\u00e9|flat white|espresso/.test(msg)) { placeType = 'cafe'; keyword = 'cafe'; }
-  else if (/restaurant|dinner|lunch|eat|food|cuisine/.test(msg))  { placeType = 'restaurant'; }
-  else if (/bar|cocktail|drink|pub|whisky|wine/.test(msg))        { placeType = 'bar'; }
-  else if (/hotel|stay|accommodation|room/.test(msg))            { placeType = 'lodging'; }
+  // "I'm hungry" matched NONE of the original patterns \u2014 not `eat`, not `food`, not
+  // `restaurant`. So no Places lookup ran, and the model, asked where to eat with no
+  // data in front of it, recalled Brooklyn caf\u00e9s from memory: real businesses, wrong
+  // neighbourhood, invented walk times. She was in Fort Greene; it sent her to Park Slope.
+  //
+  // Third regex prefilter today to decide what's worth checking and get it wrong.
+  // Widened \u2014 but the widening is not the fix. The fix is below, in the prompt: when
+  // this returns nothing, the model must NOT name a venue.
+  if (/bakery|croissant|pastry|bread/.test(msg))                 { placeType = 'bakery'; keyword = 'bakery'; }
+  else if (/coffee|cafe|caf\u00e9|flat white|espresso|latte/.test(msg)) { placeType = 'cafe'; keyword = 'cafe'; }
   else if (/brunch|breakfast/.test(msg))                         { placeType = 'restaurant'; keyword = 'brunch'; }
+  else if (/bar|cocktail|drink|pub|whisky|wine|beer/.test(msg))  { placeType = 'bar'; }
+  else if (/hotel|stay|accommodation|room/.test(msg))            { placeType = 'lodging'; }
+  else if (/restaurant|dinner|lunch|supper|eat|food|cuisine|hungry|starving|famished|peckish|a bite|grab something|somewhere to eat|snack|takeaway|takeout|delivery/.test(msg)) { placeType = 'restaurant'; }
   else return [];
   try {
     const lat = location.lat;
@@ -5572,7 +5580,18 @@ ${memorySection || ''}${instructionsSection}${tasteSection ? `=== USER'S TASTE P
 ${loyaltySummary ? `=== USER'S LOYALTY ACCOUNTS ===\n${loyaltySummary}\n\nWhen recommending hotels, always factor in which programs the user has status with and suggest properties where their status will be recognized. When advising on flights, factor in their airline status and miles balance — suggest using miles for upgrades when the balance is high.\n` : ""}
 ${locationContext ? `=== USER'S CURRENT LOCATION ===\n${locationContext}\nUse this to give hyper-local recommendations. If the user asks "what should I do" or "where should I eat" without specifying a city, assume they mean right now, right here.\n` : ""}
 ${liveWeather ? `=== LIVE WEATHER AT USER'S LOCATION ===\nCurrently ${liveWeather.temp}\u00b0C (feels like ${liveWeather.feels}\u00b0C), ${liveWeather.desc}${liveWeather.windKph ? `, wind ${liveWeather.windKph} km/h` : ''}${liveWeather.humidity ? `, humidity ${liveWeather.humidity}%` : ''}.\nUse this when the user asks about weather, what to wear, or whether to go outside.\n` : ""}
-${placesResults.length > 0 ? `=== NEARBY PLACES (REAL — from Google Maps, verified) ===\nThe following businesses actually exist near the user right now. ONLY recommend places from this list when asked for local recommendations. NEVER invent or hallucinate business names.\n${placesResults.map((p, i) => `${i+1}. ${p.name} — ${p.address || 'nearby'}${p.rating ? ` · ${p.rating}★ (${p.user_ratings_total} reviews)` : ''}${p.open_now === true ? ' · Open now' : p.open_now === false ? ' · Currently closed' : ''}${p.price_level !== null ? ' · ' + ['Free','Inexpensive','Moderate','Expensive','Very expensive'][p.price_level] || '' : ''}\n   Maps: ${p.maps_url}`).join('\n')}\n\nCRITICAL: You MUST only name businesses from the list above. If none match what the user is asking for, say so honestly and describe the type of neighbourhood to look in instead.\n` : ""}
+${placesResults.length > 0 ? `=== NEARBY PLACES (REAL — from Google Maps, verified) ===\nThe following businesses actually exist near the user right now. ONLY recommend places from this list when asked for local recommendations. NEVER invent or hallucinate business names.\n${placesResults.map((p, i) => `${i+1}. ${p.name} — ${p.address || 'nearby'}${p.rating ? ` · ${p.rating}★ (${p.user_ratings_total} reviews)` : ''}${p.open_now === true ? ' · Open now' : p.open_now === false ? ' · Currently closed' : ''}${p.price_level !== null ? ' · ' + ['Free','Inexpensive','Moderate','Expensive','Very expensive'][p.price_level] || '' : ''}\n   Maps: ${p.maps_url}`).join('\n')}\n\nCRITICAL: You MUST only name businesses from the list above. If none match what the user is asking for, say so honestly and describe the type of neighbourhood to look in instead.\nDistances: you may say a place is nearby, but do NOT state a walking time in minutes unless it is given above. You do not know how fast she walks or which way she turns.\n` : `=== NO VERIFIED PLACES DATA ===
+I have NOT looked up any businesses near the user for this message.
+
+Therefore you MUST NOT:
+  · name a specific restaurant, café, bar or shop
+  · state an address, a street, or a walking time
+  · say what is "5 minutes away" or "just around the corner"
+
+You may be recalling a real business — and still be wrong about where she is. That is exactly what happened before: she asked where to eat while standing in Fort Greene, and was sent to two genuinely excellent bakeries in Park Slope, a mile away, with confident walk times attached. Real places. Wrong neighbourhood. Worse than useless, because it sounded certain.
+
+If she wants a recommendation, say you'll look up what's actually open near her right now, and ask her to confirm the neighbourhood if you're not sure of it. An honest "let me check what's around you" beats a beautifully specific answer about somewhere she isn't.
+`}
 ${liveSearchContext ? `=== LIVE SEARCH RESULTS (current as of today — use these to ground your recommendations) ===\n${liveSearchContext}\n\nIMPORTANT: Prioritize information from the live search results above your training data when they conflict. If the search results mention a restaurant or hotel is closed, do not recommend it.\n` : ""}
 ${transitRoute ? `=== TRANSIT ROUTE (from Google Directions API — verified) ===\nRoute: ${transitRoute.start_address} → ${transitRoute.end_address}\nTotal journey: ${transitRoute.total_duration}${transitRoute.total_distance ? ` · ${transitRoute.total_distance}` : ''}${transitRoute.departure_time ? ` · Departs ${transitRoute.departure_time}` : ''}${transitRoute.arrival_time ? ` · Arrives ${transitRoute.arrival_time}` : ''}\n\nSTEPS:\n${transitRoute.steps.map((s, i) => `${i+1}. [${s.mode}] ${s.instruction}${s.duration ? ` (${s.duration})` : ''}${s.transit ? ` — ${s.transit.vehicle || 'Transit'} ${s.transit.line || ''}, board at ${s.transit.departure_stop || ''}, alight at ${s.transit.arrival_stop || ''}${s.transit.departure_time ? ` (departs ${s.transit.departure_time})` : ''}${s.transit.num_stops ? `, ${s.transit.num_stops} stops` : ''}` : ''}`).join('\n')}\n\n${transitRoute.payment ? `PAYMENT IN THIS CITY:\n- Card: ${transitRoute.payment.card}\n- App: ${transitRoute.payment.app}\n- Cash: ${transitRoute.payment.cash}\n- TIP: ${transitRoute.payment.tip}\n- Buy tickets: ${transitRoute.payment.ticket_url}` : ''}\n\nOpen in Maps: ${transitRoute.maps_url}\n\nCRITICAL TRANSIT INSTRUCTIONS: When presenting this route, always include: (1) the specific transit line/bus number, (2) exactly how to pay in this city (especially whether Apple Pay works), (3) whether to tap in AND out or just tap in, (4) the direct ticket purchase link. End your response with: ACTION:{"type":"maps","label":"Open in Maps","url":"${transitRoute.maps_url}"} on its own line.\n` : ""}
 === USER'S TRIPS (with live data) ===
