@@ -613,6 +613,21 @@ function scoreOption(constraintSet, satisfiedIds = [], strengths = {}) {
 
 const CONSTRAINT_INVARIANTS = [
   {
+    name: "a booking that forgot why it exists",
+    why: "This leg was planned — Wingman proposed it, for reasons, and drew edges to the constraints it served. Now it's booked and it has no reasons at all. That means booking created a NEW leg instead of promoting the proposal, and the edges are stranded on an orphan. The symptom is silence: when this flight is delayed, the cascade walks from here, finds nothing downstream, and reports 'nothing depends on this' — confidently, on evidence it never checked. Booking must UPDATE the proposed leg, never INSERT beside it.",
+    query: (email) => sql`
+      SELECT tl.id, COALESCE(tl.destination, tl.destination_city, tl.type) AS detail, tl.state, tl.booked_by
+      FROM trip_legs tl
+      JOIN trips t ON t.id = tl.trip_id
+      WHERE t.user_email = ${email}
+        AND tl.state = 'booked'
+        AND tl.booked_by = 'wingman'
+        AND NOT EXISTS (SELECT 1 FROM satisfies s WHERE s.commitment_id = tl.id)
+        AND EXISTS (SELECT 1 FROM constraints c
+                    WHERE c.trip_id = tl.trip_id AND c.superseded_by IS NULL)
+      LIMIT 5`,
+  },
+  {
     name: "autonomous action that names nothing it was protecting",
     why: "Wingman acted alone and cannot say what for. If it can't name the constraint, it had no business acting. This is the whole safety argument.",
     query: (email) => sql`

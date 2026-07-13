@@ -476,7 +476,17 @@ async function shapeTrip(sql, { user_email, trip_id, shape = [], constraints = [
            ${leg.kind === "stay" ? title : null}, ${leg.nights || null},
            ${leg.date || null}::TIMESTAMPTZ,          -- only if the USER fixed it
            'proposed', 'wingman',
-           ${JSON.stringify({ why: leg.why, planned: true })}::jsonb)
+           -- from_city/to_city are the plan's own words, kept as words.
+           -- They are NOT written to origin/destination: those columns hold IATA codes
+           -- on every booked leg in the table, and a city name sitting in an IATA column
+           -- is a lie about its own type — the kind that reads fine until something
+           -- downstream trusts it. Booking resolves these to airports later, out loud.
+           ${JSON.stringify({
+             why: leg.why,
+             planned: true,
+             from_city: leg.kind === "move" ? leg.from || null : null,
+             to_city:   leg.kind === "move" ? leg.city || null : null,
+           })}::jsonb)
         RETURNING id`;
       legId = row.id;
     }

@@ -7984,8 +7984,13 @@ app.get("/flights/offer/:offerId", async (req, res) => {
 // Body: { offer_id, passengers: [{ given_name, family_name, born_on, gender, email, phone, passport_number?, passport_expiry?, passport_country? }] }
 app.post("/flights/book", async (req, res) => {
   try {
-    const user = await verifyAccessToken(req);
-    if (!user) return res.status(401).json({ error: "Unauthorized" });
+    // verifyAccessToken returns an EMAIL STRING. This used to read `user.email` —
+    // undefined — and pass it to `INSERT INTO trips (user_email ...)`, which is NOT NULL.
+    // The insert therefore threw. It threw AFTER duffel.orders.create() had already sold
+    // the ticket. A real charge, a 500 to the client, and no row anywhere saying so.
+    const email = await verifyAccessToken(req);
+    if (!email) return res.status(401).json({ error: "Unauthorized" });
+    const user = { email };
     const { offer_id, passengers } = req.body;
     if (!offer_id || !passengers?.length) {
       return res.status(400).json({ error: "offer_id and passengers are required" });
@@ -8076,13 +8081,15 @@ app.post("/flights/book", async (req, res) => {
 // GET /flights/orders — list user's Duffel bookings
 app.get("/flights/orders", async (req, res) => {
   try {
-    const user = await verifyAccessToken(req);
-    if (!user) return res.status(401).json({ error: "Unauthorized" });
+    // verifyAccessToken returns an EMAIL STRING, not a user object. This read `user.email`
+    // — undefined — so this endpoint returned an empty list to everyone, forever.
+    const email = await verifyAccessToken(req);
+    if (!email) return res.status(401).json({ error: "Unauthorized" });
     const rows = await sql`
       SELECT t.id, t.title, t.created_at, tl.carrier, tl.flight_number, tl.origin, tl.destination, tl.departs_at, tl.confirmation, tl.raw_data
       FROM trips t
       JOIN trip_legs tl ON tl.trip_id = t.id
-      WHERE t.user_email = ${user.email} AND t.source = 'duffel'
+      WHERE t.user_email = ${email} AND t.source = 'duffel'
       ORDER BY tl.departs_at ASC
     `;
     res.json({ bookings: rows });
@@ -13511,6 +13518,203 @@ app.post("/plan/constraint/:id/confirm", async (req, res) => {
     res.json({ ok: true, constraint: row });
   } catch (e) {
     res.status(500).json({ error: e.message });
+  }
+});
+
+// ═══════════════════════════════════════════════════════════════════════════
+// BOOKING — where a plan stops being a sketch.
+//
+// Two endpoints, and the split between them is the whole ethic:
+//   GET  /plan/leg/:legId/book   — what I know, what I don't, and what I'd choose.
+//   POST /plan/leg/:legId/book   — do it.
+//
+// The GET is allowed to be uncertain out loud. The POST is not allowed to be
+// uncertain at all: anything it can't evaluate, it refuses to act on alone.
+// ═══════════════════════════════════════════════════════════════════════════
+
+const booking = require("./booking");
+
+async function loadProposedLeg(email, legId) {
+  const [leg] = await sql`
+    SELECT tl.*, t.user_email, t.title AS trip_title
+    FROM trip_legs tl
+    JOIN trips t ON t.id = tl.trip_id
+    WHERE tl.id = ${legId} AND t.user_email = ${email}`;
+  return leg || null;
+}
+
+async function passengerFor(email) {
+  const [u] = await sql`SELECT preferences FROM users WHERE email = ${email}`;
+  return u?.preferences?.passenger_profile || null;
+}
+
+// GET /plan/leg/:legId/book — the honest offer sheet.
+app.get("/plan/leg/:legId/book", async (req, res) => {
+  const email = await verifyAccessToken(req);
+  if (!email) return res.status(401).json({ error: "unauthorized" });
+  try {
+    const legId = parseInt(req.params.legId, 10);
+    const leg = await loadProposedLeg(email, legId);
+    if (!leg) return res.status(404).json({ error: "not_found" });
+
+    const passenger = await passengerFor(email);
+    const ready = booking.readiness({ leg, trip: { id: leg.trip_id }, passenger });
+
+    // Missing anything? Then there is nothing to search for, and no ranking to fake.
+    // Return the QUESTIONS. A gap is a thing to ask about, not a thing to fill in.
+    if (!ready.ready) return res.json({ ready: false, ...ready, options: [] });
+    if (!process.env.DUFFEL_API_KEY) {
+      return res.json({ ready: false, missing: [{ field: "duffel", ask: "Flight search isn't configured." }], options: [] });
+    }
+
+    const duffel = getDuffel();
+    const [from, to] = await Promise.all([
+      booking.resolveAirport(duffel, ready.from_city),
+      booking.resolveAirport(duffel, ready.to_city),
+    ]);
+    // An unresolvable city is a question, not a shrug. Do NOT pick the nearest big airport.
+    if (!from || !to) {
+      return res.json({
+        ready: false,
+        options: [],
+        missing: [{
+          field: "airport",
+          ask: `I couldn't find an airport for ${!from ? ready.from_city : ready.to_city}. Which airport do you mean?`,
+        }],
+      });
+    }
+
+    const { options, recommended_id, no_recommendation_because, constraints } =
+      await booking.offersFor(sql, duffel, {
+        leg: { ...leg, user_email: email },
+        from, to,
+        departs_at: ready.departs_at,
+        cabin_class: req.query.cabin || undefined,
+      });
+
+    const top = options[0];
+    const permission = await booking.permission(sql, {
+      user_email: email, trip_id: leg.trip_id, choice: top,
+    });
+
+    res.json({
+      ready: true,
+      leg: { id: leg.id, title: leg.destination, departs_at: ready.departs_at },
+      // Which airports I chose, and that I chose them. Never silent.
+      resolved: { from, to },
+      constraints,
+      options: options.slice(0, 8),
+      // Which one I'd take — and, if none, why I won't pick for you.
+      recommended_id,
+      no_recommendation_because,
+      // Can I do this without you? The graph answers; the setting doesn't.
+      may_act_alone: permission,
+    });
+  } catch (e) {
+    console.error("[plan/book/get]", e.message);
+    res.status(500).json({ error: e.message });
+  }
+});
+
+// POST /plan/leg/:legId/book — the plan becomes a commitment.
+// Body: { offer_id, by?: 'you' | 'wingman' }
+app.post("/plan/leg/:legId/book", async (req, res) => {
+  const email = await verifyAccessToken(req);
+  if (!email) return res.status(401).json({ error: "unauthorized" });
+  try {
+    const legId = parseInt(req.params.legId, 10);
+    const { offer_id, by = "you" } = req.body || {};
+    if (!offer_id) return res.status(400).json({ error: "offer_id required" });
+
+    const leg = await loadProposedLeg(email, legId);
+    if (!leg) return res.status(404).json({ error: "not_found" });
+    if (leg.state !== "proposed") {
+      return res.status(409).json({ error: "not_proposed", detail: `This leg is already '${leg.state}'.` });
+    }
+
+    const passenger = await passengerFor(email);
+    const ready = booking.readiness({ leg, trip: { id: leg.trip_id }, passenger });
+    if (!ready.ready) return res.status(400).json({ error: "not_ready", ...ready });
+
+    const duffel = getDuffel();
+    const offer = (await duffel.offers.get(offer_id)).data;
+
+    // If Wingman is acting alone, it must re-earn permission HERE — not inherit it from
+    // whatever the GET said a few minutes ago. Between the two calls she may have told me
+    // something new, and the last thing to check is always the freshest thing I know.
+    if (by === "wingman") {
+      const constraints = await graph.constraintsFor(sql, { user_email: email, trip_id: leg.trip_id });
+      const cascade = await graph.cascadeFrom(sql, leg.id, { delayMinutes: 0 }).catch(() => ({ nodes: [] }));
+      const { options } = rescue.rank({
+        offers: [offer], constraints, nodes: cascade.nodes || [], originalArrival: null,
+      });
+      const may = await booking.permission(sql, { user_email: email, trip_id: leg.trip_id, choice: options[0] });
+      if (!may.ok) return res.status(403).json({ error: "may_not_act_alone", ...may });
+    }
+
+    const order = (await duffel.orders.create({
+      selected_offers: [offer_id],
+      passengers: offer.passengers.map((p) => ({
+        id: p.id,
+        given_name: passenger.given_name,
+        family_name: passenger.family_name,
+        born_on: passenger.born_on,
+        gender: passenger.gender || "m",
+        email,
+        phone_number: passenger.phone || "+10000000000",
+        ...(passenger.passport_number ? {
+          identity_documents: [{
+            type: "passport",
+            unique_identifier: passenger.passport_number,
+            expires_on: passenger.passport_expiry,
+            issuing_country_code: passenger.passport_country || "US",
+          }],
+        } : {}),
+      })),
+      payments: [{ type: "balance", currency: offer.total_currency, amount: offer.total_amount }],
+      metadata: { wingman_user: email, wingman_leg: String(leg.id) },
+    })).data;
+
+    // ── The load-bearing line. UPDATE, not INSERT. ──
+    // The proposal becomes the booking, and keeps every reason it was proposed for.
+    const { leg: booked, reasons_kept } = await booking.promote(sql, { leg, order, offer, by });
+
+    await graph.deliberate(sql, {
+      user_email: email,
+      trip_id: leg.trip_id,
+      commitment_id: leg.id,
+      question: `Book ${booked.origin} → ${booked.destination}?`,
+      chose: `${booked.carrier} ${booked.flight_number} · ${offer.total_currency} ${offer.total_amount}`,
+      because: reasons_kept
+        ? `It serves ${reasons_kept} thing${reasons_kept === 1 ? "" : "s"} you told me mattered.`
+        : "You chose it.",
+      // deliberate() refuses to record a wingman decision that protects nothing.
+      protecting: (await graph.reasonsFor(sql, leg.id)).map((r) => r.id),
+      by,
+    }).catch((e) => console.error("[plan/book/deliberate]", e.message));
+
+    await logActivity(
+      email, "booking",
+      `Booked: ${booked.origin} → ${booked.destination}`,
+      `${booked.carrier} ${booked.flight_number}. Reference ${order.booking_reference}. ${offer.total_currency} ${offer.total_amount}.`,
+      leg.trip_id, leg.id,
+      { duffel_order_id: order.id, booking_reference: order.booking_reference, promoted_from_proposal: true, by }
+    );
+
+    // Now that it has real times, the trip's dependency edges can finally be drawn.
+    await ensureTripEdges(leg.trip_id).catch((e) => console.error("[plan/book/edges]", e.message));
+
+    res.json({
+      ok: true,
+      leg: booked,
+      booking_reference: order.booking_reference,
+      order_id: order.id,
+      reasons_kept,
+    });
+  } catch (e) {
+    console.error("[plan/book/post]", e.message, e?.errors);
+    const msg = e?.errors?.[0]?.message || e.message || "Booking failed";
+    res.status(500).json({ error: msg });
   }
 });
 

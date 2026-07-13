@@ -97,6 +97,29 @@ function evaluate(constraint, offer) {
       const cents = Math.round(parseFloat(offer.total_amount || "0") * 100);
       return cents <= Number(p.value);
     }
+    // These two were listed in APPLIES_TO_FLIGHT and then never implemented, so they
+    // fell through to `default: return null` — permanently "unknown". Which meant that
+    // for any trip carrying an "I have to land before the rehearsal" constraint, Wingman
+    // would show "I can't assess this", and refuse to act alone, FOREVER — about a
+    // question it can answer from the offer's own timestamps.
+    //
+    // An honest "unknown" is the most valuable thing this system says. That is exactly
+    // why it has to be scarce: a system that says "I don't know" about things it plainly
+    // does know teaches you to stop believing it when it doesn't.
+    case "arrive_before": {
+      const arr = offer.slices?.[0]?.segments?.slice(-1)[0]?.arriving_at;
+      if (!arr || !p.value) return null;
+      const limit = new Date(p.value);
+      if (isNaN(limit)) return null;
+      return new Date(arr) <= limit;
+    }
+    case "depart_after": {
+      const dep = seg.departing_at;
+      if (!dep || !p.value) return null;
+      const limit = new Date(p.value);
+      if (isNaN(limit)) return null;
+      return new Date(dep) >= limit;
+    }
     // Lodging, facilities, climate, entry rules — a flight offer says nothing about
     // any of them. UNKNOWN, and we say so, rather than scoring them as satisfied.
     default:
