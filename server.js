@@ -13562,6 +13562,56 @@ app.get("/plan/:tripId", async (req, res) => {
   }
 });
 
+// GET /me/constraints — what Wingman believes is always true of you.
+//
+// These apply to every trip, which is exactly why they don't belong on the Plan screen:
+// they say nothing about the trip you're planning, they just crowd out the things that do.
+// They belong where you go to CHANGE them.
+//
+// Each one carries how it was learned. "You told me" and "I worked it out" are different
+// kinds of fact and must never be rendered as the same kind — an inference wearing the
+// confidence of a statement is the failure this whole system is built to prevent.
+app.get("/me/constraints", async (req, res) => {
+  const email = await verifyAccessToken(req);
+  if (!email) return res.status(401).json({ error: "unauthorized" });
+  try {
+    const rows = await sql`
+      SELECT * FROM constraints
+      WHERE user_email = ${email}
+        AND trip_id IS NULL
+        AND superseded_by IS NULL
+      ORDER BY
+        CASE hardness WHEN 'must' THEN 0 WHEN 'strong' THEN 1 ELSE 2 END,
+        created_at DESC`;
+    res.json({
+      constraints: rows,
+      // Awaiting your word — an inference Wingman won't act on until you confirm it.
+      proposed: rows.filter((c) => c.status === "proposed"),
+    });
+  } catch (e) {
+    console.error("[me/constraints]", e.message);
+    res.status(500).json({ error: e.message });
+  }
+});
+
+// DELETE /me/constraints/:id — "no, that isn't true of me."
+// Retires it rather than deleting the row: what Wingman used to believe, and when it
+// stopped, is part of how it explains a decision it made last month.
+app.delete("/me/constraints/:id", async (req, res) => {
+  const email = await verifyAccessToken(req);
+  if (!email) return res.status(401).json({ error: "unauthorized" });
+  try {
+    const [row] = await sql`
+      UPDATE constraints SET status = 'retired', expires_at = NOW()
+      WHERE id = ${parseInt(req.params.id, 10)} AND user_email = ${email} AND trip_id IS NULL
+      RETURNING id`;
+    if (!row) return res.status(404).json({ error: "not_found" });
+    res.json({ ok: true });
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
 // POST /plan/constraint/:id/confirm — an inference becomes a fact.
 // The ONLY way that ever happens.
 app.post("/plan/constraint/:id/confirm", async (req, res) => {
