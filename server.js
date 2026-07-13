@@ -3642,11 +3642,24 @@ app.post("/inbound/email", async (req, res) => {
     return res.status(401).json({ ok: false });
   }
 
-  const from    = req.body?.from    || req.body?.envelope?.from || "";
-  const toRaw   = req.body?.to      || req.body?.envelope?.to   || req.body?.recipient || "";
-  const subject = req.body?.subject || "";
-  const text    = req.body?.text    || req.body?.plain || "";
-  const html    = req.body?.html    || "";
+  // Resend's webhook wraps the email in an envelope: { type, created_at, data: {...} }.
+  // SendGrid posts the fields at the top level. The original code only read the top
+  // level, so a real Resend delivery would have arrived, matched nothing, and returned
+  // 200 OK — a silent no-op, which is the worst possible failure: it looks like it
+  // worked. Read both shapes.
+  const mail = req.body?.data || req.body || {};
+  const evt  = req.body?.type || "";
+  if (evt && !/received|inbound/i.test(evt)) {
+    // Delivery / bounce / open notifications also land here if the webhook is set to
+    // "All Events". Not an error — just not ours.
+    return res.status(200).json({ ok: true, ignored: evt });
+  }
+
+  const from    = mail.from    || mail.envelope?.from || mail.sender || "";
+  const toRaw   = mail.to      || mail.envelope?.to   || mail.recipient || "";
+  const subject = mail.subject || "";
+  const text    = mail.text    || mail.plain || mail["body-plain"] || "";
+  const html    = mail.html    || mail["body-html"] || "";
 
   const senderMatch = String(from).match(/[a-zA-Z0-9._%+\-]+@[a-zA-Z0-9.\-]+\.[a-zA-Z]{2,}/);
   const senderEmail = senderMatch ? senderMatch[0].toLowerCase() : null;
