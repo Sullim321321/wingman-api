@@ -28,6 +28,12 @@ const crypto = require("crypto");
 const graph = require("./constraints");
 // "Ranked by what they protect, not by price." The slide, made literal.
 const rescue = require("./rescue");
+// A flight has a NAME ("Japan Airlines JL 623") and a KEY ("JL623"), and they are not
+// the same string. Every ident builder in this file used to be `carrier + flight_number`
+// — which produced "Japan AirlinesJL623", 404'd on AeroAPI, and returned null. A null
+// that means "malformed key" is indistinguishable from a null that means "no delay".
+// The monitor wasn't wrong. It was dark.
+const flightid = require("./flightid");
 
 const app = express();
 
@@ -1320,7 +1326,7 @@ app.post("/me/test-morning-briefing", async (req, res) => {
     } else {
       const daysAway = Math.ceil((new Date(next.departs_at) - now) / 86400000);
       const dest = next.destination_city || next.destination || "your destination";
-      const ident = [next.carrier, next.flight_number].filter(Boolean).join("");
+      const ident = flightid.displayName(next) || "";   // a NAME — a person reads this
       const route = next.origin && next.destination ? `${next.origin} → ${next.destination}` : dest;
       if (daysAway <= 0) body = `${dest} today. ${route}${ident ? ` · ${ident}` : ""}. You're in good shape — I'll flag anything the moment it moves.`;
       else if (daysAway === 1) body = `${dest} tomorrow. Everything's lined up; I'll have your full briefing ready in the morning.`;
@@ -1543,7 +1549,7 @@ async function loyaltyInsights(email) {
       kind: "attach_number",
       urgency: "low",
       program: l.carrier,
-      title: `${l.carrier}${l.flight_number ? " " + l.flight_number : ""} on ${new Date(l.departs_at).toLocaleDateString("en-US", { month: "short", day: "numeric" })}`,
+      title: `${flightid.displayName(l)} on ${new Date(l.departs_at).toLocaleDateString("en-US", { month: "short", day: "numeric" })}`,
       body: `You have a ${l.carrier} account. Check your number is on this booking — credit doesn't apply retroactively without a claim.`,
       evidence: { trip_id: l.trip_id, leg_id: l.id, departs_at: l.departs_at },
     });
@@ -3165,7 +3171,7 @@ app.post("/trips/rename-unknown", auth, async (req, res) => {
       } else if (row.destination) {
         newTitle = `${row.destination} Trip`;
       } else if (row.carrier && row.flight_number) {
-        newTitle = `${row.carrier}${row.flight_number}`;
+        newTitle = flightid.displayName(row);
       } else if (row.carrier) {
         newTitle = `${row.carrier} Flight`;
       } else {
@@ -4956,7 +4962,7 @@ app.post("/decisions/simulate", async (req, res) => {
       FROM trip_legs tl JOIN trips t ON t.id = tl.trip_id
       WHERE t.user_email = ${email} AND tl.type = 'flight' AND tl.departs_at > NOW()
       ORDER BY tl.departs_at ASC LIMIT 1`;
-    const ident = leg ? `${leg.carrier || ""}${leg.flight_number || ""}`.trim() : "";
+    const ident = leg ? (flightid.displayName(leg) || "") : "";
     const route = leg ? `${leg.origin || "?"} → ${leg.destination || "?"}` : "BOS → LHR";
     const headline = `${ident ? ident + " " : ""}${route} looks at risk`;
     const options = [
@@ -5243,9 +5249,11 @@ app.post("/concierge", conciergeLimiter, async (req, res) => {
       const legs = trip.legs || [];
       const enrichedLegs = await Promise.all(legs.map(async (leg) => {
         if (leg.type !== "flight" || !leg.flight_number) return leg;
-        const ident = (leg.carrier || "") + leg.flight_number;
+        // The KEY, not the name. This line used to send "Japan AirlinesJL623".
+        const ident = flightid.apiKey(leg);
         const [liveStatus, weatherData] = await Promise.allSettled([
-          getFlightStatus(ident),
+          // No key → no lookup. We do not fetch with garbage and then read the 404 as calm.
+          ident ? getFlightStatus(ident) : Promise.resolve(null),
           (leg.origin && leg.destination)
             ? (async () => {
                 const depI = ICAO[leg.origin] || "K" + leg.origin;
@@ -5283,7 +5291,7 @@ app.post("/concierge", conciergeLimiter, async (req, res) => {
               const wr = leg.weather_risk;
               const statusStr = ls ? `Status: ${ls.status}${ls.delay ? ` (${Math.round(ls.delay / 60)}m delay)` : ""}${ls.gate ? `, Gate ${ls.gate}` : ""}` : "Status: unknown";
               const weatherStr = wr ? `Weather risk: ${wr.risk}%` : "";
-              return `  - Flight ${leg.carrier || ""}${leg.flight_number || ""}: ${leg.origin || "?"} → ${leg.destination || "?"} at ${leg.departs_at || "TBD"}. ${statusStr}. ${weatherStr}`.trim();
+              return `  - Flight ${flightid.displayName(leg) || "(unidentified)"}: ${leg.origin || "?"} → ${leg.destination || "?"} at ${leg.departs_at || "TBD"}. ${statusStr}. ${weatherStr}`.trim();
             }
             if (leg.type === "hotel") return `  - Hotel: ${leg.carrier || leg.destination || "Hotel"} check-in ${leg.departs_at || "TBD"}`;
             return `  - ${leg.type}: ${leg.carrier || leg.destination || "Booking"}`;
@@ -5906,14 +5914,35 @@ app.get("/predict", async (req, res) => {
 const AEROAPI_BASE = "https://aeroapi.flightaware.com/aeroapi";
 
 // FlightAware AeroAPI — primary source
+//
+// `lastFlightAwareReason` exists because this function used to return `null` for four
+// completely different situations — no API key, an HTTP error, a rate limit, and a
+// perfectly healthy answer that simply had no flights in it — and the caller could not
+// tell them apart. That is precisely how the malformed-ident bug stayed invisible for
+// so long: the monitor asked a broken question, got a 404, read `null`, and concluded
+// all was calm.
+//
+// A system that cannot distinguish "I found nothing" from "I couldn't look" will
+// eventually report the second as the first, and it will do it in a push notification.
+let lastFlightAwareReason = null;
+
 async function getFlightStatusFlightAware(flightIdent) {
+  lastFlightAwareReason = null;
   const key = process.env.FLIGHTAWARE_API_KEY;
-  if (!key) return null;
+  if (!key) { lastFlightAwareReason = "no_api_key"; return null; }
   try {
     const r = await fetch(`${AEROAPI_BASE}/flights/${encodeURIComponent(flightIdent)}`, {
       headers: { "x-apikey": key, "Accept": "application/json" }
     });
-    if (!r.ok) return null;
+    if (!r.ok) {
+      lastFlightAwareReason =
+        r.status === 404 ? `not_found (AeroAPI does not know the ident "${flightIdent}")`
+      : r.status === 401 || r.status === 403 ? "bad_api_key"
+      : r.status === 429 ? "rate_limited"
+      : `http_${r.status}`;
+      console.warn(`[aeroapi] ${flightIdent} → ${lastFlightAwareReason}`);
+      return null;
+    }
     const j = await r.json();
     const flights = j.flights || [];
     const now = Date.now();
@@ -5922,7 +5951,9 @@ async function getFlightStatusFlightAware(flightIdent) {
       return dep ? new Date(dep).getTime() > now - 3 * 60 * 60 * 1000 : false;
     });
     const flight = upcoming[0] || flights[0];
-    if (!flight) return null;
+    // THIS is the honest empty: AeroAPI answered, and it has nothing scheduled.
+    // Categorically different from every branch above.
+    if (!flight) { lastFlightAwareReason = "no_flights_scheduled"; return null; }
     const status = flight.status || "Unknown";
     const delay = flight.departure_delay ? Math.round(flight.departure_delay / 60) : 0;
     const gate = flight.gate_origin || null;
@@ -5931,6 +5962,7 @@ async function getFlightStatusFlightAware(flightIdent) {
     const scheduledDep = flight.scheduled_out || null;
     return { status, delay, gate, terminal, actualDep, scheduledDep, source: "flightaware" };
   } catch (e) {
+    lastFlightAwareReason = `network_error: ${e.message}`;
     console.error("[aeroapi]", e.message);
     return null;
   }
@@ -5987,6 +6019,19 @@ async function getFlightStatus(flightIdent) {
   return getFlightStatusAviationStack(flightIdent);
 }
 
+// Why do we have nothing? The four answers below are NOT the same answer, and the
+// entire monitor was blind for months because the code returned `null` for all of them.
+//
+//   no_api_key            → we never looked.        (a config problem)
+//   bad_api_key           → we were refused.        (a config problem)
+//   not_found             → we asked a bad question.(the ident bug)
+//   rate_limited          → we were throttled.      (a capacity problem)
+//   no_flights_scheduled  → we asked, and there is genuinely nothing.  ← the ONLY calm one
+//
+// Only the last one means "nothing is wrong." Reporting the other four as calm is how
+// a monitor that never fires comes to look exactly like a world where nothing goes wrong.
+function whyNoStatus() { return lastFlightAwareReason; }
+
 // GET /flight-status?ident=UA412
 app.get("/flight-status", async (req, res) => {
   const email = await verifyAccessToken(req);
@@ -5994,7 +6039,8 @@ app.get("/flight-status", async (req, res) => {
   const ident = String(req.query.ident || "").toUpperCase().replace(/\s/g, "");
   if (!ident) return res.status(400).json({ error: "ident required" });
   const status = await getFlightStatus(ident);
-  if (!status) return res.json({ ident, status: "Unknown", live: false });
+  // "Unknown" is not an answer. It's four answers wearing the same coat. Say which.
+  if (!status) return res.json({ ident, status: "Unknown", live: false, reason: whyNoStatus() });
   res.json({ ident, live: true, ...status });
 });
 
@@ -6004,7 +6050,8 @@ app.get("/flight-status-public", async (req, res) => {
   const ident = String(req.query.ident || "").toUpperCase().replace(/\s/g, "");
   if (!ident) return res.status(400).json({ error: "ident required" });
   const status = await getFlightStatus(ident);
-  if (!status) return res.json({ ident, status: "Unknown", live: false });
+  // "Unknown" is not an answer. It's four answers wearing the same coat. Say which.
+  if (!status) return res.json({ ident, status: "Unknown", live: false, reason: whyNoStatus() });
   res.json({ ident, live: true, ...status });
 });
 // GET /flight-status/:ident — path-param alias (app calls this form)
@@ -6015,7 +6062,8 @@ app.get("/flight-status/:ident", async (req, res) => {
   const ident = String(req.params.ident || "").toUpperCase().replace(/\s/g, "");
   if (!ident) return res.status(400).json({ error: "ident required" });
   const status = await getFlightStatus(ident);
-  if (!status) return res.json({ ident, status: "Unknown", live: false });
+  // "Unknown" is not an answer. It's four answers wearing the same coat. Say which.
+  if (!status) return res.json({ ident, status: "Unknown", live: false, reason: whyNoStatus() });
   res.json({ ident, live: true, ...status });
 });
 // ---------------------------------------------------------------------------
@@ -6030,7 +6078,11 @@ app.post("/trips/:id/refresh", async (req, res) => {
     const updated = [];
     for (const leg of legs) {
       if (!leg.flight_number) continue;
-      const s = await getFlightStatus(leg.flight_number);
+      // Was `getFlightStatus(leg.flight_number)` — "JL 623", with a space. AeroAPI 404s
+      // on that too. Different call site, same silence.
+      const ident = flightid.apiKey(leg);
+      if (!ident) { console.warn(`[flight-status] leg ${leg.id}: ${flightid.whyNoKey(leg)}`); continue; }
+      const s = await getFlightStatus(ident);
       if (s) {
         await sql`UPDATE trip_legs SET status=${s.status} WHERE id=${leg.id}`;
         updated.push({ id: leg.id, flight_number: leg.flight_number, ...s });
@@ -7082,7 +7134,8 @@ async function createDisruptionDecision(leg, live, newStatus) {
       WHERE user_email = ${email} AND leg_id = ${leg.id} AND status IN ('pending','auto_done')
       LIMIT 1`;
     if (existing) return; // already surfaced
-    const ident = `${leg.carrier || ""}${leg.flight_number || ""}`.trim();
+    // This one goes into a PUSH NOTIFICATION. It said "Japan AirlinesJL623 is delayed."
+    const ident = flightid.displayName(leg) || "";
     const route = `${leg.origin || "?"} → ${leg.destination || "?"}`;
     const cancelled = newStatus === "Cancelled";
     const delayMins = live?.delay ? Math.round(live.delay / 60) : null;
@@ -7132,7 +7185,7 @@ async function pollDisruptions() {
     console.log(`[poll] checking ${legs.length} upcoming flight legs`);
 
     for (const leg of legs) {
-      const ident = (leg.carrier || "") + leg.flight_number;
+      const ident = flightid.apiKey(leg);
       const live = await getFlightStatus(ident);
       if (!live || !live.status) continue;
 
@@ -7330,7 +7383,7 @@ async function activateReturnTripWatch(leg) {
     `;
 
     // Log to activity feed
-    const ident = (returnLeg.carrier || "") + (returnLeg.flight_number || "");
+    const ident = flightid.displayName(returnLeg);
     await logActivity(
       leg.user_email,
       "return_watch_activated",
@@ -7477,7 +7530,7 @@ async function getFlightAwareSeatConfig(leg) {
   try {
     const apiKey = process.env.FLIGHTAWARE_API_KEY;
     if (!apiKey) return null;
-    const ident = (leg.carrier || "") + (leg.flight_number || "");
+    const ident = flightid.apiKey(leg);
     if (!ident) return null;
     // Fetch recent flights for this ident to get aircraft_type
     const url = `https://aeroapi.flightaware.com/aeroapi/flights/${encodeURIComponent(ident)}?max_pages=1`;
@@ -7591,7 +7644,7 @@ async function checkSeatPreferenceAlerts(legs) {
             AND created_at > NOW() - INTERVAL '12 hours'
         `;
         if (recentAlerts.length > 0) continue;
-        const ident = (leg.carrier || "") + leg.flight_number;
+        const ident = flightid.apiKey(leg);
         // Try to get aircraft config from FlightAware, then infer seat layout
         let matchingSeats = [];
         let usedLiveData = false;
@@ -8140,8 +8193,8 @@ app.get("/trips/:tripId/risk", auth, async (req, res) => {
       risks.push({
         leg_a_id: legA.id,
         leg_b_id: legB.id,
-        leg_a_flight: (legA.carrier || "") + (legA.flight_number || ""),
-        leg_b_flight: (legB.carrier || "") + (legB.flight_number || ""),
+        leg_a_flight: flightid.displayName(legA),
+        leg_b_flight: flightid.displayName(legB),
         connection_airport: legA.destination,
         connection_minutes: connectionMins,
         risk_level: riskLevel,
@@ -8388,7 +8441,7 @@ app.post("/trips/:tripId/rescue", auth, requirePro, async (req, res) => {
     // Log rescue surfaced
     await logActivity(
       req.user.email, "rescue_surfaced",
-      `Rescue options for ${(leg.carrier || "") + (leg.flight_number || "")}`,
+      `Rescue options for ${flightid.displayName(leg)}`,
       `${options.length} rescue options found for your ${origin} → ${dest} disruption.`,
       tripId, disrupted_leg_id,
       { disruption_type, delay_minutes, options_count: options.length, source: duffelSource ? "duffel" : "estimate" }
@@ -8406,7 +8459,7 @@ app.post("/trips/:tripId/rescue", auth, requirePro, async (req, res) => {
     }));
 
     res.json({
-      disrupted_leg: { id: leg.id, flight: (leg.carrier || "") + (leg.flight_number || ""), origin, destination: dest },
+      disrupted_leg: { id: leg.id, flight: flightid.displayName(leg), origin, destination: dest },
       downstream_legs: downstreamLegs.length,
       downstream_legs_detail: downstreamLegSummaries,
       downstream_value_at_risk: downstreamValue,
@@ -8815,7 +8868,7 @@ async function runPreDepartureCron() {
           const already = await sql`SELECT id FROM departure_push_log WHERE user_email = ${leg.user_email} AND leg_id = ${leg.id} AND push_type = ${w.type}`;
           if (already.length > 0) continue;
           const route = `${leg.origin} → ${leg.destination}`;
-          const fl = leg.carrier && leg.flight_number ? `${leg.carrier}${leg.flight_number}` : route;
+          const fl = leg.carrier && leg.flight_number ? flightid.displayName(leg) : route;
           await sendPushToUser(leg.user_email, w.title(route, fl), w.body(route), { route: "Concierge", tripId: String(leg.trip_id), legId: String(leg.id), prefill: w.prefill(route) });
           await sql`INSERT INTO departure_push_log (user_email, leg_id, push_type) VALUES (${leg.user_email}, ${leg.id}, ${w.type}) ON CONFLICT DO NOTHING`;
           await logActivity(leg.user_email, "pre_departure_push", `${w.type} briefing sent for ${fl}`, `Departure briefing push sent for ${route}.`, leg.trip_id, leg.id);
@@ -9185,7 +9238,9 @@ app.post("/trips/:tripId/compensation/check", auth, async (req, res) => {
     const origin  = leg.origin || '';
     const dest    = leg.destination || '';
     const carrier = (leg.carrier || '').toUpperCase();
-    const flightIdent = carrier && leg.flight_number ? `${carrier}${leg.flight_number}` : (leg.flight_ident || '');
+    // EC261 compensation: this is quoted back to an airline, so it must be the KEY —
+    // "JL623", not "JAPAN AIRLINESJL 623", which is what .toUpperCase() was producing.
+    const flightIdent = flightid.apiKey(leg) || leg.flight_ident || '';
     const delayMins = delay_minutes || leg.delay_minutes || 0;
     const cancelled = disruption_type === 'cancelled' || leg.status === 'cancelled';
     const distanceKm = estimateDistanceKm(origin, dest);
@@ -10192,7 +10247,7 @@ async function runMorningBriefings() {
       if (daysAway > 14) continue;
       const name = user.first_name ? `, ${user.first_name}` : "";
       const dest = next.destination_city || next.destination || "your destination";
-      const ident = [next.carrier, next.flight_number].filter(Boolean).join("");
+      const ident = flightid.displayName(next) || "";   // a NAME — a person reads this
       const route = next.origin && next.destination ? `${next.origin} → ${next.destination}` : dest;
       const title = `Good morning${name}`;
       let body;
@@ -10563,7 +10618,7 @@ app.get("/journey/simulate", async (req, res) => {
     runningMins += securityMins;
     timeline.push({ icon: "🚶", label: `Walk to gate`, minutes: runningMins, duration: gateWalkMins, note: leg.gate ? `Gate ${leg.gate}` : "Gate TBC" });
     runningMins += gateWalkMins;
-    timeline.push({ icon: "✈️", label: `Board ${leg.carrier || ""}${leg.flight_number || ""}`, minutes: runningMins, duration: 0, note: `Departs ${new Date(leg.departs_at).toLocaleTimeString("en-US", { hour: "numeric", minute: "2-digit" })}` });
+    timeline.push({ icon: "✈️", label: `Board ${flightid.displayName(leg) || "your flight"}`, minutes: runningMins, duration: 0, note: `Departs ${new Date(leg.departs_at).toLocaleTimeString("en-US", { hour: "numeric", minute: "2-digit" })}` });
 
     // Buffer = time to departure minus all steps
     const totalStepMins = runningMins;
@@ -10589,7 +10644,7 @@ app.get("/journey/simulate", async (req, res) => {
 
     res.json({
       ok: true,
-      flight: { ident: (leg.carrier || "") + (leg.flight_number || ""), origin: leg.origin, destination: leg.destination, departs_at: leg.departs_at, gate: leg.gate },
+      flight: { ident: flightid.displayName(leg), origin: leg.origin, destination: leg.destination, departs_at: leg.departs_at, gate: leg.gate },
       buffer_minutes: bufferMinutes,
       mins_to_depart: minsToDepart,
       verdict,
@@ -10730,7 +10785,7 @@ app.get("/disruption/alternatives", async (req, res) => {
           data: { legId: dl.id, eventName, eventDate },
         });
       } else if (dl.type === "flight") {
-        const connIdent = (dl.carrier || "") + (dl.flight_number || "");
+        const connIdent = flightid.displayName(dl);
         const connRoute = dl.origin && dl.destination ? `${dl.origin}→${dl.destination}` : connIdent;
         const bufferMins = dlTime ? Math.round((dlTime.getTime() - (affectedTime.getTime() + (delayMins || 0) * 60000)) / 60000) : null;
         const isAtRisk = bufferMins !== null && bufferMins < 90;
@@ -10795,7 +10850,7 @@ app.get("/disruption/alternatives", async (req, res) => {
 
     res.json({
       ok: true,
-      flight: { ident: (leg.carrier || "") + (leg.flight_number || ""), origin: leg.origin, destination: leg.destination, status: leg.status, delay_minutes: delayMins },
+      flight: { ident: flightid.displayName(leg), origin: leg.origin, destination: leg.destination, status: leg.status, delay_minutes: delayMins },
       is_cancelled: isCancelled,
       alternatives,
       ec261,
@@ -10969,7 +11024,7 @@ app.post("/trips/:tripId/checklist/generate", auth, async (req, res) => {
       lastArr  ? `Returns: ${new Date(lastArr).toDateString()}`  : "",
       daysAway != null ? `Days until departure: ${daysAway}` : "",
       countries.length > 0 ? `Countries/cities: ${countries.join(", ")}` : "",
-      flightLegs.length > 0 ? `Flights: ${flightLegs.map(l => (l.carrier || "") + (l.flight_number || "") + " " + (l.origin || "") + "→" + (l.destination || "")).join(", ")}` : "",
+      flightLegs.length > 0 ? `Flights: ${flightLegs.map(l => flightid.displayName(l) + " " + (l.origin || "") + "→" + (l.destination || "")).join(", ")}` : "",
       eventLegs.length > 0 ? `Events/shows: ${eventLegs.map(l => l.carrier || l.destination_city || "event").join(", ")}` : "",
       trip.cabin_preference ? `Cabin: ${trip.cabin_preference}` : "",
       companionStr,
@@ -11157,7 +11212,7 @@ app.get("/trips/:tripId/show-nights", auth, async (req, res) => {
       const sameDay = flightLegs.find(f => f.departs_at && new Date(f.departs_at).toDateString() === evDay);
       if (sameDay) {
         sn.tight_day = true;
-        sn.tight_day_note = `You have a flight (${(sameDay.carrier || "") + (sameDay.flight_number || "")} ${sameDay.origin}→${sameDay.destination}) on the same day as this event. Arrive early.`;
+        sn.tight_day_note = `You have a flight (${flightid.displayName(sameDay)} ${sameDay.origin}→${sameDay.destination}) on the same day as this event. Arrive early.`;
       }
     }
 
@@ -11337,7 +11392,7 @@ app.get("/me/home-state", async (req, res) => {
     let liveStatus = null;
     if (activeLeg?.flight_number) {
       try {
-        const ident = (activeLeg.carrier || "") + activeLeg.flight_number;
+        const ident = flightid.apiKey(activeLeg);
         liveStatus = await getFlightStatus(ident);
       } catch {}
     }
@@ -11368,7 +11423,7 @@ app.get("/me/home-state", async (req, res) => {
     if (state === "at_airport" && activeLeg) {
       suggestions.push({ label: "Lounge access", icon: "🛋", route: "LoungeCards", prefill: null });
       suggestions.push({ label: "Security wait", icon: "🔒", route: "Concierge", prefill: `Security wait at ${activeLeg.origin} Terminal ${liveStatus?.terminal || activeLeg.terminal || ""}` });
-      suggestions.push({ label: "Journey timing", icon: "⏱", route: "JourneySimulator", prefill: null, params: { tripId: activeTrip?.id, legId: activeLeg.id, flightIdent: (activeLeg.carrier || "") + (activeLeg.flight_number || "") } });
+      suggestions.push({ label: "Journey timing", icon: "⏱", route: "JourneySimulator", prefill: null, params: { tripId: activeTrip?.id, legId: activeLeg.id, flightIdent: flightid.displayName(activeLeg) } });
       if (liveStatus?.gate) suggestions.push({ label: `Gate ${liveStatus.gate}`, icon: "🚪", route: "Concierge", prefill: `Directions to gate ${liveStatus.gate} at ${activeLeg.origin}` });
     } else if (state === "at_destination" && activeTrip) {
       suggestions.push({ label: "Get around", icon: "🚇", route: "Concierge", prefill: `How do I get around ${activeTrip.destination_city || "here"}?` });
@@ -11377,7 +11432,7 @@ app.get("/me/home-state", async (req, res) => {
     } else if (state === "pre_departure" && activeLeg) {
       const hoursStr = hoursToDepart > 24 ? `${Math.round(hoursToDepart / 24)}d` : `${Math.round(hoursToDepart)}h`;
       suggestions.push({ label: "Pack list", icon: "🧳", route: "Concierge", prefill: `Pack list for my ${activeLeg.destination} trip` });
-      suggestions.push({ label: "Journey timing", icon: "⏱", route: "JourneySimulator", prefill: null, params: { tripId: activeTrip?.id, legId: activeLeg.id, flightIdent: (activeLeg.carrier || "") + (activeLeg.flight_number || "") } });
+      suggestions.push({ label: "Journey timing", icon: "⏱", route: "JourneySimulator", prefill: null, params: { tripId: activeTrip?.id, legId: activeLeg.id, flightIdent: flightid.displayName(activeLeg) } });
       suggestions.push({ label: "Entry requirements", icon: "📋", route: "Concierge", prefill: `Entry requirements for ${activeLeg.destination}` });
       suggestions.push({ label: "Currency tips", icon: "💳", route: "Concierge", prefill: `Currency and payment tips for ${activeLeg.destination}` });
     } else if (state === "no_trip") {
@@ -11447,7 +11502,7 @@ app.get("/me/home-state", async (req, res) => {
       active_leg: activeLeg ? {
         id: activeLeg.id,
         trip_id: activeTrip?.id,
-        ident: (activeLeg.carrier || "") + (activeLeg.flight_number || ""),
+        ident: flightid.displayName(activeLeg),
         origin: activeLeg.origin,
         destination: activeLeg.destination,
         departs_at: activeLeg.departs_at,
@@ -11530,7 +11585,7 @@ async function runJourneyBufferCron() {
 
         if (bufferMins < 20) {
           // At risk — send push
-          const ident = (leg.carrier || "") + (leg.flight_number || "");
+          const ident = flightid.displayName(leg);
           const urgency = bufferMins < 0 ? "⚠️ You may miss" : bufferMins < 10 ? "⚠️ Very tight —" : "⏱ Heads up —";
           const pushTitle = `${urgency} ${ident}`;
           const pushBody = bufferMins < 0
@@ -12010,7 +12065,7 @@ cron.schedule("* * * * *", async () => {
             : `in ${diffD} days`;
           // Get live status
           try {
-            const ident = (nextFlight.carrier || "") + (nextFlight.flight_number || "");
+            const ident = flightid.apiKey(nextFlight);
             const status = await getFlightStatus(ident).catch(() => null);
             if (status?.delay > 300) {
               bodyParts.push(`${ident} is running ${Math.round(status.delay/60)} mins late.`);
@@ -12638,7 +12693,7 @@ app.get("/trips/:tripId/calendar.ics", auth, async (req, res) => {
       let description = "";
       let location = "";
       if (leg.type === "flight") {
-        summary = `${leg.carrier || ""}${leg.flight_number || ""} ${leg.origin || ""} → ${leg.destination || ""}`;
+        summary = `${flightid.displayName(leg) || ""} ${leg.origin || ""} → ${leg.destination || ""}`.trim();
         description = `Flight${leg.cabin_class ? " (" + leg.cabin_class + ")" : ""}${leg.seat ? ", Seat " + leg.seat : ""}${leg.confirmation ? ", Ref: " + leg.confirmation : ""}`;
         location = leg.origin || "";
       } else if (leg.type === "hotel" || leg.type === "airbnb") {

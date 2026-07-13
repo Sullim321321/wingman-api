@@ -11,6 +11,7 @@
 const forge = require("node-forge");
 const JSZip = require("jszip");
 const crypto = require("crypto");
+const flightid = require("./flightid");
 const fs = require("fs");
 const path = require("path");
 
@@ -64,7 +65,7 @@ function signManifest(manifestBuf, signerCertPem, keyPem, wwdrPem) {
 // Build the pass.json payload for a flight leg (falls back gracefully for non-flights).
 function passJsonForLeg(leg, trip) {
   const serial = `wingman-${leg.id}`;
-  const ident = `${leg.carrier || ""}${leg.flight_number || ""}`.trim();
+  const ident = flightid.displayName(leg).trim();
   const fmtDate = (d) => d ? new Date(d).toLocaleDateString("en-US", { month: "short", day: "numeric" }) : "—";
   const fmtTime = (d) => d ? new Date(d).toLocaleTimeString("en-US", { hour: "numeric", minute: "2-digit" }) : null;
 
