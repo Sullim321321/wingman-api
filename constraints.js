@@ -646,6 +646,18 @@ const CONSTRAINT_INVARIANTS = [
       LIMIT 5`,
   },
   {
+    name: "a PLANNED leg wearing a booking's clothes",
+    why: "THE most dangerous row this database can hold. A leg the planner sketched — state 'proposed' — must never carry a confirmation number, a flight number or a departure time, because those are exactly the fields that make a fiction indistinguishable from a fact to someone standing in an airport. The model WILL volunteer them; stripShape() throws them away. If one ever lands here, the strip failed and a user is about to be told they have a flight they do not have.",
+    query: (email) => sql`
+      SELECT tl.id, COALESCE(tl.property_name, tl.destination) AS detail,
+             tl.state, tl.confirmation, tl.flight_number
+      FROM trip_legs tl JOIN trips t ON t.id = tl.trip_id
+      WHERE t.user_email = ${email}
+        AND tl.state IN ('considered','proposed','held')
+        AND (tl.confirmation IS NOT NULL OR tl.flight_number IS NOT NULL)
+      LIMIT 5`,
+  },
+  {
     name: "booked commitment with no reason attached",
     why: "Not a crash — a diagnosis. Every booking Wingman cannot explain is one it cannot defend during a disruption. Expect this to be LARGE on the first run. That is the finding, not the failure.",
     soft: true,   // reported, does not fail the suite

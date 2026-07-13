@@ -19,6 +19,7 @@
 
 const Anthropic = require("@anthropic-ai/sdk");
 const graph = require("./constraints");
+const { link } = graph;
 
 // maxRetries covers the transport failures that are NOT the model's fault — the
 // "Premature close" class, where the connection dies mid-response. The default of 2
@@ -49,6 +50,35 @@ const TOOLS = [{
             summary: { type: "string" },
           },
           required: ["kind", "summary"],
+        },
+      },
+      // ── The SHAPE of the trip — not bookings. ────────────────────────────────
+      // This is the most dangerous field in the system.
+      //
+      // A model asked for "legs" will cheerfully produce JL 623, departing 11:40,
+      // confirmation ABC123 — a flight that does not exist, stored in the same table
+      // as flights that do, rendered by the same components, and shown to someone at
+      // an airport. Every failure this app has had is a milder version of that.
+      //
+      // So: shape, never bookings. A city, a span of nights, an intent. NO flight
+      // numbers, NO confirmations, NO times. Those can only come from Duffel or from
+      // the user's inbox — from the world, not from a language model. The schema below
+      // literally has nowhere to put them, and stripShape() throws them away if the
+      // model smuggles them in anyway.
+      shape: {
+        type: "array",
+        description: "The SHAPE of the trip so far — cities and spans, in order. Never a specific flight or a confirmation number: you are sketching, not booking.",
+        items: {
+          type: "object",
+          properties: {
+            kind:  { type: "string", enum: ["stay", "move", "event"] },
+            city:  { type: "string", description: "e.g. 'Kyoto'. For a move: the destination." },
+            from:  { type: "string", description: "For a move: the origin city." },
+            nights:{ type: "number", description: "For a stay." },
+            date:  { type: "string", description: "ISO date, ONLY if the user gave it or it's fixed by an event. Never guessed." },
+            why:   { type: "string", description: "Which constraint or intent puts this here. 'The Shanghai show on 9/24.'" },
+          },
+          required: ["kind", "city", "why"],
         },
       },
       constraints: {
@@ -232,6 +262,30 @@ async function readTurn({ turn, known = [], history = [], findings = null }) {
   };
 }
 
+// ── Fields a PLAN may never contain ──────────────────────────────────────────
+// A sketched leg must be structurally incapable of impersonating a booking. If the
+// model volunteers a flight number or a confirmation code — and it will, because it
+// is trying to be helpful — those are the exact fields that make a fiction look like
+// a fact to a person standing in an airport.
+//
+// The tool schema doesn't offer these fields. This throws them away when the model
+// invents them anyway. Belt and braces, because the cost of being wrong is someone
+// arriving for a flight that never existed.
+const FORBIDDEN_ON_A_PLAN = [
+  "flight_number", "carrier", "confirmation", "pnr", "booking_reference",
+  "departs_at", "arrives_at", "seat", "gate", "terminal", "record_locator",
+];
+
+function stripShape(leg) {
+  const clean = {};
+  for (const k of ["kind", "city", "from", "nights", "date", "why"]) {
+    if (leg[k] != null) clean[k] = leg[k];
+  }
+  const smuggled = FORBIDDEN_ON_A_PLAN.filter((k) => leg[k] != null);
+  if (smuggled.length) clean._stripped = smuggled;   // reported, never stored
+  return clean;
+}
+
 /**
  * Coerce whatever came back into a list.
  *
@@ -375,6 +429,82 @@ async function commit(sql, { user_email, trip_id, proposals, known = [] }) {
   return { written, refused, superseded, kept, proposed, duplicates, enriched };
 }
 
+/**
+ * Write the trip's SHAPE — the thing that makes Plan more than a chat log.
+ *
+ * Legs land at state 'proposed', booked_by 'wingman', with NO confirmation, NO flight
+ * number, NO times. They are the outline of a journey, not a claim about the world.
+ * The app must render them as visibly unbooked, and invariant #9 fails loudly if one
+ * ever acquires a confirmation without also becoming 'booked'.
+ *
+ * And each one gets `satisfies` edges: this stay exists BECAUSE of the Shanghai show,
+ * BECAUSE of the training block. That is the link no other travel app stores, and it
+ * is the whole reason the cascade can defend a trip later instead of merely rebooking it.
+ */
+async function shapeTrip(sql, { user_email, trip_id, shape = [], constraints = [] }) {
+  const legs = [], smuggled = [];
+
+  for (const raw of asArray(shape)) {
+    const leg = stripShape(raw);
+    if (leg._stripped) smuggled.push({ city: leg.city, fields: leg._stripped });
+    if (!leg.city) continue;
+
+    const type  = leg.kind === "stay" ? "hotel" : leg.kind === "move" ? "flight" : "activity";
+    const title = leg.kind === "stay"  ? `${leg.city}${leg.nights ? ` · ${leg.nights} nights` : ""}`
+                : leg.kind === "move"  ? `${leg.from || "?"} → ${leg.city}`
+                : leg.city;
+
+    // Idempotent: re-planning the same city must not stack up copies of it.
+    const [existing] = await sql`
+      SELECT id FROM trip_legs
+      WHERE trip_id = ${trip_id} AND state = 'proposed'
+        AND type = ${type} AND COALESCE(property_name, destination) = ${title}
+      LIMIT 1`;
+
+    let legId;
+    if (existing) {
+      legId = existing.id;
+    } else {
+      const [row] = await sql`
+        INSERT INTO trip_legs
+          (trip_id, type, destination, destination_city, property_name, nights,
+           departs_at, state, booked_by, raw_data)
+        VALUES
+          (${trip_id}, ${type}, ${title}, ${leg.city},
+           ${leg.kind === "stay" ? title : null}, ${leg.nights || null},
+           ${leg.date || null}::TIMESTAMPTZ,          -- only if the USER fixed it
+           'proposed', 'wingman',
+           ${JSON.stringify({ why: leg.why, planned: true })}::jsonb)
+        RETURNING id`;
+      legId = row.id;
+    }
+    legs.push({ id: legId, title, city: leg.city, why: leg.why, type });
+
+    // ── the reason edge ──────────────────────────────────────────────────────
+    // Match the leg's stated `why` back to the constraints it serves. Conservative on
+    // purpose: a wrong reason is worse than no reason, because a wrong reason is what
+    // the rescue engine will later defend.
+    const words = String(leg.why || "").toLowerCase();
+    for (const c of constraints) {
+      const r = String(c.rationale || "").toLowerCase();
+      const hit =
+        (c.scope && leg.city && c.scope.toLowerCase() === leg.city.toLowerCase()) ||
+        (r && leg.city && r.includes(leg.city.toLowerCase())) ||
+        (words && r && words.split(/\W+/).filter((w) => w.length > 4).some((w) => r.includes(w)));
+      if (hit) await link(sql, legId, c.id, 1.0, leg.why || null);
+    }
+  }
+  return { legs, smuggled };
+}
+
+/** A trip called "Untitled trip" is a trip nobody will open. */
+function titleFor(shape = [], fallback = "Untitled trip") {
+  const cities = [...new Set(asArray(shape).map((s) => s.city).filter(Boolean))];
+  if (!cities.length) return fallback;
+  if (cities.length <= 3) return cities.join(" → ");
+  return `${cities[0]} → ${cities[cities.length - 1]} · ${cities.length} stops`;
+}
+
 // ── converse() — the Plan tab's engine ────────────────────────────────────────
 //
 // readTurn() only listens. A planner has to ANSWER: recommend, push back, and ask
@@ -456,6 +586,7 @@ async function converse({ message, known = [], history = [], findings = null }) 
     reply,
     intents: asArray(out.intents),
     constraints: asArray(out.constraints).map(normalize),
+    shape: asArray(out.shape).map(stripShape),
     gaps,
     usage: res.usage,
   };
@@ -463,5 +594,6 @@ async function converse({ message, known = [], history = [], findings = null }) 
 
 module.exports = {
   readTurn, converse, commit, research, coverage,
+  shapeTrip, titleFor, stripShape, FORBIDDEN_ON_A_PLAN,
   normalize, asArray, NEEDS_LOOKUP, MODEL, RESEARCH_MODEL,
 };

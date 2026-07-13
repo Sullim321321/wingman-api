@@ -12975,11 +12975,42 @@ app.post("/plan/message", conciergeLimiter, async (req, res) => {
 
     const live = await graph.constraintsFor(sql, { user_email: email, trip_id });
 
+    // ── Close the loop: the conversation becomes a trip ───────────────────────
+    // Legs land as 'proposed' — a shape, not a booking. No flight numbers, no
+    // confirmations, no times we weren't given. And each is linked to the constraints
+    // it exists to serve, which is the edge that lets the cascade DEFEND this trip
+    // later rather than merely rebook it.
+    const shaped = await planner.shapeTrip(sql, {
+      user_email: email, trip_id, shape: out.shape, constraints: live,
+    });
+
+    if (shaped.smuggled.length) {
+      // The model tried to hand us a flight number on a trip nobody has booked.
+      // Stripped, and logged loudly — this is the single most dangerous thing it can do.
+      console.warn("[plan] STRIPPED invented booking fields:", JSON.stringify(shaped.smuggled));
+    }
+
+    // A trip called "Untitled trip" is a trip nobody opens.
+    if (shaped.legs.length) {
+      const title = planner.titleFor(out.shape);
+      if (title !== "Untitled trip") {
+        await sql`UPDATE trips SET title = ${title}, updated_at = NOW()
+                  WHERE id = ${trip_id} AND user_email = ${email}`;
+      }
+    }
+
+    const legs = await sql`
+      SELECT id, type, destination, destination_city, property_name, nights,
+             departs_at, state, raw_data
+      FROM trip_legs WHERE trip_id = ${trip_id} ORDER BY id`;
+
     res.json({
       trip_id,
       reply: out.reply,
       gaps: out.gaps,
       constraints: live,
+      legs,
+      shaped: shaped.legs,
       added: wrote.written.map((w) => ({ id: w.id, rationale: w.rationale, hardness: w.hardness, status: w.status, scope: w.scope })),
       proposed: wrote.proposed.map((p) => ({ id: p.id, rationale: p.rationale, hardness: p.hardness })),
       kept: wrote.kept,

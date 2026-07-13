@@ -196,6 +196,35 @@ async function is(what, actual, expected) {
   await is("...and Wingman can NAME what Aman costs you", aman2.lost.map((l) => l.id), [11]);
   console.log(`      ${d}"${aman2.lost[0].rationale}" — the exact reason the transcript chose Palace.${x}`);
 
+  console.log(`\n${b}A plan may never impersonate a booking${x}`);
+  console.log(`${d}──────────────────────────────────────────────────────────${x}`);
+
+  // The single most dangerous thing this system can produce: a flight that does not
+  // exist, stored in the same table as flights that do, rendered by the same
+  // components, shown to someone standing in an airport.
+  //
+  // A model asked to sketch a trip WILL volunteer a flight number — it is trying to be
+  // helpful. The tool schema doesn't offer the field; stripShape throws it away if the
+  // model invents it anyway; and invariant #9 fails loudly if one ever reaches the
+  // table. Three layers, because being wrong here means a person misses a flight they
+  // were told they had.
+  const planner = require("./planner");
+  const eager = {
+    kind: "move", city: "Shanghai", from: "London", why: "The 9/24 show",
+    flight_number: "LH 726", carrier: "Lufthansa", confirmation: "XK4P2Q",
+    departs_at: "2026-09-22T11:40:00Z", seat: "2A", gate: "C14",
+  };
+  const clean = planner.stripShape(eager);
+
+  await is("a sketched leg keeps its city",           clean.city, "Shanghai");
+  await is("...and keeps the REASON it exists",       clean.why, "The 9/24 show");
+  await is("...but the flight number is stripped",    clean.flight_number, undefined);
+  await is("...and the confirmation is stripped",     clean.confirmation, undefined);
+  await is("...and the departure time is stripped",   clean.departs_at, undefined);
+  await is("...and the seat and gate are stripped",   [clean.seat, clean.gate].join(","), ",");
+  await is("...and the smuggling is REPORTED, loudly", clean._stripped.length > 0, true);
+  console.log(`      ${d}stripped: ${clean._stripped.join(", ")}${x}`);
+
   console.log(`\n${d}──────────────────────────────────────────────────────────${x}`);
   console.log(`${fail === 0 ? g + "all " + pass + " held" : r + fail + " FAILED, " + pass + " held"}${x}\n`);
   process.exit(fail === 0 ? 0 : 1);
