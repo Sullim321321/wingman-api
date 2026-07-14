@@ -7034,7 +7034,7 @@ async function silentAutonomyRebook(leg, newStatus, delaySeconds) {
         leg.user_email,
         `✈ Auto-rebook paused — price above your limit`,
         `Best alternative for ${leg.origin}→${leg.destination} is $${price.toFixed(0)}, above your $${threshold} auto-approve limit. Tap to review.`,
-        { route: "Alert", tripId: String(leg.trip_id), legId: String(leg.id) }
+        { route: "Situation", tripId: String(leg.trip_id), legId: String(leg.id) }
       );
       await logActivity(
         leg.user_email, "auto_rebook_paused",
@@ -7055,7 +7055,7 @@ async function silentAutonomyRebook(leg, newStatus, delaySeconds) {
         leg.user_email,
         `✈ Wingman found a rescue flight`,
         `${leg.origin}→${leg.destination} — ${bestOffer.owner?.name || ""} for $${price.toFixed(0)}. Add your traveler details in Settings to enable auto-booking.`,
-        { route: "Alert", tripId: String(leg.trip_id), legId: String(leg.id), duffel_offer_id: bestOffer.id }
+        { route: "Situation", tripId: String(leg.trip_id), legId: String(leg.id), duffel_offer_id: bestOffer.id }
       );
       return;
     }
@@ -7114,7 +7114,7 @@ async function silentAutonomyRebook(leg, newStatus, delaySeconds) {
       leg.user_email,
       `✅ Wingman auto-rebooked you`,
       `New flight booked: ${orderData.booking_reference} for $${price.toFixed(0)}. Check your email for the confirmation.`,
-      { route: "Activity", tripId: String(leg.trip_id) }
+      { route: "Intelligence", tripId: String(leg.trip_id) }
     );
 
     console.log(`[silent-autonomy] Auto-rebooked leg ${leg.id} → Duffel order ${orderData.id} (${orderData.booking_reference})`);
@@ -7706,7 +7706,7 @@ async function checkSeatPreferenceAlerts(legs) {
             usedLiveData
               ? `${best.count} ${best.label} seat${best.count !== 1 ? "s" : ""} available on ${leg.origin} → ${leg.destination}. Tap to check.`
               : `Your preferred seat may be available on ${leg.origin} → ${leg.destination}. Tap to check.`,
-            { route: "Activity", legId: leg.id }
+            { route: "Situation", legId: String(leg.id), delay: "0" }
           );
         } else if (!usedLiveData) {
           // No live data available — fall back to reminder
@@ -7721,7 +7721,7 @@ async function checkSeatPreferenceAlerts(legs) {
             userEmail,
             `🪑 Check your seat on ${ident}`,
             `Your preferred seat may be available on ${leg.origin} → ${leg.destination}. Tap to check.`,
-            { route: "Activity" }
+            { route: "Intelligence" }
           );
         }
       }
