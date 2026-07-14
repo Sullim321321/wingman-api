@@ -13562,6 +13562,88 @@ app.get("/plan/:tripId", async (req, res) => {
   }
 });
 
+// ═══════════════════════════════════════════════════════════════════════════
+// GET /ledger — what Wingman did, and what it was protecting when it did it.
+//
+// This replaces Insights, which showed "$430 total value protected · 48 trips tracked ·
+// 23m avg time saved." Those numbers have two problems. The small one: three of the four
+// are vanity. The large one: "avg time saved" is a claim about a counterfactual that
+// was never measured — it is the system asserting a fact it has no evidence for, which
+// is the exact failure this codebase has spent months eradicating everywhere else.
+//
+// The ledger asserts nothing it cannot show. Every row is a decision that actually
+// happened, the reason it was taken, and the named constraints it was defending. If
+// Wingman cannot say what it was protecting, `deliberate()` refuses to record the
+// decision at all — so an empty ledger is an honest one, and a full ledger is proof.
+//
+// No aggregates. No averages. No "value protected." Just: here is what I did, and here
+// is why. A chief of staff's worth is not a dashboard; it is a record.
+// ═══════════════════════════════════════════════════════════════════════════
+app.get("/ledger", async (req, res) => {
+  const email = await verifyAccessToken(req);
+  if (!email) return res.status(401).json({ error: "unauthorized" });
+  try {
+    const rows = await sql`
+      SELECT d.id, d.question, d.chose, d.because, d.protecting, d.by, d.created_at,
+             d.trip_id, t.title AS trip_title,
+             d.commitment_id,
+             tl.type AS leg_type, tl.carrier, tl.flight_number,
+             tl.origin, tl.destination, tl.property_name, tl.destination_city
+      FROM deliberations d
+      LEFT JOIN trips t     ON t.id  = d.trip_id
+      LEFT JOIN trip_legs tl ON tl.id = d.commitment_id
+      WHERE d.user_email = ${email}
+      ORDER BY d.created_at DESC
+      LIMIT 100`;
+
+    // Resolve the constraint IDs in `protecting` into the actual sentences you said.
+    // "It protected constraint 47" is not a thing anyone can read. "It protected
+    // 'Kikunoi at 8 — booked three months ago'" is the entire point.
+    const ids = [...new Set(rows.flatMap((r) => (Array.isArray(r.protecting) ? r.protecting : [])))]
+      .map(Number).filter(Number.isFinite);
+
+    let byId = {};
+    if (ids.length) {
+      const cs = await sql`
+        SELECT id, rationale, kind, hardness, source
+        FROM constraints
+        WHERE user_email = ${email} AND id = ANY(${ids})`;
+      byId = Object.fromEntries(cs.map((c) => [c.id, c]));
+    }
+
+    const entries = rows.map((r) => ({
+      id: r.id,
+      by: r.by,                       // 'wingman' — it acted alone. 'you' — you chose.
+      question: r.question,
+      chose: r.chose,
+      because: r.because,
+      at: r.created_at,
+      trip: r.trip_title || null,
+      what: r.leg_type === "flight"
+        ? [flightid.displayName(r), [r.origin, r.destination].filter(Boolean).join(" → ")]
+            .filter(Boolean).join(" · ")
+        : (r.property_name || r.destination_city || null),
+      // The reasons, in your own words. Unresolvable ids are DROPPED, not rendered as
+      // "constraint 47" — a broken reference is worse than a missing one.
+      protecting: (Array.isArray(r.protecting) ? r.protecting : [])
+        .map((cid) => byId[Number(cid)])
+        .filter(Boolean)
+        .map((c) => ({ id: c.id, what: c.rationale || c.kind, hardness: c.hardness })),
+    }));
+
+    res.json({
+      entries,
+      // Two counts, and they are the only two that are true by construction:
+      // how many times Wingman acted alone, and how many times it handed the call back.
+      acted_alone: entries.filter((e) => e.by === "wingman").length,
+      handed_back: entries.filter((e) => e.by !== "wingman").length,
+    });
+  } catch (e) {
+    console.error("[ledger]", e.message);
+    res.status(500).json({ error: e.message });
+  }
+});
+
 // GET /me/constraints — what Wingman believes is always true of you.
 //
 // These apply to every trip, which is exactly why they don't belong on the Plan screen:
