@@ -568,16 +568,74 @@ A status update is not an answer. "Let me check the exact dates" followed by "Ye
 
 ALWAYS REPLY IN TEXT. Even when you record constraints, say something. A tool call with no words is a silent turn, and a silent turn reads as a broken app.`;
 
-async function converse({ message, known = [], history = [], findings = null }) {
+async function converse({ message, known = [], history = [], findings = null, now = null, timezone = null }) {
   const gaps = coverage(known);
   const knownList = known.length
     ? known.map((c) => `- [${c.hardness}${c.scope ? "/@" + c.scope : ""}] ${c.rationale}`).join("\n")
     : "(nothing yet — this is the start)";
 
+  // ── THE PLANNER HAD NO CLOCK. ────────────────────────────────────────────────
+  // She said "Nashville Thursday", then "7.16.26". Wingman asked: "Is that July 17–19,
+  // or are you saying the 16th is the Thursday?" July 16 2026 IS a Thursday. It could
+  // not check, so it guessed — and guessed wrong, at the user, about the one fact the
+  // whole trip hangs on.
+  //
+  // Worse: with no date it cannot tell a date in the past from a date next year, and it
+  // will happily record "flying 16 July" as a constraint for a day that has already been.
+  //
+  // The clock comes from the DEVICE, not from Render — Render runs UTC, and at 6:30am
+  // Pacific that is already tomorrow afternoon somewhere. This is the same bug the
+  // concierge had when it offered her dinner at breakfast.
+  //
+  // NOTE the cache_control below: this header changes daily, so it is placed in its own
+  // block AFTER the cached prompt, or it would bust the cache on every single turn.
+  const d = now ? new Date(now) : new Date();
+  const clock = isNaN(d) ? new Date() : d;
+  const tz = timezone || "UTC";
+  const fmt = (dt, opts) => dt.toLocaleDateString("en-US", { timeZone: tz, ...opts });
+
+  // ── DON'T ASK THE MODEL TO DO CALENDAR ARITHMETIC. GIVE IT THE CALENDAR. ─────
+  //
+  // v1 of this fix told the model "TODAY IS Tuesday, July 14, 2026" and asked it to
+  // work out weekdays itself. It then recorded "Trip starts Thursday, July 17" — which
+  // is a Friday — as a MUST. Told the right date, it still got the day wrong, because
+  // date arithmetic is precisely the thing language models are worst at, and I had
+  // handed it a puzzle when I could have handed it the answer.
+  //
+  // That is the same mistake as the NEEDS_LOOKUP regex: building a system where the
+  // only available move is to guess, and then being surprised that it guessed. If a
+  // fact is computable, COMPUTE IT. Never make the model derive something a two-line
+  // loop can state.
+  const cal = [];
+  for (let k = 0; k < 21; k++) {
+    const dt = new Date(clock.getTime() + k * 86400000);
+    const iso = new Intl.DateTimeFormat("en-CA", { timeZone: tz }).format(dt); // YYYY-MM-DD
+    cal.push(
+      `${k === 0 ? "TODAY    " : k === 1 ? "TOMORROW " : "         "}` +
+      `${fmt(dt, { weekday: "long" }).padEnd(10)} ${iso}`
+    );
+  }
+
+  const dated =
+    `TODAY IS ${fmt(clock, { weekday: "long", year: "numeric", month: "long", day: "numeric" })}` +
+    `${timezone ? ` (${timezone})` : ""}.\n\n` +
+    `THE NEXT THREE WEEKS — do not compute these, READ them:\n${cal.join("\n")}\n\n` +
+    `Rules:\n` +
+    `- NEVER work out a weekday yourself. It is in the table above. Look it up.\n` +
+    `- NEVER ask the user which day of the week a date falls on. You have the calendar.\n` +
+    `- "Thursday" with no other qualifier means the NEXT Thursday in that table.\n` +
+    `- If a date the user gives you is not in the table and is in the past, it is a typo ` +
+    `or they mean next year. ASK. Never record a trip into a day that has already been.\n` +
+    `- When you record a date constraint, use the ISO date from this table, and state ` +
+    `the weekday from this table. If those two disagree, you have made an error.`;
+
   const res = await anthropic.messages.create({
     model: MODEL,
     max_tokens: 2000,
-    system: [{ type: "text", text: CONVERSE_SYSTEM + "\n\n" + SYSTEM, cache_control: { type: "ephemeral" } }],
+    system: [
+      { type: "text", text: CONVERSE_SYSTEM + "\n\n" + SYSTEM, cache_control: { type: "ephemeral" } },
+      { type: "text", text: dated },
+    ],
     // ── Give it a real way to look things up ───────────────────────────────────
     // Research used to be gated by a REGEX I wrote in advance — NEEDS_LOOKUP. Which
     // means it could only check the things I had thought of. Ask it about a band's

@@ -13453,7 +13453,9 @@ app.post("/plan/message", conciergeLimiter, async (req, res) => {
   const email = await verifyAccessToken(req);
   if (!email) return res.status(401).json({ error: "unauthorized" });
 
-  const { message: raw, tripId, history = [] } = req.body || {};
+  // `now` and `timezone` come from the PHONE. Render runs in UTC, and a planner that
+  // reads its clock from the datacentre will tell you the 16th isn't a Thursday.
+  const { message: raw, tripId, history = [], now = null, timezone = null } = req.body || {};
   if (!raw) return res.status(400).json({ error: "message required" });
   const message = scrubPII(raw);
 
@@ -13477,7 +13479,7 @@ app.post("/plan/message", conciergeLimiter, async (req, res) => {
     // I wrote in advance happens to match. The regex missed "LANY Sept 26 to Oct 17",
     // no search ran, and the model announced it had the tour dates anyway. A filter
     // that decides what needs checking can only ever check what its author imagined.
-    const out = await planner.converse({ message, known, history });
+    const out = await planner.converse({ message, known, history, now, timezone });
     const wrote = await planner.commit(sql, {
       user_email: email, trip_id, proposals: out, known,
     });
