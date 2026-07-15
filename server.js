@@ -13191,10 +13191,29 @@ app.get("/situation/:legId", auth, async (req, res) => {
       user_email: email, trip_id: leg.trip_id,
     });
 
+    // ── WHAT I ALREADY HANDLED ───────────────────────────────────────────────
+    // The deck's promise is that the work is done BEFORE you arrive at this screen.
+    // The screen was opening with the damage — "three things won't survive" — when it
+    // should open with what Wingman already did about it on its own. A chief of staff
+    // leads with "handled," not with "here's the fire."
+    //
+    // These are the autonomous decisions (by='wingman') on this trip, most recent first.
+    // If there are none, the screen simply doesn't show the block — it does not invent
+    // a reassurance it can't back, which is the whole discipline.
+    const handledRows = await sql`
+      SELECT question, chose, because, created_at
+      FROM deliberations
+      WHERE user_email = ${email} AND trip_id = ${leg.trip_id} AND by = 'wingman'
+      ORDER BY created_at DESC
+      LIMIT 5`;
+
     res.json({
       leg, delay,
       nodes,
       constraints,
+      already_handled: handledRows.map((h) => ({
+        did: h.chose, why: h.because, at: h.created_at,
+      })),
       summary: {
         broken:  nodes.filter((n) => n.verdict === "broken").length,
         at_risk: nodes.filter((n) => n.verdict === "at_risk").length,
