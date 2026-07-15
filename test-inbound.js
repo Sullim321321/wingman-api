@@ -23,8 +23,14 @@ function inbound({ headers = {}, query = {}, body = {} }) {
   const b = Buffer.from(SECRET);
   if (a.length !== b.length || !crypto.timingSafeEqual(a, b)) return { status: 401, wrote: null };
 
-  const toRaw = body.to || body.envelope?.to || body.recipient || "";
-  const m = String(Array.isArray(toRaw) ? toRaw.join(",") : toRaw).toLowerCase().match(/\+([a-z0-9]{16,})@/);
+  // Search EVERY recipient field, concatenated — not just the first truthy one.
+  // (Matches the endpoint after the auto-forward fix.)
+  const flat = (v) => (Array.isArray(v) ? v.join(",") : (v == null ? "" : String(v)));
+  const allRecipients = [
+    body.to, body.envelope?.to, body.recipient, body.cc, body.bcc,
+    body["envelope-to"], body.delivered_to, body["delivered-to"],
+  ].map(flat).join(",").toLowerCase();
+  const m = allRecipients.match(/\+([a-z0-9]{16,})@/);
   const token = m ? m[1] : null;
   if (!token) return { status: 200, wrote: null, reason: "no token" };
 
@@ -87,6 +93,26 @@ allows("...even forwarded from a DIFFERENT address", inbound({
   // Her assistant forwards it, or she sends from her work account. Identity comes
   // from the token, so this just works — and it couldn't, when identity came from From:.
   body: { from: "someone.else@work.com", to: "import+a1b2c3d4e5f60718@wingmantravel.app", text: "x".repeat(50) },
+}), "maddie@example.com");
+
+// The one that was silently broken: a Gmail AUTO-FORWARD filter. The header `To:` is
+// still the user's OWN address; the import address is only the envelope recipient. The
+// old code read `body.to` first and never looked at envelope.to — so the automatic
+// path, the one people set up once and rely on, failed every time while manual forwards
+// worked. This is the case that most needs to pass, and the one no manual test finds.
+allows("a Gmail AUTO-FORWARD (token only in the envelope, not the To: header)", inbound({
+  headers: { "x-wingman-inbound-secret": SECRET },
+  body: {
+    from: "united@united.com",
+    to: "maddie@example.com",                                    // her own address
+    envelope: { to: "import+a1b2c3d4e5f60718@wingmantravel.app" }, // token lives here
+    text: "x".repeat(50),
+  },
+}), "maddie@example.com");
+
+allows("...and a provider that only sets Delivered-To", inbound({
+  headers: { "x-wingman-inbound-secret": SECRET },
+  body: { from: "united@united.com", "delivered-to": "import+a1b2c3d4e5f60718@wingmantravel.app", text: "x".repeat(50) },
 }), "maddie@example.com");
 
 console.log(`\n${d}──────────────────────────────────────────────────────────${x}`);

@@ -3662,7 +3662,6 @@ app.post("/inbound/email", async (req, res) => {
   }
 
   const from    = mail.from    || mail.envelope?.from || mail.sender || "";
-  const toRaw   = mail.to      || mail.envelope?.to   || mail.recipient || "";
   const subject = mail.subject || "";
   const text    = mail.text    || mail.plain || mail["body-plain"] || "";
   const html    = mail.html    || mail["body-html"] || "";
@@ -3670,16 +3669,34 @@ app.post("/inbound/email", async (req, res) => {
   const senderMatch = String(from).match(/[a-zA-Z0-9._%+\-]+@[a-zA-Z0-9.\-]+\.[a-zA-Z]{2,}/);
   const senderEmail = senderMatch ? senderMatch[0].toLowerCase() : null;
 
+  // Log that SOMETHING arrived, before we judge it. When forwarding fails, the first
+  // question is always "did the webhook even fire" — and a silent success on a rejected
+  // message is exactly the failure this whole project hunts. So: one line per delivery,
+  // always, with the shape we actually received.
+  const flat = (v) => (Array.isArray(v) ? v.join(",") : (v == null ? "" : String(v)));
+  console.log(`[inbound] recv evt=${evt || "none"} from=${senderEmail || "?"} bodyLen=${(text || html || "").length}`);
+
   // ── 2. Who is this? The TOKEN says so — not the From: line. ────────────────
   // import+a1b2c3…@wingmantravel.app  →  the part after the '+' is the user's secret.
-  const tokenMatch = String(Array.isArray(toRaw) ? toRaw.join(",") : toRaw)
-    .toLowerCase()
-    .match(/\+([a-z0-9]{16,})@/);
+  //
+  // Search EVERY recipient field concatenated, not just the first truthy one. On a Gmail
+  // AUTO-FORWARD filter the header `To:` is still the user's own address — the import
+  // address is only the *envelope* recipient. The old code took `mail.to` first and never
+  // looked at envelope.to, so every auto-forwarded booking failed with "no token." A
+  // manual forward happened to work; the automatic path — the one people actually set up
+  // once and rely on — was quietly broken.
+  const allRecipients = [
+    mail.to, mail.envelope?.to, mail.recipient, mail.cc, mail.bcc,
+    mail["envelope-to"], mail.delivered_to, mail["delivered-to"],
+  ].map(flat).join(",").toLowerCase();
+
+  const tokenMatch = allRecipients.match(/\+([a-z0-9]{16,})@/);
   const token = tokenMatch ? tokenMatch[1] : null;
 
   if (!token) {
-    console.warn("[inbound/email] rejected: no per-user token in recipient address");
-    return res.status(200).json({ ok: false, reason: "no token" });
+    // Say what we actually got, so the Render log pinpoints it instead of just "no token."
+    console.warn(`[inbound] rejected: no token in recipients → "${allRecipients.slice(0, 200)}"`);
+    return res.status(200).json({ ok: false, reason: "no token", recipients_seen: allRecipients.slice(0, 200) });
   }
 
   let userEmail = null;
@@ -3691,24 +3708,41 @@ app.post("/inbound/email", async (req, res) => {
   }
 
   if (!userEmail) {
-    console.warn("[inbound/email] rejected: token matched no user");
+    console.warn(`[inbound] rejected: token ${token.slice(0, 6)}… matched no user`);
     return res.status(200).json({ ok: false, reason: "unknown token" });
   }
 
-  // Build the body to parse — prefer plain text, fall back to HTML stripped of tags
-  const body = text.trim() ||
-    html.replace(/<[^>]+>/g, " ").replace(/\s{2,}/g, " ").trim();
+  // Build the body to parse. Prefer plain text; fall back to HTML with a real strip.
+  //
+  // The old strip was `replace(/<[^>]+>/g, " ")` — which turns a forwarded confirmation's
+  // <style> and <script> blocks into a wall of CSS the parser then chokes on, and glues
+  // words together where a tag was the only separator. A booking email forwarded from
+  // Gmail is almost always HTML, so this path is the common case, not the fallback.
+  const htmlToText = (h) => h
+    .replace(/<(script|style|head)[\s\S]*?<\/\1>/gi, " ")  // kill non-content blocks first
+    .replace(/<br\s*\/?>/gi, "\n")
+    .replace(/<\/(p|div|tr|li|h[1-6])>/gi, "\n")            // block ends → line breaks
+    .replace(/<[^>]+>/g, " ")
+    .replace(/&nbsp;/gi, " ").replace(/&amp;/gi, "&")
+    .replace(/&lt;/gi, "<").replace(/&gt;/gi, ">")
+    .replace(/[ \t]{2,}/g, " ").replace(/\n{3,}/g, "\n\n").trim();
+
+  const body = text.trim() || htmlToText(html);
 
   if (body.length < 20) {
-    return res.status(200).json({ ok: false, reason: "body too short" });
+    // This is the "forwarded as attachment" / empty-body case. Say so explicitly, with
+    // the lengths, so the log tells you whether the email arrived without a readable body
+    // versus not arriving at all.
+    console.warn(`[inbound] rejected: body too short (text=${text.length}, html=${html.length}) for ${userEmail}`);
+    return res.status(200).json({ ok: false, reason: "body too short", text_len: text.length, html_len: html.length });
   }
 
   try {
     const count = await parsePastedEmailBody(userEmail, `Subject: ${subject}\n\n${body}`, "email_forward");
-    console.log(`[inbound/email] token→${userEmail} (from ${senderEmail || "unknown"}): ${count} booking(s)`);
+    console.log(`[inbound] OK token→${userEmail} (from ${senderEmail || "unknown"}): ${count} booking(s)`);
     return res.status(200).json({ ok: true, bookings_created: count });
   } catch (e) {
-    console.error("[inbound/email] parse error:", e.message);
+    console.error("[inbound] parse error:", e.message);
     return res.status(200).json({ ok: false, reason: e.message });
   }
 });
@@ -13664,8 +13698,22 @@ app.post("/plan/message", conciergeLimiter, async (req, res) => {
       refused: wrote.refused.map((r) => ({ rationale: r.rationale, why: r.why })),
     });
   } catch (e) {
-    console.error("[plan/message]", e.message);
-    res.status(500).json({ error: "plan_failed", detail: e.message });
+    console.error("[plan/message]", e.status, e.message);
+    // "plan_failed" told the user nothing and made them guess — is it my code, the
+    // network, or the Anthropic account? Name the actual cause. The most common one in
+    // a dev account is a drained credit balance; the model returns 400/429, and that is
+    // NOT a bug in the app, so the app should say so rather than showing a red error box
+    // that looks like something broke.
+    const raw = String(e.message || "");
+    const credits = e.status === 402 || /credit balance|billing|quota|insufficient/i.test(raw);
+    const rate    = e.status === 429 || /rate limit|overloaded/i.test(raw);
+    const msg = credits
+      ? "Wingman's AI credits have run out — this isn't a fault in the app. Top up the Anthropic account and try again."
+      : rate
+      ? "The planner is being rate-limited right now. Give it a few seconds and try again."
+      : "The planner couldn't reach its model just now. Try again in a moment.";
+    // NOT 402 — that status is the app's Pro-upgrade gate, and this is not that.
+    res.status(503).json({ error: "plan_failed", reason: msg, detail: raw });
   }
 });
 
