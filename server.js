@@ -6046,6 +6046,30 @@ app.get("/flight-status", async (req, res) => {
 
 // GET /flight-status-public — no auth required (used by home screen tracker for new users)
 // ---------------------------------------------------------------------------
+// GET /duffel-mode — reports whether the Duffel key is TEST or LIVE, WITHOUT exposing it.
+//
+// This exists so nobody ever has to look at the key to answer "will booking produce a
+// real ticket." A test key returns a confirmation number and no seat — the app would say
+// it worked, and you'd learn otherwise at the gate. The safe way to know which you have
+// is to ask the system that holds it, not to reveal it. Returns only the mode; never a
+// character of the value.
+app.get("/duffel-mode", (_req, res) => {
+  const k = process.env.DUFFEL_API_KEY || "";
+  const mode = !k ? "not_set"
+    : k.startsWith("duffel_test_") ? "test"
+    : k.startsWith("duffel_live_") ? "live"
+    : "unrecognised";
+  res.json({
+    duffel_mode: mode,
+    books_real_tickets: mode === "live",
+    note: mode === "test"
+      ? "Bookings will succeed with a confirmation number and NO seat. Do not book real travel through the app."
+      : mode === "live"
+      ? "Bookings are real and will charge the account on file."
+      : "Key missing or in an unexpected format.",
+  });
+});
+
 app.get("/flight-status-public", async (req, res) => {
   const ident = String(req.query.ident || "").toUpperCase().replace(/\s/g, "");
   if (!ident) return res.status(400).json({ error: "ident required" });
