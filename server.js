@@ -6092,6 +6092,93 @@ app.get("/flight-status/:ident", async (req, res) => {
 });
 // ---------------------------------------------------------------------------
 // POST /trips/:id/refresh — refresh all leg statuses for a trip
+// GET /trips/:id/dossier — the trip as one document, with its dependency spine.
+//
+// Trip detail is a database dump: cards inside cards, one per booking, in a list. The
+// dossier is the thing no other travel app can show — because no other app kept the
+// graph. Every booking that hangs off a flight carries its dependency in plain words:
+// "depends on JL 623 · 40 min of slack." That line is the whole product, made legible.
+//
+// Four chapters, because a trip has four phases and they want different things from you:
+//   plan      — nothing time-fixed yet; still sketch (proposed legs, undated stays)
+//   prepare   — booked and dated, before you leave
+//   in_motion — happening now (between first departure and last arrival)
+//   after     — done
+//
+// The chapters are derived from the DATA, never asserted. A leg with no date can't be
+// "prepare"; a proposed leg can't be "after". If we can't place it, it goes to plan —
+// the honest default, because a sketch is what an unplaceable thing actually is.
+app.get("/trips/:id/dossier", async (req, res) => {
+  const email = await verifyAccessToken(req);
+  if (!email) return res.status(401).json({ error: "unauthorized" });
+  try {
+    const tripId = parseInt(req.params.id, 10);
+    const [trip] = await sql`SELECT * FROM trips WHERE id = ${tripId} AND user_email = ${email}`;
+    if (!trip) return res.status(404).json({ error: "not_found" });
+
+    await ensureTripEdges(tripId).catch(() => {});
+
+    const legs = await sql`
+      SELECT * FROM trip_legs WHERE trip_id = ${tripId}
+      ORDER BY departs_at NULLS LAST, id`;
+
+    // Every dependency edge inside this trip, resolved to the leg it points at, with the
+    // measured slack. This is the line the rest of the industry can't print.
+    const edges = await sql`
+      SELECT d.from_commitment, d.to_commitment, d.kind, d.slack_minutes, d.confidence,
+             tl.carrier, tl.flight_number, tl.origin, tl.destination, tl.property_name,
+             tl.destination_city, tl.type AS to_type, tl.departs_at AS to_departs
+      FROM depends_on d
+      JOIN trip_legs tl ON tl.id = d.to_commitment
+      WHERE d.from_commitment IN (SELECT id FROM trip_legs WHERE trip_id = ${tripId})`;
+
+    const depBy = {};
+    for (const e of edges) {
+      (depBy[e.from_commitment] ||= []).push({
+        to: e.to_commitment,
+        on: e.to_type === "flight"
+          ? flightid.displayName(e)
+          : (e.property_name || e.destination_city || e.destination || "the next booking"),
+        slack_minutes: e.slack_minutes,
+        // Say how sure we are. An inferred edge is not a measured one, and the dossier
+        // must not let a hunch wear a fact's clothes.
+        certain: e.confidence >= 0.9,
+        kind: e.kind,
+      });
+    }
+
+    const now = Date.now();
+    const firstDep = legs.map((l) => l.departs_at).filter(Boolean).sort()[0];
+    const lastArr = legs.map((l) => l.arrives_at || l.departs_at).filter(Boolean).sort().slice(-1)[0];
+    const inMotion = firstDep && lastArr &&
+      now >= new Date(firstDep).getTime() && now <= new Date(lastArr).getTime();
+
+    const chapterOf = (l) => {
+      if (l.state === "proposed" || !l.departs_at) return "plan";
+      const dep = new Date(l.departs_at).getTime();
+      const arr = l.arrives_at ? new Date(l.arrives_at).getTime() : dep;
+      if (now > arr) return "after";
+      if (now >= dep && now <= arr) return "in_motion";
+      if (inMotion) return "in_motion";     // between other legs of a live trip
+      return "prepare";
+    };
+
+    const chapters = { plan: [], prepare: [], in_motion: [], after: [] };
+    for (const l of legs) {
+      chapters[chapterOf(l)].push({
+        ...l,
+        display_name: l.type === "flight" ? flightid.displayName(l) : (l.property_name || l.destination_city || l.destination),
+        depends_on: depBy[l.id] || [],
+      });
+    }
+
+    res.json({ trip, chapters, in_motion: !!inMotion });
+  } catch (e) {
+    console.error("[dossier]", e.message);
+    res.status(500).json({ error: e.message });
+  }
+});
+
 app.post("/trips/:id/refresh", async (req, res) => {
   const email = await verifyAccessToken(req);
   if (!email) return res.status(401).json({ error: "unauthorized" });
