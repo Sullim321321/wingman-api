@@ -13824,6 +13824,70 @@ app.get("/ledger", async (req, res) => {
   }
 });
 
+// GET /ledger/:id — one decision, in full: what it weighed, what it chose, and what
+// it was protecting when it chose. The Ledger list shows the verdict; this shows the
+// reasoning behind it — the thing that separates a chief of staff from a logbook.
+app.get("/ledger/:id", async (req, res) => {
+  const email = await verifyAccessToken(req);
+  if (!email) return res.status(401).json({ error: "unauthorized" });
+  try {
+    const [d] = await sql`
+      SELECT d.*, t.title AS trip_title,
+             tl.type AS leg_type, tl.carrier, tl.flight_number, tl.origin, tl.destination,
+             tl.property_name, tl.destination_city, tl.state AS leg_state,
+             tl.cancellable_until, tl.booked_by
+      FROM deliberations d
+      LEFT JOIN trips t      ON t.id  = d.trip_id
+      LEFT JOIN trip_legs tl ON tl.id = d.commitment_id
+      WHERE d.id = ${parseInt(req.params.id, 10)} AND d.user_email = ${email}`;
+    if (!d) return res.status(404).json({ error: "not_found" });
+
+    // Resolve the protecting constraint IDs to the sentences the user actually said.
+    const ids = (Array.isArray(d.protecting) ? d.protecting : []).map(Number).filter(Number.isFinite);
+    let protecting = [];
+    if (ids.length) {
+      const cs = await sql`
+        SELECT id, rationale, kind, hardness, source
+        FROM constraints WHERE user_email = ${email} AND id = ANY(${ids})`;
+      const byId = Object.fromEntries(cs.map((c) => [c.id, c]));
+      protecting = ids.map((i) => byId[i]).filter(Boolean)
+        .map((c) => ({ what: c.rationale || c.kind, hardness: c.hardness, source: c.source }));
+    }
+
+    // Is this reversible? ONLY if the leg it acted on is still cancellable in its window.
+    // We do NOT show an undo button we can't honour — a dead "Undo" is worse than none.
+    const reversible = d.commitment_id
+      && d.leg_state === "booked"
+      && d.cancellable_until
+      && new Date(d.cancellable_until).getTime() > Date.now();
+
+    res.json({
+      id: d.id,
+      by: d.by,
+      question: d.question,
+      chose: d.chose,
+      because: d.because,
+      at: d.created_at,
+      trip: d.trip_title || null,
+      // The alternatives it considered — the road not taken, which is what makes the
+      // choice legible rather than just asserted.
+      options: Array.isArray(d.options) ? d.options : [],
+      protecting,
+      acted_on: d.commitment_id ? {
+        what: d.leg_type === "flight"
+          ? [flightid.displayName(d), [d.origin, d.destination].filter(Boolean).join(" → ")].filter(Boolean).join(" · ")
+          : (d.property_name || d.destination_city || d.destination || null),
+        state: d.leg_state,
+      } : null,
+      reversible: !!reversible,
+      reversible_until: reversible ? d.cancellable_until : null,
+    });
+  } catch (e) {
+    console.error("[ledger/:id]", e.message);
+    res.status(500).json({ error: e.message });
+  }
+});
+
 // GET /me/constraints — what Wingman believes is always true of you.
 //
 // These apply to every trip, which is exactly why they don't belong on the Plan screen:
