@@ -2946,7 +2946,8 @@ Rules:
 - For trains: "station_from" and "station_to" are the station names (e.g. "London King's Cross", "Edinburgh Waverley")
 - For cars: "pickup_location" = city or airport where car is collected, "dropoff_location" = return location
 - For flights: "flight_number" = IATA code (e.g. "BA1234"), "origin" = departure IATA or city, "destination" = arrival IATA or city ALWAYS extract "departs_at" for flights — the departure date and time in ISO 8601 (include the year; infer it from the email date if the ticket only shows month/day). A flight without a departs_at is not useful, so never leave it null when any date/time appears in the email.
-- "carrier" = airline, hotel property name, car rental company, train operator, ferry operator, or activity provider
+- "carrier" = airline, car rental company, train operator, ferry operator, or activity provider
+- "property_name" = for a HOTEL, Airbnb, restaurant, or venue: its ACTUAL NAME, exactly as written — "Kimpton Aertson", "The Whitby Hotel", "Aman Tokyo". NOT the city. This is the single most important field for a hotel; without it the booking renders as just the city name. A confirmation from a booking portal (TrueBlue Travel, Expedia, Booking.com) still names the property inside — find it.
 - "price_total" = total cost as a number (no currency symbol), "currency" = 3-letter ISO code (e.g. "GBP", "USD")
 - "guests" = number of guests/passengers as integer
 - "property_address" = full address for hotels/Airbnb if present
@@ -2960,7 +2961,8 @@ Return this exact JSON structure:
   "type": "flight|hotel|airbnb|car|train|ferry|cruise|activity|transfer|other",
   "trip_title": "destination city name only — used for grouping (e.g. Edinburgh, New York)",
   "destination_city": "city the traveller is visiting",
-  "carrier": "airline, hotel, car company, train operator, etc.",
+  "carrier": "airline, car company, train operator, etc. (NOT the hotel name)",
+  "property_name": "hotel/Airbnb/venue name for lodging & activities, else null",
   "confirmation": "booking reference or confirmation number",
   "origin": "departure city, airport code, or station (null for hotels/Airbnb)",
   "destination": "arrival city, airport code, or station",
@@ -3069,7 +3071,7 @@ Return this exact JSON structure:
     // ── Insert the leg with all enriched fields ──
     await sql`
       INSERT INTO trip_legs (
-        trip_id, type, carrier, flight_number, origin, destination, destination_city,
+        trip_id, type, carrier, property_name, flight_number, origin, destination, destination_city,
         departs_at, arrives_at, confirmation, raw_data,
         nights, guests, station_from, station_to,
         pickup_location, dropoff_location, vehicle_class,
@@ -3078,6 +3080,7 @@ Return this exact JSON structure:
         ${tripId},
         ${parsed.type || "flight"},
         ${parsed.carrier || null},
+        ${parsed.property_name || null},
         ${parsed.flight_number || null},
         ${parsed.origin || null},
         ${parsed.destination || null},
@@ -3401,7 +3404,8 @@ Return this exact JSON structure:
   "type": "flight|hotel|airbnb|car|train|ferry|cruise|activity|transfer|other",
   "trip_title": "destination city name only",
   "destination_city": "city the traveller is visiting",
-  "carrier": "airline, hotel, car company, train operator, etc.",
+  "carrier": "airline, car company, train operator, etc. (NOT the hotel name)",
+  "property_name": "hotel/Airbnb/venue name for lodging & activities, else null",
   "confirmation": "booking reference or null",
   "origin": "departure city, airport code, or station (null for hotels/Airbnb)",
   "destination": "arrival city, airport code, or station",
@@ -3447,7 +3451,7 @@ Return this exact JSON structure:
 
   await sql`
     INSERT INTO trip_legs (
-      trip_id, type, carrier, flight_number, origin, destination, destination_city,
+      trip_id, type, carrier, property_name, flight_number, origin, destination, destination_city,
       departs_at, arrives_at, confirmation, raw_data,
       nights, guests, station_from, station_to,
       pickup_location, dropoff_location, vehicle_class,
@@ -3456,6 +3460,7 @@ Return this exact JSON structure:
       ${tripId},
       ${parsed.type || "flight"},
       ${parsed.carrier || null},
+      ${parsed.property_name || null},
       ${parsed.flight_number || null},
       ${parsed.origin || null},
       ${parsed.destination || null},
@@ -8318,11 +8323,29 @@ app.get("/trips/:tripId/risk", auth, async (req, res) => {
     for (let i = 0; i < legs.length - 1; i++) {
       const legA = legs[i];  // arriving leg
       const legB = legs[i + 1];  // departing leg
+      if (legA.type !== "flight" || legB.type !== "flight") continue;
       if (!legA.arrives_at || !legB.departs_at) continue;
+
+      // A CONNECTION is not "any two consecutive flights." It is: land somewhere, then
+      // take off AGAIN FROM THAT SAME AIRPORT, SOON. Two separate flights into Nashville
+      // — PIT→BNA in one month, LGA→BNA in another — are not a connection at BNA; they're
+      // two ways into the same city. The old code scored them as a layover and reported a
+      // 7,452,045-minute connection as "comfortable." Confident nonsense about real travel.
+      //
+      // Two guards, both required:
+      //   1. legB must depart FROM where legA arrived. (You can't connect at BNA to a
+      //      flight leaving LGA.)
+      //   2. the gap must be a plausible layover, not days apart.
+      if (!legA.destination || !legB.origin) continue;
+      if (String(legA.destination).toUpperCase() !== String(legB.origin).toUpperCase()) continue;
 
       const arriveMs = new Date(legA.arrives_at).getTime();
       const departMs = new Date(legB.departs_at).getTime();
       const connectionMins = Math.round((departMs - arriveMs) / 60000);
+
+      // A real layover is minutes-to-hours. Negative (data error) or more than a day
+      // apart is not a connection — skip rather than narrate a fiction about it.
+      if (connectionMins <= 0 || connectionMins > 24 * 60) continue;
 
       // Risk scoring: < 45 min = critical, 45-90 = high, 90-150 = moderate, > 150 = low
       let riskLevel, riskScore;
