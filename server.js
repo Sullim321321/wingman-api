@@ -2722,6 +2722,51 @@ async function findTripForLooseBooking(userEmail, whenISO, city) {
  *
  * Holder buckets keep their names. Manually-renamed trips are left alone.
  */
+/**
+ * What should this trip be called, given what is actually in it?
+ *
+ * ONE definition, because there were two and they drifted. retitleTripFromLegs got
+ * the "a suggestion may not name a trip" fix; the copy inside unmergeMegaTrips did
+ * not — so a repair run would helpfully restore the exact title the fix removed.
+ * Two implementations of one rule is not redundancy, it's a race between versions.
+ *
+ * Returns null when there is nothing to say.
+ */
+async function computeTripTitle(tripId) {
+  // Committed legs decide the name. Proposals only get a say when there is nothing
+  // else — a trip that is purely an idea still needs to be findable, but it must
+  // never blend suggestions into a title alongside real bookings.
+  const committed = await sql`
+    SELECT COALESCE(destination_city, destination) AS city
+    FROM trip_legs
+    WHERE trip_id = ${tripId}
+      AND type IN ('flight','hotel','airbnb','train','ferry','cruise')
+      AND COALESCE(destination_city, destination, '') <> ''
+      AND COALESCE(state, '') <> 'proposed'
+    ORDER BY departs_at ASC NULLS LAST
+  `;
+  const legs = committed.length ? committed : await sql`
+    SELECT COALESCE(destination_city, destination) AS city
+    FROM trip_legs
+    WHERE trip_id = ${tripId}
+      AND type IN ('flight','hotel','airbnb','train','ferry','cruise')
+      AND COALESCE(destination_city, destination, '') <> ''
+    ORDER BY departs_at ASC NULLS LAST
+  `;
+  if (!legs.length) return null;
+
+  const stops = [];
+  for (const l of legs) {
+    const c = canonicalCity(l.city);
+    if (!c || stops.some((x) => sameCity(x.canon, c))) continue;
+    stops.push({ canon: c, label: String(l.city).split(",")[0].trim() });
+  }
+  if (!stops.length) return null;
+  if (stops.length === 1) return stops[0].label;
+  if (stops.length <= 3) return stops.map((x) => x.label).join(" → ");
+  return `${stops[0].label} → … → ${stops[stops.length - 1].label}`;
+}
+
 async function retitleTripFromLegs(tripId) {
   try {
     const [trip] = await sql`SELECT id, title, source FROM trips WHERE id = ${tripId}`;
@@ -2729,59 +2774,7 @@ async function retitleTripFromLegs(tripId) {
     if (trip.title === "Needs review" || trip.title === "Reservations") return;
     if (trip.source === "manual") return;   // the user named it; don't argue
 
-    // ── A SUGGESTION MAY NOT NAME A TRIP ────────────────────────────────────
-    //
-    // This is the failure that made the app feel delusional. The user asked where
-    // she might go for three days; Wingman proposed the Smoky Mountains; the
-    // proposal was written as a `proposed` leg — correctly, and the Dossier drew it
-    // correctly, dashed and marked SKETCH. Then this function read every anchor leg
-    // with a destination, took no interest in whether any of them were real, and
-    // retitled the trip "Nashville → Chicago → Smoky Mountains area."
-    //
-    // So the one honest thing on the screen was overruled by the largest text on it.
-    // She had a hotel in Nashville. The app told her she was going to the Smokies,
-    // in 30pt serif, because it had once said so itself.
-    //
-    // A title is an assertion. It may only be built from things that exist.
-    const committed = await sql`
-      SELECT COALESCE(destination_city, destination) AS city, departs_at
-      FROM trip_legs
-      WHERE trip_id = ${tripId}
-        AND type IN ('flight','hotel','airbnb','train','ferry','cruise')
-        AND COALESCE(destination_city, destination, '') <> ''
-        AND COALESCE(state, '') <> 'proposed'
-      ORDER BY departs_at ASC NULLS LAST
-    `;
-
-    // Nothing committed at all — this trip is still only an idea. It still needs a
-    // findable name, so it takes one from the proposals, but it is NEVER allowed to
-    // absorb proposals into a title alongside real bookings. Mixing the two is what
-    // produced the sentence above.
-    const legs = committed.length ? committed : await sql`
-      SELECT COALESCE(destination_city, destination) AS city, departs_at
-      FROM trip_legs
-      WHERE trip_id = ${tripId}
-        AND type IN ('flight','hotel','airbnb','train','ferry','cruise')
-        AND COALESCE(destination_city, destination, '') <> ''
-      ORDER BY departs_at ASC NULLS LAST
-    `;
-    if (!legs.length) return;
-
-    // Distinct cities, in travel order, alias-aware (Milano and Milan are one stop).
-    const stops = [];
-    for (const l of legs) {
-      const c = canonicalCity(l.city);
-      if (!c) continue;
-      if (stops.some((s) => sameCity(s.canon, c))) continue;
-      stops.push({ canon: c, label: String(l.city).split(",")[0].trim() });
-    }
-    if (!stops.length) return;
-
-    let title;
-    if (stops.length === 1) title = stops[0].label;
-    else if (stops.length <= 3) title = stops.map((s) => s.label).join(" → ");
-    else title = `${stops[0].label} → … → ${stops[stops.length - 1].label}`;
-
+    const title = await computeTripTitle(tripId);
     if (title && title !== trip.title) {
       await sql`UPDATE trips SET title = ${title} WHERE id = ${tripId}`;
       console.log(`[retitle] #${tripId}: "${trip.title}" → "${title}"`);
@@ -4526,27 +4519,8 @@ async function unmergeMegaTrips(userEmail, { dryRun = true } = {}) {
       AND COALESCE(t.source, '') <> 'manual'
   `;
   for (const t of titleCandidates) {
-    const legs = await sql`
-      SELECT COALESCE(destination_city, destination) AS city
-      FROM trip_legs
-      WHERE trip_id = ${t.id}
-        AND type IN ('flight','hotel','airbnb','train','ferry','cruise')
-        AND COALESCE(destination_city, destination, '') <> ''
-      ORDER BY departs_at ASC NULLS LAST
-    `;
-    const stops = [];
-    for (const l of legs) {
-      const c = canonicalCity(l.city);
-      if (!c || stops.some((s) => sameCity(s.canon, c))) continue;
-      stops.push({ canon: c, label: String(l.city).split(",")[0].trim() });
-    }
-    if (!stops.length) continue;
-    const title = stops.length === 1
-      ? stops[0].label
-      : stops.length <= 3
-        ? stops.map((s) => s.label).join(" → ")
-        : `${stops[0].label} → … → ${stops[stops.length - 1].label}`;
-    if (title === t.title) continue;
+    const title = await computeTripTitle(t.id);
+    if (!title || title === t.title) continue;
 
     report.tripsRetitled++;
     report.details.push(`retitle #${t.id}: "${t.title}" → "${title}"`);
