@@ -3677,10 +3677,35 @@ app.post("/inbound/email", async (req, res) => {
   let html = mail.html || mail["body-html"] || mail.html_body
     || mail.HtmlBody || mail.body?.html || "";
 
+  // ── RESEND SENDS A NOTIFICATION, NOT THE MESSAGE ────────────────────────────
+  // The real payload contains no body at all — no text, no html, no raw. Just metadata
+  // and an `email_id`:
+  //
+  //   { attachments: [], bcc: [], cc: [], email_id: "d06fdd73-…", from, subject, to }
+  //
+  // The content must be FETCHED with that id. This is why every field we tried came back
+  // empty: the body was never in the webhook to begin with. (I guessed `raw` first and
+  // was wrong — worth recording, so the next person doesn't re-guess it.)
+  if (!text && !html && mail.email_id && process.env.RESEND_API_KEY) {
+    try {
+      const r = await fetch(`https://api.resend.com/emails/${mail.email_id}`, {
+        headers: { Authorization: `Bearer ${process.env.RESEND_API_KEY}` },
+      });
+      if (r.ok) {
+        const full = await r.json();
+        text = full.text || full.plain || "";
+        html = full.html || "";
+        console.log(`[inbound] fetched body for ${mail.email_id} (text=${text.length}, html=${html.length})`);
+      } else {
+        console.warn(`[inbound] could not fetch email ${mail.email_id}: HTTP ${r.status}`);
+      }
+    } catch (e) {
+      console.error("[inbound] body fetch failed:", e.message);
+    }
+  }
+
   // Some inbound providers hand over the full RFC-822 message in `raw` rather than
-  // pre-split text/html parts. If that's what we got, pull the parts out ourselves.
-  // (Precautionary — not yet confirmed as the shape Resend sends. It costs nothing if
-  //  unused, and if it IS the shape, forwarding works instead of failing silently.)
+  // pre-split text/html parts. Kept as a fallback for providers that do work that way.
   if (!text && !html && typeof mail.raw === "string" && mail.raw.length > 40) {
     const raw = mail.raw;
     const decode = (chunk, enc) => {
