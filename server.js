@@ -2544,6 +2544,7 @@ const ANCHOR_TYPES = new Set(["flight", "hotel", "airbnb", "train", "ferry", "cr
 // So: any stay longer than this is treated as a parse error, not as a long
 // holiday. Its end date is discarded rather than trusted.
 const { usableConfirmation, confirmationReachOk } = require("./grouping");
+const sketches = require("./sketches");
 
 const MAX_STAY_NIGHTS = 30;
 const MAX_TRIP_DAYS   = 30;   // a single trip should not span longer than this
@@ -2728,7 +2729,35 @@ async function retitleTripFromLegs(tripId) {
     if (trip.title === "Needs review" || trip.title === "Reservations") return;
     if (trip.source === "manual") return;   // the user named it; don't argue
 
-    const legs = await sql`
+    // ── A SUGGESTION MAY NOT NAME A TRIP ────────────────────────────────────
+    //
+    // This is the failure that made the app feel delusional. The user asked where
+    // she might go for three days; Wingman proposed the Smoky Mountains; the
+    // proposal was written as a `proposed` leg — correctly, and the Dossier drew it
+    // correctly, dashed and marked SKETCH. Then this function read every anchor leg
+    // with a destination, took no interest in whether any of them were real, and
+    // retitled the trip "Nashville → Chicago → Smoky Mountains area."
+    //
+    // So the one honest thing on the screen was overruled by the largest text on it.
+    // She had a hotel in Nashville. The app told her she was going to the Smokies,
+    // in 30pt serif, because it had once said so itself.
+    //
+    // A title is an assertion. It may only be built from things that exist.
+    const committed = await sql`
+      SELECT COALESCE(destination_city, destination) AS city, departs_at
+      FROM trip_legs
+      WHERE trip_id = ${tripId}
+        AND type IN ('flight','hotel','airbnb','train','ferry','cruise')
+        AND COALESCE(destination_city, destination, '') <> ''
+        AND COALESCE(state, '') <> 'proposed'
+      ORDER BY departs_at ASC NULLS LAST
+    `;
+
+    // Nothing committed at all — this trip is still only an idea. It still needs a
+    // findable name, so it takes one from the proposals, but it is NEVER allowed to
+    // absorb proposals into a title alongside real bookings. Mixing the two is what
+    // produced the sentence above.
+    const legs = committed.length ? committed : await sql`
       SELECT COALESCE(destination_city, destination) AS city, departs_at
       FROM trip_legs
       WHERE trip_id = ${tripId}
@@ -5018,6 +5047,102 @@ app.get("/admin/invariants", async (req, res) => {
   }
 });
 
+// GET /admin/provenance — where did everything in here come from?
+//
+// Read-only, always. The user's complaint was "the app has a lot of dead information
+// and artifacts," and the honest first move is not to start deleting on a hunch about
+// which sources produce junk. It's to show her every trip with its origin and a
+// verdict, and let her point at what dies.
+app.get("/admin/provenance", async (req, res) => {
+  const email = await verifyAccessToken(req);
+  if (!email) return res.status(401).json({ error: "unauthorized" });
+  try {
+    const rows = await sql`
+      SELECT t.id, t.title, t.source, t.status, t.archived, t.created_at,
+             COALESCE(JSON_AGG(
+               JSON_BUILD_OBJECT('state', tl.state, 'type', tl.type,
+                                 'departs_at', tl.departs_at, 'confirmation', tl.confirmation,
+                                 'created_at', tl.created_at)
+             ) FILTER (WHERE tl.id IS NOT NULL), '[]') AS legs
+      FROM trips t
+      LEFT JOIN trip_legs tl ON tl.trip_id = t.id
+      WHERE t.user_email = ${email}
+      GROUP BY t.id
+      ORDER BY t.created_at DESC NULLS LAST
+    `;
+
+    const now = Date.now();
+    const trips = rows.map((t) => {
+      const legs = Array.isArray(t.legs) ? t.legs : [];
+      const { verdict, note } = sketches.classifyTrip({ legs, title: t.title, source: t.source });
+      const expiring = legs.filter((l) => sketches.shouldExpire(l, now).expire).length;
+      const span = (() => {
+        const ds = legs.map((l) => l.departs_at).filter(Boolean).map((d) => new Date(d).getTime());
+        if (!ds.length) return null;
+        return { from: new Date(Math.min(...ds)).toISOString(),
+                 to:   new Date(Math.max(...ds)).toISOString(),
+                 days: Math.round((Math.max(...ds) - Math.min(...ds)) / 86400000) };
+      })();
+      return {
+        id: t.id, title: t.title, source: t.source || "(none)", archived: t.archived,
+        verdict, note, legs: legs.length,
+        booked: legs.filter((l) => l.state !== "proposed").length,
+        proposed: legs.filter((l) => l.state === "proposed").length,
+        would_expire: expiring, span,
+      };
+    });
+
+    const tally = {};
+    for (const t of trips) tally[t.verdict] = (tally[t.verdict] || 0) + 1;
+    res.json({
+      ok: true, total: trips.length, by_verdict: tally,
+      would_expire_legs: trips.reduce((n, t) => n + t.would_expire, 0),
+      trips,
+    });
+  } catch (e) {
+    console.error("[provenance]", e.message);
+    res.status(500).json({ ok: false, error: e.message });
+  }
+});
+
+// POST /admin/expire-sketches — retire proposals that were never acted on.
+// Dry-run by default. ?apply=true to actually delete.
+app.post("/admin/expire-sketches", async (req, res) => {
+  const email = await verifyAccessToken(req);
+  if (!email) return res.status(401).json({ error: "unauthorized" });
+  const dryRun = req.query.apply !== "true";
+  try {
+    const legs = await sql`
+      SELECT tl.id, tl.trip_id, tl.state, tl.type, tl.departs_at, tl.confirmation,
+             tl.created_at, tl.destination_city, tl.destination, tl.property_name, t.title
+      FROM trip_legs tl JOIN trips t ON t.id = tl.trip_id
+      WHERE t.user_email = ${email} AND tl.state = 'proposed'
+    `;
+    const now = Date.now();
+    const expired = [];
+    for (const l of legs) {
+      const d = sketches.shouldExpire(l, now);
+      if (!d.expire) continue;
+      const name = l.property_name || l.destination_city || l.destination || l.type || "leg";
+      expired.push({ id: l.id, trip: l.title, what: name, why: d.why });
+      if (!dryRun) {
+        // Deleted, but NEVER silently. If this record isn't written, the user's
+        // experience is "my plans disappeared" with no way to find out why — which
+        // is a worse failure than the stale sketch this is cleaning up.
+        await logActivity(email, "sketch_expired",
+          `Retired a suggestion: ${name}`,
+          `It was never booked — ${d.why}. It came from a planning conversation, not from you.`)
+          .catch((e) => console.error("[expire-sketches] ledger write failed", e.message));
+        await sql`DELETE FROM trip_legs WHERE id = ${l.id}`;
+      }
+    }
+    res.json({ ok: true, dryRun, expired: expired.length, details: expired });
+  } catch (e) {
+    console.error("[expire-sketches]", e.message);
+    res.status(500).json({ ok: false, error: e.message });
+  }
+});
+
 // POST /admin/unmerge-trips — split trips that swallowed unrelated travel.
 // Dry-run by default. Add ?apply=true to actually write.
 app.post("/admin/unmerge-trips", async (req, res) => {
@@ -6444,7 +6569,15 @@ app.get("/trips/:id/dossier", async (req, res) => {
       });
     }
 
-    res.json({ trip, chapters, rides, in_motion: !!inMotion });
+    // ── Is any of this real? ────────────────────────────────────────────────
+    // A trip built entirely from proposals is an IDEA, and the screen has to say so
+    // in its own voice rather than leaving the user to infer it from four dashed
+    // borders. She asked where she might go for three days; she should not have to
+    // audit border styles to find out whether she's going.
+    const committedCount = legs.filter((l) => l.state !== "proposed").length;
+    const certainty = committedCount === 0 ? "idea" : "real";
+
+    res.json({ trip, chapters, rides, certainty, in_motion: !!inMotion });
   } catch (e) {
     console.error("[dossier]", e.message);
     res.status(500).json({ error: "dossier_failed", reason: humanError(e) });
