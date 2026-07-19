@@ -2543,6 +2543,8 @@ const ANCHOR_TYPES = new Set(["flight", "hotel", "airbnb", "train", "ferry", "cr
 //
 // So: any stay longer than this is treated as a parse error, not as a long
 // holiday. Its end date is discarded rather than trusted.
+const { usableConfirmation, confirmationReachOk } = require("./grouping");
+
 const MAX_STAY_NIGHTS = 30;
 const MAX_TRIP_DAYS   = 30;   // a single trip should not span longer than this
 
@@ -2794,25 +2796,45 @@ async function findOrCreateGroupedTrip(userEmail, parsed, emailId, source) {
 
   const rawDest = (parsed.destination_city || parsed.destination || "").split(",")[0].trim();
   const dest = rawDest.toLowerCase();
-  const confirmation = (parsed.confirmation || "").trim();
   const startDate = parsed.departs_at ? new Date(parsed.departs_at) : null;
   const endDate   = parsed.arrives_at  ? new Date(parsed.arrives_at)  : startDate;
+  const confirmation = usableConfirmation(parsed.confirmation);
   const isLoose = parsed.type && !ANCHOR_TYPES.has(parsed.type);
 
   // ── 1. Strongest signal: an existing leg with the SAME confirmation number ──
+  // A shared reference beats every date heuristic — but only while the dates stay
+  // plausible. unmergeMegaTrips ALREADY refuses to unite clusters whose shared
+  // confirmation spans more than a journey ("that's a collision, not a booking").
+  // This side had no such guard, so the two halves fought: the grouper pulled a
+  // February leg into an August trip on a recycled reference, the splitter tore it
+  // back out, and the next import did it again. A repair loop that never settles is
+  // indistinguishable from a broken repair.
   if (confirmation) {
     const byConf = await sql`
-      SELECT t.id, t.title
+      SELECT t.id, t.title,
+             MIN(tl2.departs_at) AS s,
+             MAX(COALESCE(tl2.arrives_at, tl2.departs_at)) AS e
       FROM trips t
-      JOIN trip_legs tl ON tl.trip_id = t.id
+      JOIN trip_legs tl  ON tl.trip_id  = t.id
+      JOIN trip_legs tl2 ON tl2.trip_id = t.id
       WHERE t.user_email = ${userEmail}
         AND tl.confirmation IS NOT NULL
-        AND LOWER(tl.confirmation) = ${confirmation.toLowerCase()}
+        AND LOWER(tl.confirmation) = ${confirmation}
+      GROUP BY t.id, t.title
       ORDER BY t.id ASC
       LIMIT 1
     `;
     if (byConf.length > 0) {
-      return { tripId: byConf[0].id, isNew: false, tripTitle: byConf[0].title };
+      const m = byConf[0];
+      const reach = confirmationReachOk(parsed.departs_at, m.s, m.e, MAX_TRIP_DAYS);
+      if (reach.ok) {
+        return { tripId: m.id, isNew: false, tripTitle: m.title };
+      }
+      console.warn(
+        `[grouping] ignoring confirmation "${confirmation}" — it would put a ` +
+        `${parsed.departs_at} booking into "${m.title}" (${m.s} → ${m.e}), ` +
+        `${reach.days} days away. That is a collision, not a booking.`,
+      );
     }
   }
 
@@ -3067,11 +3089,15 @@ Return this exact JSON structure:
     // the trips table, so the email can be re-seen on later scans and re-inserted.
     // Guard by confirmation number (and, when absent, by type+date+name) so rescans
     // fill gaps without creating duplicate legs.
-    if (parsed.confirmation) {
+    // Same predicate as the grouper, deliberately. If "N/A" counted as a reference
+    // here, the second booking to ever carry it would be silently discarded as a
+    // duplicate of the first — a leg vanishing with no error anywhere.
+    const dedupeConf = usableConfirmation(parsed.confirmation);
+    if (dedupeConf) {
       const dupLeg = await sql`
         SELECT tl.id FROM trip_legs tl JOIN trips t ON t.id = tl.trip_id
         WHERE t.user_email = ${userEmail}
-          AND LOWER(tl.confirmation) = ${String(parsed.confirmation).toLowerCase()}
+          AND LOWER(tl.confirmation) = ${dedupeConf}
         LIMIT 1`;
       if (dupLeg.length > 0) return;
     } else if (parsed.departs_at) {
@@ -4643,7 +4669,7 @@ async function unmergeMegaTrips(userEmail, { dryRun = true } = {}) {
     const byConf = new Map();
     clusters.forEach((c, i) => {
       for (const l of c.legs) {
-        const conf = (l.confirmation || "").trim().toLowerCase();
+        const conf = usableConfirmation(l.confirmation);
         if (!conf) continue;
         if (!byConf.has(conf)) byConf.set(conf, new Set());
         byConf.get(conf).add(i);
@@ -6383,20 +6409,42 @@ app.get("/trips/:id/dossier", async (req, res) => {
       const arr = l.arrives_at ? new Date(l.arrives_at).getTime() : dep;
       if (now > arr) return "after";
       if (now >= dep && now <= arr) return "in_motion";
-      if (inMotion) return "in_motion";     // between other legs of a live trip
+      // A LEG's chapter is decided by ITS OWN times, never by the trip's.
+      // This used to read `if (inMotion) return "in_motion"`, which shoved every leg of a
+      // live trip into "happening now" — so a flight three days away rendered as
+      // in-progress. "Happening now" has to mean happening now, or the word is worthless
+      // on the one screen where you'd act on it.
       return "prepare";
     };
 
+    // ── An Uber is an expense; a seaplane is an appointment ─────────────────────
+    // TripDetail already collapses unnamed short car/transfer legs into a quiet count.
+    // The Dossier is a NEW surface and never inherited the rule, so four address-to-address
+    // "Nashville" rides and a leg literally called "transfer" were sitting in the itinerary
+    // with the same weight as a hotel. Same content, new screen, old noise.
+    //
+    // The distinction is the same one as before: an Uber has no name. "Seaplane transfer"
+    // does. A NAMED transfer stays visible — it's the kind of thing the cascade defends.
+    const isRide = (l) =>
+      (l.type === "car" || l.type === "transfer") &&
+      !l.property_name &&
+      !l.vehicle_class &&
+      !l.nights &&
+      !l.confirmation;
+
     const chapters = { plan: [], prepare: [], in_motion: [], after: [] };
+    const rides = { plan: 0, prepare: 0, in_motion: 0, after: 0 };
     for (const l of legs) {
-      chapters[chapterOf(l)].push({
+      const ch = chapterOf(l);
+      if (isRide(l)) { rides[ch]++; continue; }
+      chapters[ch].push({
         ...l,
         display_name: l.type === "flight" ? flightid.displayName(l) : (l.property_name || l.destination_city || l.destination),
         depends_on: depBy[l.id] || [],
       });
     }
 
-    res.json({ trip, chapters, in_motion: !!inMotion });
+    res.json({ trip, chapters, rides, in_motion: !!inMotion });
   } catch (e) {
     console.error("[dossier]", e.message);
     res.status(500).json({ error: "dossier_failed", reason: humanError(e) });
