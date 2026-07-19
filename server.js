@@ -3672,10 +3672,37 @@ app.post("/inbound/email", async (req, res) => {
   // like an empty email. Try every shape we've seen, then — if it's STILL empty — log the
   // keys we actually received, so the next failure names the field instead of repeating
   // "body too short" forever.
-  const text = mail.text || mail.plain || mail["body-plain"] || mail.text_body
+  let text = mail.text || mail.plain || mail["body-plain"] || mail.text_body
     || mail.TextBody || mail.body?.text || "";
-  const html = mail.html || mail["body-html"] || mail.html_body
+  let html = mail.html || mail["body-html"] || mail.html_body
     || mail.HtmlBody || mail.body?.html || "";
+
+  // Some inbound providers hand over the full RFC-822 message in `raw` rather than
+  // pre-split text/html parts. If that's what we got, pull the parts out ourselves.
+  // (Precautionary — not yet confirmed as the shape Resend sends. It costs nothing if
+  //  unused, and if it IS the shape, forwarding works instead of failing silently.)
+  if (!text && !html && typeof mail.raw === "string" && mail.raw.length > 40) {
+    const raw = mail.raw;
+    const decode = (chunk, enc) => {
+      if (/base64/i.test(enc || "")) { try { return Buffer.from(chunk, "base64").toString("utf8"); } catch { return chunk; } }
+      if (/quoted-printable/i.test(enc || "")) {
+        return chunk.replace(/=\r?\n/g, "").replace(/=([0-9A-F]{2})/gi, (_, h) => String.fromCharCode(parseInt(h, 16)));
+      }
+      return chunk;
+    };
+    // Split on MIME boundaries when present; otherwise treat the body after the headers.
+    const boundary = (raw.match(/boundary="?([^"\s;]+)"?/i) || [])[1];
+    const parts = boundary ? raw.split(new RegExp(`--${boundary.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}`)) : [raw];
+    for (const part of parts) {
+      const enc = (part.match(/Content-Transfer-Encoding:\s*([^\r\n]+)/i) || [])[1];
+      const body = part.split(/\r?\n\r?\n/).slice(1).join("\n\n").trim();
+      if (!body) continue;
+      if (/Content-Type:\s*text\/plain/i.test(part) && !text) text = decode(body, enc);
+      else if (/Content-Type:\s*text\/html/i.test(part) && !html) html = decode(body, enc);
+      else if (!boundary && !text) text = decode(body, enc);   // no MIME parts at all
+    }
+    if (text || html) console.log(`[inbound] recovered body from raw MIME (text=${text.length}, html=${html.length})`);
+  }
 
   const senderMatch = String(from).match(/[a-zA-Z0-9._%+\-]+@[a-zA-Z0-9.\-]+\.[a-zA-Z]{2,}/);
   const senderEmail = senderMatch ? senderMatch[0].toLowerCase() : null;
