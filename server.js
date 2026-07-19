@@ -2987,7 +2987,15 @@ Return this exact JSON structure:
     try {
       claudeResp = await getAnthropic().messages.create({
         model: "claude-haiku-4-5",  // cheap model — email field extraction is simple; Sonnet repair below catches misses
-        max_tokens: 700,
+        // 700 was TRUNCATING real emails. An itinerary email holds several bookings, the
+        // model answers with an array, and the reply was getting cut off mid-key —
+        // "property_name": null, "con  ← here — which then failed JSON.parse and imported
+        // NOTHING. The email looked processed and silently produced no trip.
+        //
+        // Worse, it was self-inflicted: adding `property_name` to the schema this morning
+        // made every object bigger and pushed borderline emails over the edge. A schema
+        // change is a size change, and the budget has to move with it.
+        max_tokens: 4000,
         messages: [{ role: "user", content: prompt }],
       });
     } catch (llmErr) {
@@ -3001,7 +3009,17 @@ Return this exact JSON structure:
       const jsonStr = raw.replace(/^```json\n?/, "").replace(/\n?```$/, "").trim();
       parsed = JSON.parse(jsonStr);
     } catch (parseErr) {
-      console.error("[gmail parse] JSON parse failed:", parseErr.message, "Raw:", claudeResp.content[0]?.text?.slice(0, 200));
+      // Say WHY it failed. A truncated response and malformed JSON are different problems
+      // with different fixes, and "JSON parse failed" alone sent us looking at the prompt
+      // when the real answer was the token budget.
+      const stop = claudeResp.stop_reason;
+      const truncated = stop === "max_tokens";
+      console.error(
+        `[gmail parse] JSON parse failed (${truncated ? "TRUNCATED — hit max_tokens" : `stop_reason=${stop}`}):`,
+        parseErr.message,
+        "| chars:", claudeResp.content[0]?.text?.length,
+        "| Subject:", subject,
+      );
       return;
     }
 
@@ -3430,11 +3448,17 @@ Return this exact JSON structure:
   try {
     const claudeResp = await getAnthropic().messages.create({
       model: "claude-haiku-4-5",  // cheap model for email field extraction
-      max_tokens: 700,
+      // Same truncation bug as the Gmail path — and this is the FORWARDED-email parser,
+      // the one the whole inbound chain feeds into. A multi-leg confirmation would have
+      // been cut off mid-JSON and silently imported nothing.
+      max_tokens: 4000,
       messages: [{ role: "user", content: prompt }],
     });
     const raw = claudeResp.content[0].text.trim();
     const jsonStr = raw.replace(/^```json\n?/, "").replace(/\n?```$/, "").trim();
+    if (claudeResp.stop_reason === "max_tokens") {
+      console.error(`[paste parse] response hit max_tokens (${raw.length} chars) — booking(s) may be lost`);
+    }
     parsed = JSON.parse(jsonStr);
   } catch (e) {
     console.error("[paste/parse] LLM or JSON error:", e.message);
