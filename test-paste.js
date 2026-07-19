@@ -77,14 +77,35 @@ Priya: oh and Marcus said he'd drive you from the airport if you need
   const all = cs.map((c) => (c.rationale || "").toLowerCase()).join(" | ");
 
   let pass = 0, fail = 0;
-  const t = (name, cond, detail) => {
+  // `needsData: true` marks an assertion that is only meaningful when something was
+  // actually extracted. With an empty result it reports UNPROVEN and counts as a
+  // failure — never a silent pass.
+  const t = (name, cond, detail, needsData = false) => {
+    if (needsData && cs.length === 0) {
+      console.log(`  \x1b[31m? UNPROVEN\x1b[0m ${name}\n      nothing was extracted, so this check proved nothing`);
+      fail++; return;
+    }
     if (cond) { console.log(`  \x1b[32m✓\x1b[0m ${name}`); pass++; }
     else { console.log(`  \x1b[31m✗\x1b[0m ${name}${detail ? `\n      ${detail}` : ""}`); fail++; }
   };
 
   console.log(`\n  (extracted ${cs.length} constraints)\n`);
   cs.forEach((c) => console.log(`    · [${c.hardness}/${c.source}] ${c.rationale}`));
-  console.log("");
+  console.log(`\n  \x1b[2mreply:\x1b[0m ${(out.reply || "(none)").slice(0, 400)}\n`);
+
+  // ── THE GUARD AGAINST VACUOUS PASSES ────────────────────────────────────────
+  // The first run of this file printed "6 held" while the planner extracted ZERO
+  // constraints. Four of those six passed only because there was nothing to check:
+  // "didn't inflate everything to MUST" is trivially true of an empty list, and
+  // "Sam's drinks is not a must" is trivially true when no drinks constraint exists.
+  //
+  // That is the exact failure this whole project hunts — a green light that cannot
+  // go red — and I wrote it into the test meant to catch it. So: if nothing was
+  // extracted, every downstream assertion is UNPROVEN, and unproven is not passed.
+  const vacuous = cs.length === 0;
+  if (vacuous) {
+    console.log("  \x1b[31m! NOTHING WAS EXTRACTED — every check below is unproven, not passed.\x1b[0m\n");
+  }
 
   // ── 1. Did it catch the commitments that drive scheduling? ──
   t("caught the Friday office meeting", /office|dave|4th floor|meeting/.test(all),
@@ -109,24 +130,24 @@ Priya: oh and Marcus said he'd drive you from the airport if you need
   }
   t("took the CORRECTED meeting time, not both",
     timesFound.size <= 1,
-    `graph holds ${[...timesFound].join(" AND ")} for the same meeting — a correction must supersede, not accumulate`);
+    `graph holds ${[...timesFound].join(" AND ")} for the same meeting — a correction must supersede, not accumulate`, true);
 
   // ── 3. Uncertainty stays uncertain. This is the whole ethic. ──
   const drinks = cs.find((c) => /drinks|sam/i.test(c.rationale || ""));
   t("Sam's 'might bail' drinks is NOT a must",
     !drinks || drinks.hardness !== "must",
-    drinks ? `recorded as ${drinks.hardness}` : "");
+    drinks ? `recorded as ${drinks.hardness}` : "", true);
 
   // ── 4. It must not invent. Nobody gave an airport pickup TIME. ──
   t("did not invent a pickup time nobody stated",
     !/pickup at \d|drive.*at \d{1,2}(:\d\d)?\s?(am|pm)/i.test(all),
-    "a time appeared that no message contained");
+    "a time appeared that no message contained", true);
 
   // ── 5. Musts must be real musts, not everything. ──
   const musts = cs.filter((c) => c.hardness === "must");
   t("didn't inflate everything to MUST",
     musts.length <= Math.max(2, Math.ceil(cs.length / 2)),
-    `${musts.length} of ${cs.length} are 'must' — if everything is a must, nothing is`);
+    `${musts.length} of ${cs.length} are 'must' — if everything is a must, nothing is`, true);
 
   // ── 6. It has to SAY something, not just file. ──
   t("replied in text rather than silently filing", (out.reply || "").trim().length > 0);
