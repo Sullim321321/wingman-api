@@ -3695,22 +3695,31 @@ app.post("/inbound/email", async (req, res) => {
     mail["envelope-to"], mail.delivered_to, mail["delivered-to"],
   ].map(flat).join(",").toLowerCase();
 
-  const tokenMatch = allRecipients.match(/\+([a-z0-9]{16,})@/);
-  const token = tokenMatch ? tokenMatch[1] : null;
+  // Two address shapes are valid, and both must keep working:
+  //   NEW      k7m2xq9rt4vn@inbox.…        (12 base32, no prefix)
+  //   LEGACY   import+aa5318559c96…@inbox.…  (20 hex, plus-addressed)
+  // Changing the format must not silently orphan an address someone already put into a
+  // mail-forwarding rule — that would break ingestion quietly, weeks later, with no error.
+  const candidates = new Set();
+  for (const m of allRecipients.matchAll(/\+([a-z0-9]{10,})@/g)) candidates.add(m[1]);   // legacy
+  for (const m of allRecipients.matchAll(/(?:^|[,\s<])([a-z0-9]{10,})@/g)) candidates.add(m[1]); // bare
 
-  if (!token) {
+  if (candidates.size === 0) {
     // Say what we actually got, so the Render log pinpoints it instead of just "no token."
     console.warn(`[inbound] rejected: no token in recipients → "${allRecipients.slice(0, 200)}"`);
     return res.status(200).json({ ok: false, reason: "no token", recipients_seen: allRecipients.slice(0, 200) });
   }
 
-  let userEmail = null;
+  let userEmail = null, token = null;
   try {
-    const rows = await sql`SELECT email FROM users WHERE inbound_token = ${token} LIMIT 1`;
-    if (rows.length) userEmail = rows[0].email;
+    const rows = await sql`
+      SELECT email, inbound_token FROM users
+      WHERE inbound_token = ANY(${[...candidates]}) LIMIT 1`;
+    if (rows.length) { userEmail = rows[0].email; token = rows[0].inbound_token; }
   } catch (e) {
     console.error("[inbound/email] user lookup error:", e.message);
   }
+  if (!token) token = [...candidates][0];   // for the log line below
 
   if (!userEmail) {
     console.warn(`[inbound] rejected: token ${token.slice(0, 6)}… matched no user`);
@@ -3871,6 +3880,58 @@ function getTransitPaymentInfo(cityOrCountry) {
     if (key.includes(city) || city.includes(key)) return info;
   }
   return null;
+}
+
+// ── travelTime — how long, in SECONDS, and when to leave ─────────────────────
+//
+// getTransitRoute() below returns human strings ("22 mins"), which are fine to display
+// and useless for arithmetic. Departure guidance needs numbers.
+//
+// The important part: for transit, Google can answer the question DIRECTLY — given an
+// `arrival_time`, it returns the itinerary that gets you there, so the departure time is
+// measured rather than derived. That matters because subtracting a typical duration from
+// a deadline quietly ignores that the 1:58 bus and the 2:14 bus are not the same answer.
+//
+// Returns null when it cannot route. Null means "I don't know" — the caller must say so,
+// never fall back to a guessed number. A departure time you invent is the one number in
+// this app that can make someone physically miss something.
+async function travelTime(origin, destination, { arriveBy = null, mode = "transit" } = {}) {
+  const apiKey = process.env.GOOGLE_PLACES_API_KEY;
+  if (!apiKey) return { error: "no_maps_key" };
+  if (!origin || !destination) return { error: "missing_endpoint" };
+  try {
+    const p = new URLSearchParams({
+      origin: String(origin), destination: String(destination), mode, key: apiKey,
+    });
+    // Transit honours arrival_time; driving does not, so for driving we ask for the
+    // duration in traffic at the departure time we're testing.
+    if (arriveBy && mode === "transit") p.set("arrival_time", String(Math.floor(new Date(arriveBy).getTime() / 1000)));
+    else if (mode === "driving") p.set("departure_time", String(Math.floor(Date.now() / 1000)));
+
+    const r = await fetch(`https://maps.googleapis.com/maps/api/directions/json?${p}`);
+    const data = await r.json();
+    if (data.status !== "OK" || !data.routes?.length) return { error: data.status || "no_route" };
+
+    const leg = data.routes[0].legs[0];
+    const seconds = leg.duration_in_traffic?.value ?? leg.duration?.value ?? null;
+    if (seconds == null) return { error: "no_duration" };
+
+    return {
+      seconds,
+      text: leg.duration_in_traffic?.text || leg.duration?.text,
+      mode,
+      // Present ONLY when Google actually scheduled it (transit + arrival_time). For
+      // driving this is absent and the caller must subtract — and say that it did.
+      departure_at: leg.departure_time?.value ? new Date(leg.departure_time.value * 1000).toISOString() : null,
+      arrival_at:   leg.arrival_time?.value   ? new Date(leg.arrival_time.value   * 1000).toISOString() : null,
+      start_address: leg.start_address,
+      end_address: leg.end_address,
+      in_traffic: !!leg.duration_in_traffic,
+    };
+  } catch (e) {
+    console.error("[travelTime]", e.message);
+    return { error: "request_failed" };
+  }
 }
 
 // ── Google Directions Transit routing ────────────────────────────────────────
@@ -13605,16 +13666,16 @@ app.get("/me/inbound-address", auth, async (req, res) => {
   try {
     let [row] = await sql`SELECT inbound_token FROM users WHERE email = ${email}`;
     if (!row?.inbound_token) {
-      // 20 hex chars ≈ 80 bits. This token IS the credential; guessing it must be
-      // hopeless, because knowing it means being able to write to someone's trips.
-      const token = crypto.randomBytes(10).toString("hex");
-      await sql`UPDATE users SET inbound_token = ${token} WHERE email = ${email}`;
-      row = { inbound_token: token };
+      row = { inbound_token: newInboundToken() };
+      await sql`UPDATE users SET inbound_token = ${row.inbound_token} WHERE email = ${email}`;
     }
     const domain = process.env.INBOUND_DOMAIN || "wingmantravel.app";
+    // No `import+` prefix any more. With Resend inbound EVERY address at the domain hits
+    // the same webhook, so the plus-convention bought nothing and cost 7 characters.
+    // Legacy `import+<token>@` addresses still resolve — see the inbound endpoint.
     res.json({
-      address: `import+${row.inbound_token}@${domain}`,
-      hint: "Forward any booking confirmation here. Or set a Gmail filter to forward them automatically — then you never think about it again.",
+      address: `${row.inbound_token}@${domain}`,
+      hint: "Forward any booking confirmation here. Better: set one auto-forward rule in your mail client and you never think about it again.",
     });
   } catch (e) {
     console.error("[me/inbound-address]", e.message);
@@ -13846,6 +13907,141 @@ app.get("/ledger", async (req, res) => {
     res.status(500).json({ error: "ledger_failed", reason: humanError(e) });
   }
 });
+
+// GET /trips/:tripId/departures — "leave by 1:20."
+//
+// THE JOIN. This is the payoff for everything the graph collects.
+//
+// The app knows WHERE YOU'LL BE (the hotel you booked), WHAT YOU'RE DUE AT and WHEN
+// (a timed commitment, usually pasted out of a thread of texts), and Google knows HOW
+// LONG IT TAKES. Nothing joined them, so the most chief-of-staff sentence in travel —
+// "leave the Kimpton by 1:20 to make Dave at 2:30" — could not be said.
+//
+// The honesty rules here are stricter than anywhere else in the app, because this is the
+// one output that can make someone physically miss something:
+//
+//   · No route → NO TIME. It says it couldn't work it out. It never estimates.
+//   · No address on the commitment → it says the address is missing, and asks.
+//   · Driving times are derived (Google won't schedule backwards for driving), so the
+//     response marks them `derived: true` and the UI must not present them as measured.
+//   · The buffer is stated, not hidden. "22-minute ride, 15 minutes of padding" — so you
+//     can disagree with the padding rather than with a number that came from nowhere.
+app.get("/trips/:tripId/departures", async (req, res) => {
+  const email = await verifyAccessToken(req);
+  if (!email) return res.status(401).json({ error: "unauthorized" });
+  try {
+    const tripId = parseInt(req.params.tripId, 10);
+    const [trip] = await sql`SELECT * FROM trips WHERE id = ${tripId} AND user_email = ${email}`;
+    if (!trip) return res.status(404).json({ error: "not_found" });
+
+    const legs = await sql`
+      SELECT * FROM trip_legs WHERE trip_id = ${tripId} ORDER BY departs_at NULLS LAST, id`;
+
+    // Where you'll be staying — the origin for anything that isn't a flight.
+    const stay = legs.find((l) => ["hotel", "airbnb"].includes(l.type) && (l.property_address || l.property_name));
+    const originLabel = stay?.property_name || stay?.destination_city || null;
+    const originAddr  = stay?.property_address || (stay?.property_name && stay?.destination_city
+      ? `${stay.property_name}, ${stay.destination_city}` : null);
+
+    // Timed commitments: constraints the planner recorded with a real clock time, plus
+    // any non-flight legs that have one (a dinner reservation, an event).
+    const cs = await graph.constraintsFor(sql, { user_email: email, trip_id: tripId });
+    const commitments = [];
+
+    for (const c of cs) {
+      const at = c.predicate?.at || c.predicate?.value;
+      if (!at || isNaN(new Date(at))) continue;                 // no clock time → not schedulable
+      if (new Date(at).getTime() < Date.now()) continue;        // already past
+      commitments.push({
+        what: c.rationale || c.kind,
+        at,
+        where: c.predicate?.place || c.scope || null,
+        hardness: c.hardness,
+        source: "constraint",
+      });
+    }
+    for (const l of legs) {
+      if (l.type === "flight" || !l.departs_at) continue;
+      if (new Date(l.departs_at).getTime() < Date.now()) continue;
+      if (stay && l.id === stay.id) continue;                   // you don't travel to your own hotel
+      commitments.push({
+        what: l.property_name || l.destination || l.type,
+        at: l.departs_at,
+        where: l.property_address || l.property_name || l.destination_city || null,
+        hardness: "strong",
+        source: "booking",
+      });
+    }
+
+    commitments.sort((a, b) => new Date(a.at) - new Date(b.at));
+
+    const BUFFER_MIN = 15;   // stated, never hidden
+    const out = [];
+    for (const c of commitments.slice(0, 6)) {
+      if (!originAddr) {
+        out.push({ ...c, leave_by: null, why: "I don't know where you're staying yet — add the hotel and I can work this out." });
+        continue;
+      }
+      if (!c.where) {
+        out.push({ ...c, leave_by: null, why: `I don't have an address for "${c.what}". Tell me where it is and I'll time it.` });
+        continue;
+      }
+
+      const t = await travelTime(originAddr, c.where, { arriveBy: c.at, mode: "transit" });
+      if (t?.error || !t?.seconds) {
+        out.push({ ...c, leave_by: null, why: "I couldn't find a route for this one, so I won't guess a time." });
+        continue;
+      }
+
+      // Transit with an arrival_time gives a MEASURED departure. Otherwise we derive it,
+      // and say so.
+      const derived = !t.departure_at;
+      const leaveBy = t.departure_at
+        ? new Date(new Date(t.departure_at).getTime() - BUFFER_MIN * 60000)
+        : new Date(new Date(c.at).getTime() - (t.seconds * 1000) - BUFFER_MIN * 60000);
+
+      out.push({
+        ...c,
+        leave_by: leaveBy.toISOString(),
+        travel_minutes: Math.round(t.seconds / 60),
+        buffer_minutes: BUFFER_MIN,
+        mode: t.mode,
+        derived,
+        from: originLabel || t.start_address,
+        why: `${Math.round(t.seconds / 60)} min by ${t.mode}, plus ${BUFFER_MIN} min of padding.`,
+      });
+    }
+
+    res.json({ trip_id: tripId, staying_at: originLabel, departures: out });
+  } catch (e) {
+    console.error("[departures]", e.message);
+    res.status(500).json({ error: "departures_failed", reason: humanError(e) });
+  }
+});
+
+// ─────────────────────────────────────────────────────────────────────────────
+// newInboundToken — the forwarding address IS a credential.
+//
+// Anyone who knows a user's inbound address can write bookings into their account, and
+// those bookings are then fed to the concierge — so a guessable address is a
+// prompt-injection channel into somebody else's assistant. It must be unguessable.
+//
+// It also has to be typed, read aloud, and put into a mail rule by a human, so the old
+// 20-hex-char token was needlessly hostile. Base32 packs more entropy per character:
+//
+//   20 hex chars  = 80 bits, 20 characters
+//   12 base32     = 60 bits, 12 characters
+//
+// 60 bits is still hopeless to guess (a billion attempts a second gets you nowhere in a
+// human lifetime), and it's 8 characters shorter. The alphabet drops i, l, o and u — the
+// characters people mistranscribe and that form accidental words.
+const TOKEN_ALPHABET = "0123456789abcdefghjkmnpqrstvwxyz";   // 32 chars, no i/l/o/u
+function newInboundToken(len = 12) {
+  const bytes = crypto.randomBytes(len);
+  let out = "";
+  for (let i = 0; i < len; i++) out += TOKEN_ALPHABET[bytes[i] % TOKEN_ALPHABET.length];
+  return out;
+}
 
 // ─────────────────────────────────────────────────────────────────────────────
 // humanError — never hand a user a raw infrastructure error.

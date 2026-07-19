@@ -14,7 +14,10 @@
 const crypto = require("crypto");
 
 const SECRET = "s3cret-webhook-key";
-const USERS  = { "a1b2c3d4e5f60718": "maddie@example.com" };   // token → user
+const USERS  = {
+  "a1b2c3d4e5f60718": "maddie@example.com",   // legacy 20-hex token
+  "k7m2xq9rt4vn":     "maddie@example.com",   // new 12-char base32 token
+};
 
 // The endpoint's decision logic, lifted verbatim in shape from server.js.
 function inbound({ headers = {}, query = {}, body = {} }) {
@@ -30,11 +33,14 @@ function inbound({ headers = {}, query = {}, body = {} }) {
     body.to, body.envelope?.to, body.recipient, body.cc, body.bcc,
     body["envelope-to"], body.delivered_to, body["delivered-to"],
   ].map(flat).join(",").toLowerCase();
-  const m = allRecipients.match(/\+([a-z0-9]{16,})@/);
-  const token = m ? m[1] : null;
-  if (!token) return { status: 200, wrote: null, reason: "no token" };
+  // Both address shapes must resolve — the new bare token AND the legacy import+ form.
+  const candidates = new Set();
+  for (const m of allRecipients.matchAll(/\+([a-z0-9]{10,})@/g)) candidates.add(m[1]);
+  for (const m of allRecipients.matchAll(/(?:^|[,\s<])([a-z0-9]{10,})@/g)) candidates.add(m[1]);
+  if (candidates.size === 0) return { status: 200, wrote: null, reason: "no token" };
 
-  const user = USERS[token];
+  let user = null;
+  for (const c of candidates) if (USERS[c]) { user = USERS[c]; break; }
   if (!user) return { status: 200, wrote: null, reason: "unknown token" };
   return { status: 200, wrote: user };
 }
@@ -114,6 +120,24 @@ allows("...and a provider that only sets Delivered-To", inbound({
   headers: { "x-wingman-inbound-secret": SECRET },
   body: { from: "united@united.com", "delivered-to": "import+a1b2c3d4e5f60718@wingmantravel.app", text: "x".repeat(50) },
 }), "maddie@example.com");
+
+// ── The shorter address, and the promise not to orphan the old one ──────────
+allows("the NEW short address (no import+ prefix)", inbound({
+  headers: { "x-wingman-inbound-secret": SECRET },
+  body: { from: "united@united.com", to: "k7m2xq9rt4vn@inbox.wingmantravel.app", text: "x".repeat(50) },
+}), "maddie@example.com");
+
+// Changing the address format must not silently kill an address someone already put
+// into a mail-forwarding rule. That breaks ingestion weeks later, with no error anywhere.
+allows("...and the LEGACY import+ address still resolves", inbound({
+  headers: { "x-wingman-inbound-secret": SECRET },
+  body: { from: "united@united.com", to: "import+a1b2c3d4e5f60718@inbox.wingmantravel.app", text: "x".repeat(50) },
+}), "maddie@example.com");
+
+refuses("a short address that matches no user", inbound({
+  headers: { "x-wingman-inbound-secret": SECRET },
+  body: { from: "x@y.com", to: "zzzzzzzzzzzz@inbox.wingmantravel.app", text: "x".repeat(50) },
+}));
 
 console.log(`\n${d}──────────────────────────────────────────────────────────${x}`);
 console.log(`${fail === 0 ? g + "all " + pass + " held" : r + fail + " FAILED, " + pass + " held"}${x}\n`);
