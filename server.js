@@ -6214,7 +6214,7 @@ app.get("/trips/:id/dossier", async (req, res) => {
     res.json({ trip, chapters, in_motion: !!inMotion });
   } catch (e) {
     console.error("[dossier]", e.message);
-    res.status(500).json({ error: e.message });
+    res.status(500).json({ error: "dossier_failed", reason: humanError(e) });
   }
 });
 
@@ -13367,7 +13367,7 @@ app.get("/situation/:legId", auth, async (req, res) => {
     });
   } catch (e) {
     console.error("[situation]", e.message);
-    res.status(500).json({ error: e.message });
+    res.status(500).json({ error: "situation_failed", reason: humanError(e) });
   }
 });
 
@@ -13843,9 +13843,32 @@ app.get("/ledger", async (req, res) => {
     });
   } catch (e) {
     console.error("[ledger]", e.message);
-    res.status(500).json({ error: e.message });
+    res.status(500).json({ error: "ledger_failed", reason: humanError(e) });
   }
 });
+
+// ─────────────────────────────────────────────────────────────────────────────
+// humanError — never hand a user a raw infrastructure error.
+//
+// The Dossier rendered this, verbatim, on a real phone:
+//   {"message":"Your account or project has exceeded the compute time quota...",
+//    "internalPosition":null,"internalQuery":null,"severity":"","where":null,...}
+//
+// Two problems. It's unreadable — she has no idea whether her trip is gone or the app
+// is broken. And it leaks internals (driver shape, schema fields) to the client for no
+// benefit. The real cause still goes to the server log, where it belongs; the user gets
+// a sentence that tells them what it means for THEM and whether their data is safe.
+function humanError(e) {
+  const raw = String(e?.message || "");
+  if (/compute time quota|exceeded.*quota|too many connections|Control plane/i.test(raw)) {
+    return "My database is over its usage limit right now — your trips are safe, I just can't read them this second. It should clear shortly.";
+  }
+  if (/ECONNREFUSED|ETIMEDOUT|ENOTFOUND|connection terminated|socket hang up/i.test(raw)) {
+    return "I couldn't reach the database just now. Nothing is lost — try again in a moment.";
+  }
+  if (/timeout/i.test(raw)) return "That took too long to load. Try again in a moment.";
+  return "Something went wrong on my end. Nothing is lost — try again in a moment.";
+}
 
 // GET /ledger/:id — one decision, in full: what it weighed, what it chose, and what
 // it was protecting when it chose. The Ledger list shows the verdict; this shows the
@@ -13907,7 +13930,7 @@ app.get("/ledger/:id", async (req, res) => {
     });
   } catch (e) {
     console.error("[ledger/:id]", e.message);
-    res.status(500).json({ error: e.message });
+    res.status(500).json({ error: "ledger_failed", reason: humanError(e) });
   }
 });
 
@@ -13939,7 +13962,7 @@ app.get("/me/constraints", async (req, res) => {
     });
   } catch (e) {
     console.error("[me/constraints]", e.message);
-    res.status(500).json({ error: e.message });
+    res.status(500).json({ error: "constraints_failed", reason: humanError(e) });
   }
 });
 
