@@ -5092,11 +5092,54 @@ app.get("/admin/provenance", async (req, res) => {
       };
     });
 
+    // ── WHY did the mega-trips form? ────────────────────────────────────────
+    //
+    // The audit found 18 same-city trips spanning years each, with zero corrupt
+    // date spans between them. That rules out the old poison-leg mechanism and
+    // points at the other welder: a confirmation string shared by legs that are
+    // nowhere near each other in time.
+    //
+    // Pointing at a cause is not the same as showing it, and this project has been
+    // burned before by a confident explanation nobody checked. So: list them, say
+    // whether each string would even qualify as a booking reference under the
+    // current rule, and let the data settle it.
+    const conflicts = await sql`
+      SELECT LOWER(TRIM(tl.confirmation)) AS conf,
+             COUNT(*) AS legs,
+             COUNT(DISTINCT tl.trip_id) AS trips,
+             MIN(tl.departs_at) AS first_seen,
+             MAX(tl.departs_at) AS last_seen
+      FROM trip_legs tl JOIN trips t ON t.id = tl.trip_id
+      WHERE t.user_email = ${email}
+        AND tl.confirmation IS NOT NULL AND TRIM(tl.confirmation) <> ''
+        AND tl.departs_at IS NOT NULL
+      GROUP BY LOWER(TRIM(tl.confirmation))
+      HAVING COUNT(*) > 1
+         AND MAX(tl.departs_at) - MIN(tl.departs_at) > ${MAX_TRIP_DAYS + " days"}::interval
+      ORDER BY MAX(tl.departs_at) - MIN(tl.departs_at) DESC
+      LIMIT 40
+    `;
+    const collisions = conflicts.map((c) => ({
+      confirmation: c.conf,
+      legs: Number(c.legs),
+      trips: Number(c.trips),
+      spans_days: Math.round((new Date(c.last_seen) - new Date(c.first_seen)) / 86400000),
+      // The load-bearing column. `false` means today's rule would already refuse to
+      // group on this string — i.e. the damage is historical and cannot recur.
+      // `true` means a plausible-looking reference is being reused, which the reach
+      // guard now catches but which is worth seeing with your own eyes.
+      looks_like_a_reference: !!usableConfirmation(c.conf),
+    }));
+
     const tally = {};
     for (const t of trips) tally[t.verdict] = (tally[t.verdict] || 0) + 1;
     res.json({
       ok: true, total: trips.length, by_verdict: tally,
       would_expire_legs: trips.reduce((n, t) => n + t.would_expire, 0),
+      collisions,
+      collisions_note: collisions.length
+        ? "confirmation strings shared by legs more than a month apart — the thing that welds trips together"
+        : "no confirmation string is shared across distant dates",
       trips,
     });
   } catch (e) {
