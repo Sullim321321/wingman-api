@@ -3714,10 +3714,19 @@ app.post("/inbound/email", async (req, res) => {
   // deploy cycle because the fetch failed silently and the reply looked identical to the
   // fetch never running. A diagnostic you can't see from where you're standing is not a
   // diagnostic.
+  // Reading an inbound message needs a key with READ permission. The key we send auth
+  // emails with is deliberately restricted to sending — Resend says so plainly:
+  //   401 "This API key is restricted to only send emails"
+  //
+  // The lazy fix is to widen that key to full access. Don't: it's the key that mails
+  // sign-in codes, and broadening its powers to solve an unrelated problem is how
+  // least-privilege quietly rots. Use a SECOND, read-capable key instead, and leave the
+  // sending key exactly as restricted as it is.
+  const readKey = process.env.RESEND_READ_KEY || process.env.RESEND_API_KEY;
   let fetchNote = null;
   if (!text && !html && mail.email_id) {
-    if (!process.env.RESEND_API_KEY) {
-      fetchNote = "no RESEND_API_KEY on the server";
+    if (!readKey) {
+      fetchNote = "no RESEND_READ_KEY / RESEND_API_KEY on the server";
     } else {
       // Resend has moved this path around; try the inbound-specific route first, then the
       // generic one. Record which (if either) actually answered.
@@ -3727,7 +3736,7 @@ app.post("/inbound/email", async (req, res) => {
       ];
       for (const url of urls) {
         try {
-          const r = await fetch(url, { headers: { Authorization: `Bearer ${process.env.RESEND_API_KEY}` } });
+          const r = await fetch(url, { headers: { Authorization: `Bearer ${readKey}` } });
           const body = await r.text();
           if (r.ok) {
             let full = {};
@@ -3737,7 +3746,9 @@ app.post("/inbound/email", async (req, res) => {
             fetchNote = `${url.split("/").slice(-2).join("/")} → 200, keys: ${Object.keys(full).join(",").slice(0, 200)}`;
             if (text || html) break;
           } else {
-            fetchNote = `${url.split("/").slice(-2).join("/")} → HTTP ${r.status}: ${body.slice(0, 160)}`;
+            fetchNote = r.status === 401 && /restricted/i.test(body)
+              ? "401 — the Resend key can only SEND. Add a read-capable key as RESEND_READ_KEY."
+              : `${url.split("/").slice(-2).join("/")} → HTTP ${r.status}: ${body.slice(0, 160)}`;
           }
         } catch (e) {
           fetchNote = `fetch threw: ${e.message}`;
