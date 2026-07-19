@@ -3668,8 +3668,14 @@ app.post("/inbound/email", async (req, res) => {
 
   const from    = mail.from    || mail.envelope?.from || mail.sender || "";
   const subject = mail.subject || "";
-  const text    = mail.text    || mail.plain || mail["body-plain"] || "";
-  const html    = mail.html    || mail["body-html"] || "";
+  // Providers disagree about where the body lives, and a wrong guess here looks exactly
+  // like an empty email. Try every shape we've seen, then — if it's STILL empty — log the
+  // keys we actually received, so the next failure names the field instead of repeating
+  // "body too short" forever.
+  const text = mail.text || mail.plain || mail["body-plain"] || mail.text_body
+    || mail.TextBody || mail.body?.text || "";
+  const html = mail.html || mail["body-html"] || mail.html_body
+    || mail.HtmlBody || mail.body?.html || "";
 
   const senderMatch = String(from).match(/[a-zA-Z0-9._%+\-]+@[a-zA-Z0-9.\-]+\.[a-zA-Z]{2,}/);
   const senderEmail = senderMatch ? senderMatch[0].toLowerCase() : null;
@@ -3747,8 +3753,19 @@ app.post("/inbound/email", async (req, res) => {
     // This is the "forwarded as attachment" / empty-body case. Say so explicitly, with
     // the lengths, so the log tells you whether the email arrived without a readable body
     // versus not arriving at all.
-    console.warn(`[inbound] rejected: body too short (text=${text.length}, html=${html.length}) for ${userEmail}`);
-    return res.status(200).json({ ok: false, reason: "body too short", text_len: text.length, html_len: html.length });
+    // We reached the right user and still found no body — so the content is in a field
+    // we aren't reading. Report the KEYS Resend actually sent, and the size of each, so
+    // the next delivery names the field instead of repeating "body too short" forever.
+    // A diagnostic that doesn't narrow anything is just a nicer way to stay stuck.
+    const shape = Object.entries(mail)
+      .map(([k, v]) => `${k}:${typeof v === "string" ? v.length : Array.isArray(v) ? `[${v.length}]` : typeof v}`)
+      .join(" ");
+    console.warn(`[inbound] body too short for ${userEmail} — payload shape: ${shape}`);
+    return res.status(200).json({
+      ok: false, reason: "body too short",
+      text_len: text.length, html_len: html.length,
+      payload_shape: shape.slice(0, 400),
+    });
   }
 
   try {
