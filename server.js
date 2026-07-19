@@ -3686,21 +3686,40 @@ app.post("/inbound/email", async (req, res) => {
   // The content must be FETCHED with that id. This is why every field we tried came back
   // empty: the body was never in the webhook to begin with. (I guessed `raw` first and
   // was wrong — worth recording, so the next person doesn't re-guess it.)
-  if (!text && !html && mail.email_id && process.env.RESEND_API_KEY) {
-    try {
-      const r = await fetch(`https://api.resend.com/emails/${mail.email_id}`, {
-        headers: { Authorization: `Bearer ${process.env.RESEND_API_KEY}` },
-      });
-      if (r.ok) {
-        const full = await r.json();
-        text = full.text || full.plain || "";
-        html = full.html || "";
-        console.log(`[inbound] fetched body for ${mail.email_id} (text=${text.length}, html=${html.length})`);
-      } else {
-        console.warn(`[inbound] could not fetch email ${mail.email_id}: HTTP ${r.status}`);
+  // `fetchNote` is reported in the RESPONSE, not just the log. The previous round cost a
+  // deploy cycle because the fetch failed silently and the reply looked identical to the
+  // fetch never running. A diagnostic you can't see from where you're standing is not a
+  // diagnostic.
+  let fetchNote = null;
+  if (!text && !html && mail.email_id) {
+    if (!process.env.RESEND_API_KEY) {
+      fetchNote = "no RESEND_API_KEY on the server";
+    } else {
+      // Resend has moved this path around; try the inbound-specific route first, then the
+      // generic one. Record which (if either) actually answered.
+      const urls = [
+        `https://api.resend.com/emails/inbound/${mail.email_id}`,
+        `https://api.resend.com/emails/${mail.email_id}`,
+      ];
+      for (const url of urls) {
+        try {
+          const r = await fetch(url, { headers: { Authorization: `Bearer ${process.env.RESEND_API_KEY}` } });
+          const body = await r.text();
+          if (r.ok) {
+            let full = {};
+            try { full = JSON.parse(body); } catch {}
+            text = full.text || full.plain || full.text_body || "";
+            html = full.html || full.html_body || "";
+            fetchNote = `${url.split("/").slice(-2).join("/")} → 200, keys: ${Object.keys(full).join(",").slice(0, 200)}`;
+            if (text || html) break;
+          } else {
+            fetchNote = `${url.split("/").slice(-2).join("/")} → HTTP ${r.status}: ${body.slice(0, 160)}`;
+          }
+        } catch (e) {
+          fetchNote = `fetch threw: ${e.message}`;
+        }
       }
-    } catch (e) {
-      console.error("[inbound] body fetch failed:", e.message);
+      console.log(`[inbound] body fetch — ${fetchNote}`);
     }
   }
 
@@ -3817,6 +3836,7 @@ app.post("/inbound/email", async (req, res) => {
       ok: false, reason: "body too short",
       text_len: text.length, html_len: html.length,
       payload_shape: shape.slice(0, 400),
+      body_fetch: fetchNote || "not attempted",
     });
   }
 
