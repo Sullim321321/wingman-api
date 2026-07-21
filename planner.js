@@ -19,6 +19,7 @@
 
 const Anthropic = require("@anthropic-ai/sdk");
 const graph = require("./constraints");
+const datecheck = require("./datecheck");
 const { link } = graph;
 
 // maxRetries covers the transport failures that are NOT the model's fault — the
@@ -771,8 +772,36 @@ async function converse({ message, known = [], history = [], findings = null, no
     }
   }
 
+  // ── CHECK THE OUTPUT, DON'T JUST INSTRUCT THE INPUT ────────────────────────
+  //
+  // The 21-day calendar above is correct and sits in the system prompt, and the model
+  // read it twice and then wrote "Arrive Thursday, July 24" for a Sunday-July-19
+  // conversation. July 24 is a Friday. The instruction said, in capitals, never to
+  // work out a weekday itself.
+  //
+  // Instructions are requests. This is the guarantee: a weekday and a date are two
+  // claims about one fact, so they can be cross-examined against the calendar we
+  // already built — no model, no cost, no ambiguity. If they disagree we do not need
+  // anyone's opinion about which is right.
+  const calData = datecheck.buildCalendar(clock.toISOString(), tz, 21);
+  const fixReply = datecheck.correctDateClaims(reply, calData, message);
+  if (fixReply.fixed.length) {
+    console.warn("[planner] corrected date claims:",
+      fixReply.fixed.map((f) => `"${f.from}" → "${f.to}" (${f.basis})`).join("; "));
+  }
+  for (const c of constraints) {
+    if (!c || typeof c.rationale !== "string") continue;
+    const r = datecheck.correctDateClaims(c.rationale, calData, message);
+    if (r.fixed.length) {
+      c.rationale = r.text;
+      // The graph records that it was corrected. A constraint that was quietly
+      // rewritten is still an unexplained assertion, which is the thing we're against.
+      c.evidence = { ...(c.evidence || {}), date_corrected: r.fixed };
+    }
+  }
+
   return {
-    reply,
+    reply: fixReply.text,
     intents: asArray(out.intents),
     constraints,
     shape: asArray(out.shape).map(stripShape),

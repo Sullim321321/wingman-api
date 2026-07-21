@@ -1377,6 +1377,13 @@ app.get("/activity", async (req, res) => {
       FROM activity_events ae
       LEFT JOIN trips t ON t.id = ae.trip_id
       WHERE ae.user_email = ${email} AND ae.dismissed IS NOT TRUE
+        -- ── HOUSEKEEPING HUMS; IT DOES NOT ANNOUNCE ───────────────────────────
+        -- Wingman retiring three of its own stale suggestions is bookkeeping. It
+        -- belongs in the ledger, where you can audit it if you ever wonder what
+        -- happened, and nowhere else. This afternoon it went straight to the top of
+        -- Home as three identical lines — the assistant reporting on its own filing.
+        -- A signal is something that changed in the WORLD and might need you.
+        AND ae.type NOT IN ('sketch_expired', 'import', 'scan', 'cleanup', 'retitle')
       ORDER BY ae.created_at DESC
       LIMIT ${limit}
     `;
@@ -2545,6 +2552,7 @@ const ANCHOR_TYPES = new Set(["flight", "hotel", "airbnb", "train", "ferry", "cr
 // holiday. Its end date is discarded rather than trusted.
 const { usableConfirmation, confirmationReachOk } = require("./grouping");
 const sketches = require("./sketches");
+const tripdoc = require("./document");
 
 const MAX_STAY_NIGHTS = 30;
 const MAX_TRIP_DAYS   = 30;   // a single trip should not span longer than this
@@ -6545,59 +6553,113 @@ app.get("/trips/:id/dossier", async (req, res) => {
     const inMotion = firstDep && lastArr &&
       now >= new Date(firstDep).getTime() && now <= new Date(lastArr).getTime();
 
-    const chapterOf = (l) => {
-      if (l.state === "proposed" || !l.departs_at) return "plan";
-      const dep = new Date(l.departs_at).getTime();
-      const arr = l.arrives_at ? new Date(l.arrives_at).getTime() : dep;
-      if (now > arr) return "after";
-      if (now >= dep && now <= arr) return "in_motion";
-      // A LEG's chapter is decided by ITS OWN times, never by the trip's.
-      // This used to read `if (inMotion) return "in_motion"`, which shoved every leg of a
-      // live trip into "happening now" — so a flight three days away rendered as
-      // in-progress. "Happening now" has to mean happening now, or the word is worthless
-      // on the one screen where you'd act on it.
-      return "prepare";
-    };
-
-    // ── An Uber is an expense; a seaplane is an appointment ─────────────────────
-    // TripDetail already collapses unnamed short car/transfer legs into a quiet count.
-    // The Dossier is a NEW surface and never inherited the rule, so four address-to-address
-    // "Nashville" rides and a leg literally called "transfer" were sitting in the itinerary
-    // with the same weight as a hotel. Same content, new screen, old noise.
-    //
-    // The distinction is the same one as before: an Uber has no name. "Seaplane transfer"
-    // does. A NAMED transfer stays visible — it's the kind of thing the cascade defends.
-    const isRide = (l) =>
-      (l.type === "car" || l.type === "transfer") &&
-      !l.property_name &&
-      !l.vehicle_class &&
-      !l.nights &&
-      !l.confirmation;
-
-    const chapters = { plan: [], prepare: [], in_motion: [], after: [] };
-    const rides = { plan: 0, prepare: 0, in_motion: 0, after: 0 };
-    for (const l of legs) {
-      const ch = chapterOf(l);
-      if (isRide(l)) { rides[ch]++; continue; }
-      chapters[ch].push({
-        ...l,
-        display_name: l.type === "flight" ? flightid.displayName(l) : (l.property_name || l.destination_city || l.destination),
-        depends_on: depBy[l.id] || [],
-      });
-    }
+    // Chapters, rides and names come from document.js — the same rules Home reads.
+    // Home showing a different answer to "is this happening now" than the Dossier
+    // would be the trip-title bug again, wearing a new hat.
+    const { chapters, rides } = tripdoc.toChapters(legs, now, flightid, depBy);
 
     // ── Is any of this real? ────────────────────────────────────────────────
     // A trip built entirely from proposals is an IDEA, and the screen has to say so
     // in its own voice rather than leaving the user to infer it from four dashed
     // borders. She asked where she might go for three days; she should not have to
     // audit border styles to find out whether she's going.
-    const committedCount = legs.filter((l) => l.state !== "proposed").length;
-    const certainty = committedCount === 0 ? "idea" : "real";
+    const certainty = tripdoc.certaintyOf(legs);
 
     res.json({ trip, chapters, rides, certainty, in_motion: !!inMotion });
   } catch (e) {
     console.error("[dossier]", e.message);
     res.status(500).json({ error: "dossier_failed", reason: humanError(e) });
+  }
+});
+
+// GET /today — today's page of the same document.
+//
+// ─────────────────────────────────────────────────────────────────────────────
+// Home is not a different screen from the Dossier. It is the Dossier, read through
+// a narrower window: what is happening now, and what is close enough to need you.
+//
+// It reads across ALL trips deliberately. A day does not respect trip boundaries —
+// you can be checked into a hotel in Nashville with a Chicago flight the day after
+// next, and both are today's problem. The old Home asked "what is the next FLIGHT"
+// and, finding none, told a woman sitting in a hotel that she had nothing on her
+// calendar.
+//
+// Chapters, rides, names and certainty all come from document.js, so Home and the
+// Dossier cannot drift into disagreeing about whether something is happening now.
+// ─────────────────────────────────────────────────────────────────────────────
+app.get("/today", async (req, res) => {
+  const email = await verifyAccessToken(req);
+  if (!email) return res.status(401).json({ error: "unauthorized" });
+  try {
+    const horizonHours = Math.min(parseInt(req.query.hours || "36", 10) || 36, 168);
+    const now = Date.now();
+
+    const legs = await sql`
+      SELECT tl.*, t.id AS trip_id, t.title AS trip_title
+      FROM trip_legs tl JOIN trips t ON t.id = tl.trip_id
+      WHERE t.user_email = ${email}
+        AND t.archived = false
+        AND tl.departs_at IS NOT NULL
+        AND COALESCE(tl.state, '') <> 'proposed'
+        -- happening now, or starting inside the horizon, or a stay we're still inside
+        AND COALESCE(tl.arrives_at, tl.departs_at) >= NOW() - INTERVAL '2 hours'
+        AND tl.departs_at <= NOW() + (${horizonHours} * INTERVAL '1 hour')
+      ORDER BY tl.departs_at ASC
+    `;
+
+    // The dependency edges for exactly these legs — the line that makes Home worth
+    // reading. "Dinner depends on JL 623 · 40 minutes" is the whole product, and it
+    // belongs on the screen you open every day, not only in the archive.
+    const ids = legs.map((l) => l.id);
+    const depBy = {};
+    if (ids.length) {
+      const edges = await sql`
+        SELECT d.from_commitment, d.to_commitment, d.kind, d.slack_minutes, d.confidence,
+               tl.carrier, tl.flight_number, tl.origin, tl.destination, tl.property_name,
+               tl.destination_city, tl.type AS to_type
+        FROM depends_on d
+        JOIN trip_legs tl ON tl.id = d.to_commitment
+        WHERE d.from_commitment = ANY(${ids})
+      `;
+      for (const e of edges) {
+        (depBy[e.from_commitment] ||= []).push({
+          to: e.to_commitment,
+          on: e.to_type === "flight"
+            ? flightid.displayName(e)
+            : (e.property_name || e.destination_city || e.destination || "the next booking"),
+          slack_minutes: e.slack_minutes,
+          certain: e.confidence >= 0.9,
+          kind: e.kind,
+        });
+      }
+    }
+
+    const { chapters, rides } = tripdoc.toChapters(legs, now, flightid, depBy);
+
+    // Which trips are represented, so Home can offer the full document.
+    const seen = new Map();
+    for (const l of legs) if (!seen.has(l.trip_id)) seen.set(l.trip_id, l.trip_title);
+    const trips = [...seen].map(([id, title]) => ({ id, title }));
+
+    // ── EMPTY IS NOT THE SAME AS QUIET ──────────────────────────────────────
+    // "Nothing needs you" is a claim, and it is only honest when we actually looked
+    // and found nothing. Say which it is, so the screen can tell the difference
+    // between a calm day and a day we couldn't see.
+    const anything = chapters.in_motion.length + chapters.prepare.length +
+                     rides.in_motion + rides.prepare;
+
+    res.json({
+      ok: true,
+      now: new Date(now).toISOString(),
+      horizon_hours: horizonHours,
+      chapters: { in_motion: chapters.in_motion, prepare: chapters.prepare },
+      rides: { in_motion: rides.in_motion, prepare: rides.prepare },
+      trips,
+      state: chapters.in_motion.length ? "in_motion" : (anything ? "ahead" : "clear"),
+    });
+  } catch (e) {
+    console.error("[today]", e.message);
+    res.status(500).json({ ok: false, error: humanError(e) });
   }
 });
 
@@ -11919,6 +11981,53 @@ app.get("/me/home-state", async (req, res) => {
         }
       }
       if (state === "in_transit" || state === "at_airport") break;
+    }
+
+    // ── YOU ARE SOMEWHERE, EVEN WITHOUT A FLIGHT ────────────────────────────
+    //
+    // Everything above this line looks only at flights, and `at_destination` below
+    // requires a flight explicitly marked "Landed". So a woman sitting in the
+    // Kimpton Aertson in Nashville, mid-trip, registered as `no_trip` — and Home
+    // told her "Nothing on your calendar yet."
+    //
+    // That is the whole product failing in one line. Wingman is supposed to hold the
+    // TRIP, not the bookings; a hotel you are currently inside is the most concrete
+    // fact available about where you are, and it was being skipped for not being a
+    // plane. Drove there, took the train, someone else booked the flight — all of it
+    // read as an empty life.
+    //
+    // So: if any leg's span contains right now, you are at your destination. This
+    // ranks below in_transit and at_airport (a flight in the next four hours is more
+    // urgent than the hotel you're standing in) but above pre_departure, because
+    // where you ARE beats where you're going next.
+    if (state === "no_trip" || state === "pre_departure") {
+      const spanning = await sql`
+        SELECT tl.*, t.id AS trip_id, t.title AS trip_title,
+               t.destination_city, t.destination_country
+        FROM trip_legs tl JOIN trips t ON t.id = tl.trip_id
+        WHERE t.user_email = ${email}
+          AND t.archived = false
+          AND COALESCE(tl.state, '') <> 'proposed'
+          AND tl.departs_at IS NOT NULL
+          AND tl.departs_at <= NOW()
+          AND COALESCE(tl.arrives_at, tl.departs_at + INTERVAL '1 day') >= NOW()
+        ORDER BY
+          CASE WHEN tl.type IN ('hotel','airbnb') THEN 0 ELSE 1 END,
+          tl.departs_at DESC
+        LIMIT 1
+      `;
+      if (spanning[0]) {
+        state = "at_destination";
+        activeLeg = spanning[0];
+        activeTrip = {
+          id: spanning[0].trip_id,
+          title: spanning[0].trip_title,
+          destination_city: spanning[0].destination_city
+            || spanning[0].destination_city_leg
+            || spanning[0].destination,
+          destination_country: spanning[0].destination_country,
+        };
+      }
     }
 
     // Check if user just landed (at destination): last leg landed in past 24h
