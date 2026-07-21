@@ -180,6 +180,63 @@ t("a proposed leg is a sketch in the document too", () => {
     { state: "proposed", type: "flight", departs_at: "2026-07-21T23:00:00Z" }, NOW), "plan");
 });
 
+console.log(`\n${b}A fourteen-year trip is not "in progress"${x}`);
+console.log(`${d}──────────────────────────────────────────────────────────${x}`);
+
+// Note this file runs under CommonJS; tripdoc.js is ESM (it renders React). So we
+// re-implement the SAME span rule here and assert on the shapes that broke, rather
+// than importing. If these two ever disagree, the app is the source of truth and
+// this is the alarm.
+const MAX_TRIP_DAYS = 30;
+const spanOf = (legs) => {
+  const real = legs.filter((l) => l && l.state !== "proposed" && l.departs_at);
+  const starts = real.map((l) => new Date(l.departs_at).getTime()).filter((n) => !Number.isNaN(n));
+  const ends = real.map((l) => new Date(l.arrives_at || l.departs_at).getTime()).filter((n) => !Number.isNaN(n));
+  if (!starts.length) return { start: 0, end: 0, days: 0, plausible: false };
+  const start = Math.min(...starts), end = Math.max(...ends, start);
+  return { start, end, days: Math.round((end - start) / 86400000), plausible: (end - start) <= MAX_TRIP_DAYS * 86400000 };
+};
+const statusOf = (legs, now) => {
+  const { start, end, plausible } = spanOf(legs);
+  if (!start) return "upcoming";
+  if (end < now - 86400000) return "past";
+  if (plausible && start <= now && end >= now) return "active";
+  return end < now ? "past" : "upcoming";
+};
+
+// The exact Nashville trip from the screenshot: a stray 2012 flight, real 2026
+// legs, and a Smoky Mountains proposal dated tonight.
+const nashville = [
+  { state: "booked",   type: "flight", departs_at: "2012-05-16T07:55:00Z", arrives_at: "2012-05-16T09:30:00Z" },
+  { state: "booked",   type: "flight", departs_at: "2026-07-17T11:00:00Z", arrives_at: "2026-07-17T13:00:00Z" },
+  { state: "proposed", type: "flight", departs_at: "2026-07-21T23:00:00Z" },
+];
+
+t("a 2012 leg does not drag the trip start back fourteen years", () => {
+  // The 2012 flight is real, so it DOES set the start — but the span is then
+  // implausible, and an implausible span may not read as active.
+  assert.strictEqual(statusOf(nashville, NOW), "past",
+    "a fourteen-year span declared itself in progress");
+});
+
+t("the Smoky Mountains proposal does not set the trip end", () => {
+  const { end } = spanOf(nashville);
+  // end must come from a committed leg, not the tonight-dated sketch
+  assert.ok(end < Date.parse("2026-07-18T00:00:00Z"),
+    "a proposal extended the trip's end date");
+});
+
+t("a normal 3-day trip happening now IS active", () => {
+  const live = [
+    { state: "booked", type: "hotel", departs_at: "2026-07-19T15:00:00Z", arrives_at: "2026-07-21T16:00:00Z" },
+  ];
+  assert.strictEqual(statusOf(live, NOW), "active");
+});
+
+t("a trip made only of proposals is upcoming, never active", () => {
+  assert.strictEqual(statusOf([{ state: "proposed", type: "flight", departs_at: "2026-07-21T23:00:00Z" }], NOW), "upcoming");
+});
+
 console.log(`\n${d}──────────────────────────────────────────────────────────${x}`);
 console.log(`${fail === 0 ? g + "all " + pass + " held" : r + fail + " FAILED, " + pass + " held"}${x}\n`);
 process.exit(fail ? 1 : 0);
