@@ -6605,7 +6605,11 @@ app.get("/today", async (req, res) => {
         AND COALESCE(tl.state, '') <> 'proposed'
         -- happening now, or starting inside the horizon, or a stay we're still inside
         AND COALESCE(tl.arrives_at, tl.departs_at) >= NOW() - INTERVAL '2 hours'
-        AND tl.departs_at <= NOW() + (${horizonHours} * INTERVAL '1 hour')
+        -- The codebase's idiom for intervals, which I broke by inventing my own.
+        -- Interpolating a number and multiplying it by INTERVAL sends it as TEXT, and
+        -- Postgres has no text-times-interval operator, so this threw on every call
+        -- and /today 500'd silently.
+        AND tl.departs_at <= NOW() + ${horizonHours + " hours"}::interval
       ORDER BY tl.departs_at ASC
     `;
 
