@@ -1315,6 +1315,7 @@ app.post("/me/test-morning-briefing", async (req, res) => {
       SELECT tl.departs_at, tl.origin, tl.destination, tl.destination_city, tl.carrier, tl.flight_number
       FROM trips t JOIN trip_legs tl ON tl.trip_id = t.id
       WHERE t.user_email = ${email} AND tl.type = 'flight'
+        AND COALESCE(tl.state,'') <> 'proposed'
         AND COALESCE(tl.arrives_at, tl.departs_at) > NOW()
       ORDER BY tl.departs_at ASC LIMIT 1
     `;
@@ -5360,7 +5361,8 @@ app.post("/decisions/simulate", async (req, res) => {
     const [leg] = await sql`
       SELECT tl.*, t.id AS trip_id, t.title
       FROM trip_legs tl JOIN trips t ON t.id = tl.trip_id
-      WHERE t.user_email = ${email} AND tl.type = 'flight' AND tl.departs_at > NOW()
+      WHERE t.user_email = ${email} AND tl.type = 'flight'
+        AND COALESCE(tl.state,'') <> 'proposed' AND tl.departs_at > NOW()
       ORDER BY tl.departs_at ASC LIMIT 1`;
     const ident = leg ? (flightid.displayName(leg) || "") : "";
     const route = leg ? `${leg.origin || "?"} → ${leg.destination || "?"}` : "BOS → LHR";
@@ -7772,6 +7774,12 @@ async function pollDisruptions() {
       FROM trip_legs tl
       JOIN trips t ON t.id = tl.trip_id
       WHERE tl.type = 'flight'
+        -- A SUGGESTION IS NOT A FLIGHT. Wingman proposed the Smoky Mountains. The
+        -- proposal was stored correctly, with state = proposed, and then every path
+        -- that consumes flights ignored that column. So a leg she never agreed to
+        -- became TODAY - YOUR FLIGHT, got a 24-hour departure briefing pushed to her
+        -- phone, and was watched for delays. The graph knew. Nothing downstream asked.
+        AND COALESCE(tl.state,'') <> 'proposed'
         AND tl.flight_number IS NOT NULL
         AND tl.departs_at IS NOT NULL
         AND tl.departs_at BETWEEN ${now.toISOString()} AND ${cutoff.toISOString()}
@@ -10771,6 +10779,7 @@ setInterval(async () => {
           JOIN trip_legs tl ON tl.trip_id = t.id
           WHERE t.user_email = ${user.email}
             AND tl.type = 'flight'
+            AND COALESCE(tl.state,'') <> 'proposed'
             AND tl.departs_at > NOW()
           ORDER BY tl.departs_at ASC LIMIT 1
         `;
@@ -11954,7 +11963,10 @@ app.get("/me/home-state", async (req, res) => {
 
     for (const trip of trips) {
       for (const leg of (trip.legs || [])) {
+        // Same rule as the SQL paths: a proposal is not a flight. Home was
+        // announcing "TODAY · YOUR FLIGHT" for a leg Wingman had suggested itself.
         if (leg?.type !== "flight" || !leg.departs_at) continue;
+        if (leg.state === "proposed") continue;
         const depMs = new Date(leg.departs_at).getTime();
         const nowMs = now.getTime();
         const diffH = (depMs - nowMs) / 3600000;

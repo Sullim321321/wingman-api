@@ -143,6 +143,43 @@ t("no legs is an idea, not a claim of reality", () => {
   assert.strictEqual(doc.certaintyOf([]), "idea");
 });
 
+console.log(`\n${b}A suggestion is not a flight${x}`);
+console.log(`${d}──────────────────────────────────────────────────────────${x}`);
+
+// The Home card that said "TODAY - YOUR FLIGHT: ? -> Smoky Mountains area -> Chicago,
+// departs in 9h" — for a leg Wingman proposed and she never agreed to. It also got a
+// 24-hour departure briefing pushed to her phone. Every flight-consuming path read
+// `type = 'flight'` and none of them read `state`.
+const nextFlight = (legs, nowMs) => {
+  let best = null, bestT = Infinity;
+  for (const l of legs) {
+    if (l.type !== "flight" || !l.departs_at) continue;
+    if (l.state === "proposed") continue;          // the line that was missing
+    const t = new Date(l.departs_at).getTime();
+    if (t > nowMs && t < bestT) { bestT = t; best = l; }
+  }
+  return best;
+};
+
+t("a proposed flight is never 'your flight'", () => {
+  const sketch = { id: 9, state: "proposed", type: "flight",
+                   departs_at: "2026-07-21T23:00:00Z", destination: "Chicago" };
+  assert.strictEqual(nextFlight([sketch], NOW), null,
+    "a suggestion was announced as the user's flight");
+});
+
+t("a real flight is still found when a sketch sits in front of it", () => {
+  const sketch = { id: 9, state: "proposed", type: "flight", departs_at: "2026-07-20T10:00:00Z" };
+  const real   = { id: 4, state: "booked",   type: "flight", departs_at: "2026-07-23T14:00:00Z" };
+  assert.strictEqual(nextFlight([sketch, real], NOW)?.id, 4,
+    "over-filtering hid the real flight");
+});
+
+t("a proposed leg is a sketch in the document too", () => {
+  assert.strictEqual(doc.chapterOf(
+    { state: "proposed", type: "flight", departs_at: "2026-07-21T23:00:00Z" }, NOW), "plan");
+});
+
 console.log(`\n${d}──────────────────────────────────────────────────────────${x}`);
 console.log(`${fail === 0 ? g + "all " + pass + " held" : r + fail + " FAILED, " + pass + " held"}${x}\n`);
 process.exit(fail ? 1 : 0);
