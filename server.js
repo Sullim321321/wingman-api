@@ -6652,17 +6652,28 @@ app.get("/calendar/events", async (req, res) => {
       // don't render an empty calendar as if that's the truth.
       const msg = String(e && e.message || e);
       const code = e && (e.code || (e.response && e.response.status));
-      const scopeIssue = /insufficient|scope|forbidden|403|permission|access|invalid_grant|unauthorized|401/i.test(msg)
-        || code === 401 || code === 403;
+      // Three different 403-ish failures that need three different fixes. Telling
+      // the user to "reconnect Google" when the real problem is a disabled API (a
+      // console toggle they own) would send them in circles — exactly the kind of
+      // confident-but-wrong guidance this project exists to refuse.
+      const apiDisabled = /has not been used in project|is disabled|SERVICE_DISABLED|accessNotConfigured|Enable it by visiting/i.test(msg);
+      const scopeIssue = !apiDisabled
+        && (/insufficient|scope|forbidden|permission|invalid_grant|unauthorized|401/i.test(msg)
+            || code === 401 || code === 403);
       // Log the full error server-side so it's not lost, and echo the raw message
       // to the caller for diagnosis — Google's error strings are not secrets.
       console.error("[calendar/events] read failed:", code, msg);
+      const reason = apiDisabled ? "calendar_api_disabled"
+                   : scopeIssue ? "calendar_scope_missing"
+                   : "calendar_read_failed";
+      const detail = apiDisabled
+        ? "The Google Calendar API is turned off for this app's Google Cloud project. It's a one-time switch the app owner flips in the Cloud Console — not something you can fix by reconnecting."
+        : scopeIssue
+        ? "Your Google connection predates calendar access. Reconnect Google to grant it."
+        : humanError(e);
       return res.json({
         ok: true, connected: true, readable: false,
-        reason: scopeIssue ? "calendar_scope_missing" : "calendar_read_failed",
-        detail: scopeIssue
-          ? "Your Google connection predates calendar access. Reconnect Google to grant it."
-          : humanError(e),
+        reason, detail,
         raw_error: msg,
         code: code || null,
         events: [],
