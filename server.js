@@ -6651,13 +6651,20 @@ app.get("/calendar/events", async (req, res) => {
       // scope (granted before we asked for it). Tell the user to reconnect —
       // don't render an empty calendar as if that's the truth.
       const msg = String(e && e.message || e);
-      const scopeIssue = /insufficient|scope|forbidden|403|access/i.test(msg);
+      const code = e && (e.code || (e.response && e.response.status));
+      const scopeIssue = /insufficient|scope|forbidden|403|permission|access|invalid_grant|unauthorized|401/i.test(msg)
+        || code === 401 || code === 403;
+      // Log the full error server-side so it's not lost, and echo the raw message
+      // to the caller for diagnosis — Google's error strings are not secrets.
+      console.error("[calendar/events] read failed:", code, msg);
       return res.json({
         ok: true, connected: true, readable: false,
         reason: scopeIssue ? "calendar_scope_missing" : "calendar_read_failed",
         detail: scopeIssue
           ? "Your Google connection predates calendar access. Reconnect Google to grant it."
           : humanError(e),
+        raw_error: msg,
+        code: code || null,
         events: [],
       });
     }
