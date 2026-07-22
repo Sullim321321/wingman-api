@@ -2119,6 +2119,32 @@ async function getGmailClient(userEmail, accountEmail = null) {
   return google.gmail({ version: "v1", auth: oauth2 });
 }
 
+// ── Pillar 1: read the calendar with the SAME Google token we already hold ──────
+// The OAuth scope requested at connect already includes calendar.readonly, so no
+// new consent is needed — EXCEPT for tokens granted before that scope was added.
+// Those tokens can read Gmail but will be refused by the Calendar API. We surface
+// that difference honestly (see /calendar/events) rather than showing a blank week
+// and letting the user assume they have no events.
+async function getCalendarClient(userEmail, accountEmail = null) {
+  const rows = accountEmail
+    ? await sql`SELECT * FROM gmail_tokens WHERE user_email = ${userEmail} AND account_email = ${accountEmail}`
+    : await sql`SELECT * FROM gmail_tokens WHERE user_email = ${userEmail} ORDER BY id ASC`;
+  if (!rows[0]) return null;
+  const row = rows[0];
+  const oauth2 = makeOAuth2Client();
+  oauth2.setCredentials({
+    access_token: decryptField(row.access_token),
+    refresh_token: decryptField(row.refresh_token),
+    expiry_date: row.expiry_date,
+  });
+  oauth2.on("tokens", async (tokens) => {
+    if (tokens.access_token) {
+      await sql`UPDATE gmail_tokens SET access_token = ${tokens.access_token}, expiry_date = ${tokens.expiry_date || null}, updated_at = NOW() WHERE id = ${row.id}`;
+    }
+  });
+  return google.calendar({ version: "v3", auth: oauth2 });
+}
+
 async function scanGmailForTrips(userEmail, tokens) {
   // Scan ALL connected Google accounts for this user
   const accountRows = await sql`SELECT account_email FROM gmail_tokens WHERE user_email = ${userEmail}`;
@@ -2554,6 +2580,7 @@ const ANCHOR_TYPES = new Set(["flight", "hotel", "airbnb", "train", "ferry", "cr
 const { usableConfirmation, confirmationReachOk } = require("./grouping");
 const sketches = require("./sketches");
 const tripdoc = require("./document");
+const gcal = require("./gcal");
 
 const MAX_STAY_NIGHTS = 30;
 const MAX_TRIP_DAYS   = 30;   // a single trip should not span longer than this
@@ -6589,6 +6616,60 @@ app.get("/trips/:id/dossier", async (req, res) => {
 // Chapters, rides, names and certainty all come from document.js, so Home and the
 // Dossier cannot drift into disagreeing about whether something is happening now.
 // ─────────────────────────────────────────────────────────────────────────────
+// GET /calendar/events?days=N — your real calendar, normalized to commitments.
+//
+// Pillar 1, first verifiable slice: prove Wingman can actually read your week.
+// It reads with the Google token you already granted; no new consent unless your
+// token predates the calendar scope, in which case we say so plainly instead of
+// pretending your calendar is empty.
+app.get("/calendar/events", async (req, res) => {
+  const email = await verifyAccessToken(req);
+  if (!email) return res.status(401).json({ error: "unauthorized" });
+  try {
+    const days = Math.min(Math.max(parseInt(req.query.days || "14", 10) || 14, 1), 60);
+    const cal = await getCalendarClient(email);
+    if (!cal) {
+      // Not connected is a DIFFERENT state from "no events". Say which it is.
+      return res.json({ ok: true, connected: false, reason: "no_google_account", events: [] });
+    }
+    const now = new Date();
+    const timeMin = new Date(now.getTime() - 12 * 3600000).toISOString(); // a little back-context
+    const timeMax = new Date(now.getTime() + days * 86400000).toISOString();
+
+    let raw;
+    try {
+      const resp = await cal.events.list({
+        calendarId: "primary",
+        timeMin, timeMax,
+        singleEvents: true,        // expand recurring into instances
+        orderBy: "startTime",
+        maxResults: 250,
+      });
+      raw = resp.data.items || [];
+    } catch (e) {
+      // The specific, honest failure: the token is real but lacks the calendar
+      // scope (granted before we asked for it). Tell the user to reconnect —
+      // don't render an empty calendar as if that's the truth.
+      const msg = String(e && e.message || e);
+      const scopeIssue = /insufficient|scope|forbidden|403|access/i.test(msg);
+      return res.json({
+        ok: true, connected: true, readable: false,
+        reason: scopeIssue ? "calendar_scope_missing" : "calendar_read_failed",
+        detail: scopeIssue
+          ? "Your Google connection predates calendar access. Reconnect Google to grant it."
+          : humanError(e),
+        events: [],
+      });
+    }
+
+    const events = gcal.commitmentsFrom(raw, { selfEmail: email });
+    res.json({ ok: true, connected: true, readable: true, count: events.length, events });
+  } catch (e) {
+    console.error("[calendar/events]", e.message);
+    res.status(500).json({ ok: false, error: humanError(e) });
+  }
+});
+
 app.get("/today", async (req, res) => {
   const email = await verifyAccessToken(req);
   if (!email) return res.status(401).json({ error: "unauthorized" });
