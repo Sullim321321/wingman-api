@@ -6622,66 +6622,87 @@ app.get("/trips/:id/dossier", async (req, res) => {
 // It reads with the Google token you already granted; no new consent unless your
 // token predates the calendar scope, in which case we say so plainly instead of
 // pretending your calendar is empty.
+// Classify a Calendar read failure into the state whose FIX is correct. Three
+// different 403-ish failures need three different fixes — telling the user to
+// "reconnect Google" when the real problem is a disabled API (a console toggle)
+// would send them in circles, the confident-but-wrong guidance this project refuses.
+function classifyCalendarError(e) {
+  const msg = String(e && e.message || e);
+  const code = e && (e.code || (e.response && e.response.status));
+  const apiDisabled = /has not been used in project|is disabled|SERVICE_DISABLED|accessNotConfigured|Enable it by visiting/i.test(msg);
+  const scopeIssue = !apiDisabled
+    && (/insufficient|scope|forbidden|permission|invalid_grant|unauthorized|401/i.test(msg)
+        || code === 401 || code === 403);
+  const reason = apiDisabled ? "calendar_api_disabled"
+               : scopeIssue ? "calendar_scope_missing"
+               : "calendar_read_failed";
+  const detail = apiDisabled
+    ? "The Google Calendar API is turned off for this app's Google Cloud project. It's a one-time switch the app owner flips in the Cloud Console — not something you can fix by reconnecting."
+    : scopeIssue
+    ? "This account's Google connection predates calendar access. Reconnect it to grant calendar read."
+    : humanError(e);
+  return { reason, detail, raw_error: msg, code: code || null };
+}
+
+// GET /calendar/events?days=N — your real calendar(s), normalized to commitments.
+//
+// Your life is across several Google accounts: the work calendar where meetings
+// live is a DIFFERENT account from the inbox where booking confirmations land. So
+// the spine is not "the calendar" — it's every calendar you've connected, merged.
+// Each account reports its own state: one account failing (disabled API, missing
+// scope) must never hide the events another account can see, and must never be
+// silently rendered as "you have nothing."
 app.get("/calendar/events", async (req, res) => {
   const email = await verifyAccessToken(req);
   if (!email) return res.status(401).json({ error: "unauthorized" });
   try {
     const days = Math.min(Math.max(parseInt(req.query.days || "14", 10) || 14, 1), 60);
-    const cal = await getCalendarClient(email);
-    if (!cal) {
+    const accounts = await sql`SELECT account_email FROM gmail_tokens WHERE user_email = ${email} ORDER BY id ASC`;
+    if (!accounts.length) {
       // Not connected is a DIFFERENT state from "no events". Say which it is.
-      return res.json({ ok: true, connected: false, reason: "no_google_account", events: [] });
+      return res.json({ ok: true, connected: false, reason: "no_google_account", accounts: [], events: [] });
     }
+
     const now = new Date();
     const timeMin = new Date(now.getTime() - 12 * 3600000).toISOString(); // a little back-context
     const timeMax = new Date(now.getTime() + days * 86400000).toISOString();
 
-    let raw;
-    try {
-      const resp = await cal.events.list({
-        calendarId: "primary",
-        timeMin, timeMax,
-        singleEvents: true,        // expand recurring into instances
-        orderBy: "startTime",
-        maxResults: 250,
-      });
-      raw = resp.data.items || [];
-    } catch (e) {
-      // The specific, honest failure: the token is real but lacks the calendar
-      // scope (granted before we asked for it). Tell the user to reconnect —
-      // don't render an empty calendar as if that's the truth.
-      const msg = String(e && e.message || e);
-      const code = e && (e.code || (e.response && e.response.status));
-      // Three different 403-ish failures that need three different fixes. Telling
-      // the user to "reconnect Google" when the real problem is a disabled API (a
-      // console toggle they own) would send them in circles — exactly the kind of
-      // confident-but-wrong guidance this project exists to refuse.
-      const apiDisabled = /has not been used in project|is disabled|SERVICE_DISABLED|accessNotConfigured|Enable it by visiting/i.test(msg);
-      const scopeIssue = !apiDisabled
-        && (/insufficient|scope|forbidden|permission|invalid_grant|unauthorized|401/i.test(msg)
-            || code === 401 || code === 403);
-      // Log the full error server-side so it's not lost, and echo the raw message
-      // to the caller for diagnosis — Google's error strings are not secrets.
-      console.error("[calendar/events] read failed:", code, msg);
-      const reason = apiDisabled ? "calendar_api_disabled"
-                   : scopeIssue ? "calendar_scope_missing"
-                   : "calendar_read_failed";
-      const detail = apiDisabled
-        ? "The Google Calendar API is turned off for this app's Google Cloud project. It's a one-time switch the app owner flips in the Cloud Console — not something you can fix by reconnecting."
-        : scopeIssue
-        ? "Your Google connection predates calendar access. Reconnect Google to grant it."
-        : humanError(e);
-      return res.json({
-        ok: true, connected: true, readable: false,
-        reason, detail,
-        raw_error: msg,
-        code: code || null,
-        events: [],
-      });
+    const perAccount = [];
+    let all = [];
+    for (const a of accounts) {
+      const acct = a.account_email || email;
+      const cal = await getCalendarClient(email, a.account_email);
+      if (!cal) { perAccount.push({ account: acct, readable: false, reason: "no_token" }); continue; }
+      try {
+        const resp = await cal.events.list({
+          calendarId: "primary",
+          timeMin, timeMax,
+          singleEvents: true,        // expand recurring into instances
+          orderBy: "startTime",
+          maxResults: 250,
+        });
+        // selfEmail is per-account: "did I decline" is judged against THIS account.
+        const events = gcal.commitmentsFrom(resp.data.items || [], { selfEmail: acct })
+          .map((ev) => ({ ...ev, account_email: acct }));
+        all = all.concat(events);
+        perAccount.push({ account: acct, readable: true, count: events.length });
+      } catch (e) {
+        const c = classifyCalendarError(e);
+        console.error("[calendar/events]", acct, c.code, c.raw_error);
+        perAccount.push({ account: acct, readable: false, ...c });
+      }
     }
 
-    const events = gcal.commitmentsFrom(raw, { selfEmail: email });
-    res.json({ ok: true, connected: true, readable: true, count: events.length, events });
+    all.sort((x, y) => new Date(x.start) - new Date(y.start));
+    const anyReadable = perAccount.some((p) => p.readable);
+    // readable:true means AT LEAST one calendar was read. count spans all of them.
+    // The per-account array carries the honesty: which read, which didn't, and why.
+    res.json({
+      ok: true, connected: true, readable: anyReadable,
+      count: all.length,
+      accounts: perAccount,
+      events: all,
+    });
   } catch (e) {
     console.error("[calendar/events]", e.message);
     res.status(500).json({ ok: false, error: humanError(e) });
