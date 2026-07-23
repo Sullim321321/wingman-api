@@ -7367,12 +7367,28 @@ app.patch("/policy", auth, async (req, res) => {
 // ---------------------------------------------------------------------------
 app.post("/profile/passenger", auth, async (req, res) => {
   const body = req.body || {};
-  // Accept both field name conventions (app sends first_name/last_name, some clients send given_name/family_name)
+  // Accept both field name conventions (app sends first_name/last_name/dob, some
+  // clients send given_name/family_name/born_on). This mismatch silently blocked
+  // every save from the app — the form was full, the server saw nothing.
   const given_name = body.given_name || body.first_name;
   const family_name = body.family_name || body.last_name;
-  const { born_on, gender, phone, passport_number, passport_expiry, passport_country } = body;
+  const { gender, phone, passport_number, passport_expiry, passport_country } = body;
+
+  // Normalize the birth date to YYYY-MM-DD (what Duffel requires), accepting the
+  // ISO the picker may send or the MM/DD/YYYY the form shows.
+  const normalizeDob = (v) => {
+    const s = String(v || "").trim();
+    if (!s) return null;
+    if (/^\d{4}-\d{2}-\d{2}$/.test(s)) return s;
+    const mdy = s.match(/^(\d{1,2})\/(\d{1,2})\/(\d{4})$/);
+    if (mdy) return `${mdy[3]}-${mdy[1].padStart(2, "0")}-${mdy[2].padStart(2, "0")}`;
+    const d = new Date(s);
+    return Number.isNaN(d.getTime()) ? null : d.toISOString().slice(0, 10);
+  };
+  const born_on = normalizeDob(body.born_on || body.dob || body.date_of_birth);
+
   if (!given_name || !family_name || !born_on) {
-    return res.status(400).json({ error: "first_name (or given_name), last_name (or family_name), and born_on are required" });
+    return res.status(400).json({ error: "first_name (or given_name), last_name (or family_name), and a valid date of birth are required" });
   }
   try {
     const rows = await sql`SELECT preferences FROM users WHERE email = ${req.user.email}`;
