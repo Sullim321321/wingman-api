@@ -2010,6 +2010,13 @@ app.get("/auth/gmail/connect", async (req, res) => {
     access_type: "offline",
     prompt: "consent",
     scope: [
+      // Identity FIRST — without these we cannot tell which Google account the user
+      // picked, and every account collapses onto the login email, clobbering the
+      // previous one. This was the latent multi-account bug. openid returns an
+      // id_token whose payload carries the email even if the userinfo call fails.
+      "openid",
+      "https://www.googleapis.com/auth/userinfo.email",
+      "https://www.googleapis.com/auth/userinfo.profile",
       "https://www.googleapis.com/auth/gmail.readonly",
       "https://www.googleapis.com/auth/calendar.readonly"
     ],
@@ -2033,20 +2040,44 @@ app.get("/auth/gmail/callback", async (req, res) => {
   try {
     const oauth2 = makeOAuth2Client();
     const { tokens } = await oauth2.getToken(code);
-    // Fetch the Google account email so we can store it as account_email
-    let accountEmail = userEmail; // fallback
+    // Which Google account does this token belong to? Getting it wrong silently
+    // overwrites a DIFFERENT account's row (the multi-account clobber bug), so we
+    // try two independent ways and, if both fail, refuse rather than guess.
+    let accountEmail = null;
+    let givenName = null;
+    // 1) id_token payload — present because we now request `openid`; no API call,
+    //    and it works even when the userinfo endpoint is unavailable.
     try {
-      oauth2.setCredentials(tokens);
-      const { google } = require("googleapis");
-      const oauth2Api = google.oauth2({ version: "v2", auth: oauth2 });
-      const info = await oauth2Api.userinfo.get();
-      if (info.data?.email) accountEmail = info.data.email;
-      // Save given_name to users.first_name if not already set
-      if (info.data?.given_name) {
-        await sql`UPDATE users SET first_name = ${info.data.given_name} WHERE email = ${userEmail} AND first_name IS NULL`;
+      if (tokens.id_token) {
+        const payload = JSON.parse(Buffer.from(tokens.id_token.split(".")[1], "base64url").toString("utf8"));
+        if (payload && payload.email) accountEmail = payload.email;
+        if (payload && payload.given_name) givenName = payload.given_name;
       }
     } catch (e) {
-      console.warn("[gmail/callback] could not fetch account email:", e.message);
+      console.warn("[gmail/callback] id_token decode failed:", e.message);
+    }
+    // 2) userinfo API — belt-and-suspenders, and covers tokens minted before openid.
+    if (!accountEmail) {
+      try {
+        oauth2.setCredentials(tokens);
+        const { google } = require("googleapis");
+        const oauth2Api = google.oauth2({ version: "v2", auth: oauth2 });
+        const info = await oauth2Api.userinfo.get();
+        if (info.data?.email) accountEmail = info.data.email;
+        if (info.data?.given_name && !givenName) givenName = info.data.given_name;
+      } catch (e) {
+        console.warn("[gmail/callback] could not fetch account email:", e.message);
+      }
+    }
+    // 3) Give up SAFELY. Falling back to userEmail here is what clobbered the
+    //    original account — never do it. Fail loudly instead of corrupting data.
+    if (!accountEmail) {
+      console.error("[gmail/callback] could not determine account email — refusing to store");
+      return res.status(400).send("Could not determine which Google account you connected. Please try connecting again.");
+    }
+    // Save given_name to users.first_name if not already set.
+    if (givenName) {
+      await sql`UPDATE users SET first_name = ${givenName} WHERE email = ${userEmail} AND first_name IS NULL`;
     }
     await sql`
       INSERT INTO gmail_tokens (user_email, account_email, access_token, refresh_token, expiry_date)
