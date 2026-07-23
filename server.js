@@ -2613,6 +2613,7 @@ const sketches = require("./sketches");
 const tripdoc = require("./document");
 const gcal = require("./gcal");
 const { classifyMeeting } = require("./meeting");
+const { inferTravelNeeds, groupTrips, makeCityResolver } = require("./infer");
 
 const MAX_STAY_NIGHTS = 30;
 const MAX_TRIP_DAYS   = 30;   // a single trip should not span longer than this
@@ -6684,68 +6685,109 @@ function classifyCalendarError(e) {
 // Each account reports its own state: one account failing (disabled API, missing
 // scope) must never hide the events another account can see, and must never be
 // silently rendered as "you have nothing."
+// Read every connected account's calendar, classify each event, and merge. Shared
+// by /calendar/events and /calendar/travel so the two can never disagree about what
+// is on your calendar. Returns { connected, accounts, events } with per-account
+// honesty in `accounts` (which read, which didn't, and why).
+async function readCommitments(email, days) {
+  const accounts = await sql`SELECT account_email FROM gmail_tokens WHERE user_email = ${email} ORDER BY id ASC`;
+  if (!accounts.length) return { connected: false, accounts: [], events: [] };
+
+  const now = new Date();
+  const timeMin = new Date(now.getTime() - 12 * 3600000).toISOString(); // a little back-context
+  const timeMax = new Date(now.getTime() + days * 86400000).toISOString();
+
+  const perAccount = [];
+  let all = [];
+  for (const a of accounts) {
+    const acct = a.account_email || email;
+    const cal = await getCalendarClient(email, a.account_email);
+    if (!cal) { perAccount.push({ account: acct, readable: false, reason: "no_token" }); continue; }
+    try {
+      const resp = await cal.events.list({
+        calendarId: "primary",
+        timeMin, timeMax,
+        singleEvents: true,        // expand recurring into instances
+        orderBy: "startTime",
+        maxResults: 250,
+      });
+      // selfEmail is per-account: "did I decline" is judged against THIS account.
+      // Classify each on the way out: is this a place you must BE (possible travel)
+      // or one you dial into? nature is virtual|in_person|ambiguous|unknown.
+      const events = gcal.commitmentsFrom(resp.data.items || [], { selfEmail: acct })
+        .map((ev) => {
+          const k = classifyMeeting(ev);
+          return { ...ev, account_email: acct, nature: k.nature, place: k.place };
+        });
+      all = all.concat(events);
+      perAccount.push({ account: acct, readable: true, count: events.length });
+    } catch (e) {
+      const c = classifyCalendarError(e);
+      console.error("[calendar/read]", acct, c.code, c.raw_error);
+      perAccount.push({ account: acct, readable: false, ...c });
+    }
+  }
+  all.sort((x, y) => new Date(x.start) - new Date(y.start));
+  return { connected: true, accounts: perAccount, events: all };
+}
+
 app.get("/calendar/events", async (req, res) => {
   const email = await verifyAccessToken(req);
   if (!email) return res.status(401).json({ error: "unauthorized" });
   try {
     const days = Math.min(Math.max(parseInt(req.query.days || "14", 10) || 14, 1), 60);
-    const accounts = await sql`SELECT account_email FROM gmail_tokens WHERE user_email = ${email} ORDER BY id ASC`;
-    if (!accounts.length) {
-      // Not connected is a DIFFERENT state from "no events". Say which it is.
+    const { connected, accounts, events } = await readCommitments(email, days);
+    if (!connected) {
       return res.json({ ok: true, connected: false, reason: "no_google_account", accounts: [], events: [] });
     }
-
-    const now = new Date();
-    const timeMin = new Date(now.getTime() - 12 * 3600000).toISOString(); // a little back-context
-    const timeMax = new Date(now.getTime() + days * 86400000).toISOString();
-
-    const perAccount = [];
-    let all = [];
-    for (const a of accounts) {
-      const acct = a.account_email || email;
-      const cal = await getCalendarClient(email, a.account_email);
-      if (!cal) { perAccount.push({ account: acct, readable: false, reason: "no_token" }); continue; }
-      try {
-        const resp = await cal.events.list({
-          calendarId: "primary",
-          timeMin, timeMax,
-          singleEvents: true,        // expand recurring into instances
-          orderBy: "startTime",
-          maxResults: 250,
-        });
-        // selfEmail is per-account: "did I decline" is judged against THIS account.
-        // Classify each on the way out: is this a place you must BE (possible
-        // travel) or one you dial into? nature is virtual|in_person|ambiguous|unknown.
-        const events = gcal.commitmentsFrom(resp.data.items || [], { selfEmail: acct })
-          .map((ev) => {
-            const k = classifyMeeting(ev);
-            return { ...ev, account_email: acct, nature: k.nature, place: k.place };
-          });
-        all = all.concat(events);
-        perAccount.push({ account: acct, readable: true, count: events.length });
-      } catch (e) {
-        const c = classifyCalendarError(e);
-        console.error("[calendar/events]", acct, c.code, c.raw_error);
-        perAccount.push({ account: acct, readable: false, ...c });
-      }
-    }
-
-    all.sort((x, y) => new Date(x.start) - new Date(y.start));
-    const anyReadable = perAccount.some((p) => p.readable);
-    // How the week breaks down by meeting nature — the count that tells us whether
-    // the classifier is separating real travel from Zoom before we build on it.
-    const byNature = all.reduce((acc, e) => { acc[e.nature] = (acc[e.nature] || 0) + 1; return acc; }, {});
-    // readable:true means AT LEAST one calendar was read. count spans all of them.
-    // The per-account array carries the honesty: which read, which didn't, and why.
+    const anyReadable = accounts.some((p) => p.readable);
+    // How the week breaks down by meeting nature — separating real travel from Zoom.
+    const byNature = events.reduce((acc, e) => { acc[e.nature] = (acc[e.nature] || 0) + 1; return acc; }, {});
     res.json({
       ok: true, connected: true, readable: anyReadable,
-      count: all.length,
+      count: events.length,
       by_nature: byNature,
-      accounts: perAccount,
-      events: all,
+      accounts,
+      events,
     });
   } catch (e) {
     console.error("[calendar/events]", e.message);
+    res.status(500).json({ ok: false, error: humanError(e) });
+  }
+});
+
+// GET /calendar/travel?days=N&from=CITY — what your calendar says you need to travel
+// for, judged from where you are. `from` is your current city (device geolocation,
+// later; a query param for now). Returns { trips, asks } — trips are proposals to
+// confirm, asks are the ambiguous ones we refuse to guess. Nothing here is booked or
+// certain; it's inference, and it says so.
+app.get("/calendar/travel", async (req, res) => {
+  const email = await verifyAccessToken(req);
+  if (!email) return res.status(401).json({ error: "unauthorized" });
+  try {
+    const days = Math.min(Math.max(parseInt(req.query.days || "14", 10) || 14, 1), 60);
+    const currentCity = (req.query.from || "").trim() || null;
+    const bases = ["New York", "London"]; // your rotating homes; from prefs later
+    const { connected, accounts, events } = await readCommitments(email, days);
+    if (!connected) {
+      return res.json({ ok: true, connected: false, reason: "no_google_account", trips: [], asks: [] });
+    }
+    const anyReadable = accounts.some((p) => p.readable);
+    const needs = inferTravelNeeds(events, {
+      now: Date.now(),
+      currentCity,
+      bases,
+      resolveCity: makeCityResolver(bases),
+    });
+    const { trips, asks } = groupTrips(needs);
+    res.json({
+      ok: true, connected: true, readable: anyReadable,
+      from: currentCity,
+      accounts,
+      trips, asks,
+    });
+  } catch (e) {
+    console.error("[calendar/travel]", e.message);
     res.status(500).json({ ok: false, error: humanError(e) });
   }
 });
