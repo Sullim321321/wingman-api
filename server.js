@@ -6980,6 +6980,34 @@ app.get("/calendar/travel", async (req, res) => {
   }
 });
 
+// POST /plan/propose-trip { destination, from_city, departs_at } — turn an inferred
+// travel proposal into a real trip + a PROPOSED flight leg, so the existing book flow
+// (/plan/leg/:id/book → BookLegScreen) can price and hold it. This creates a proposal,
+// never a booking; readiness will still ask for anything missing (from-city, passport).
+app.post("/plan/propose-trip", async (req, res) => {
+  const email = await verifyAccessToken(req);
+  if (!email) return res.status(401).json({ error: "unauthorized" });
+  const { destination, from_city, departs_at } = req.body || {};
+  if (!destination || !departs_at) {
+    return res.status(400).json({ error: "destination and departs_at are required" });
+  }
+  try {
+    const [trip] = await sql`
+      INSERT INTO trips (user_email, title, source)
+      VALUES (${email}, ${destination}, 'inferred')
+      RETURNING id`;
+    const [leg] = await sql`
+      INSERT INTO trip_legs (trip_id, type, state, destination_city, departs_at, raw_data)
+      VALUES (${trip.id}, 'flight', 'proposed', ${destination}, ${departs_at},
+              ${JSON.stringify({ from_city: from_city || null, to_city: destination, inferred_from: "calendar" })})
+      RETURNING id`;
+    res.json({ ok: true, trip_id: trip.id, leg_id: leg.id });
+  } catch (e) {
+    console.error("[plan/propose-trip]", e.message);
+    res.status(500).json({ ok: false, error: humanError(e) });
+  }
+});
+
 app.get("/today", async (req, res) => {
   const email = await verifyAccessToken(req);
   if (!email) return res.status(401).json({ error: "unauthorized" });
