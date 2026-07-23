@@ -76,6 +76,15 @@ t("without a 'where are you', it ASKS instead of guessing travel", () => {
   assert.ok(/where are you/i.test(n[0].question));
 });
 
+t("no location + several in-person meetings = ONE prompt, not one per meeting", () => {
+  // The bug on the phone: two identical "Where are you?" cards, one per meeting.
+  const needs = inferTravelNeeds([WEEK[1], WEEK[3]], { now: NOW, current: null });
+  const { asks } = groupTrips(needs, { hubs: HUBS });
+  const locAsks = asks.filter((a) => a.reason_code === "no_current_location");
+  assert.strictEqual(locAsks.length, 1, "duplicate 'where are you' cards were not collapsed");
+  assert.strictEqual(locAsks[0].drivers.length, 2, "the single prompt should remember both meetings");
+});
+
 t("a past meeting drives nothing", () => {
   const past = [{ calendar_id: "0", title: "Old", nature: "in_person", geo: geo.chicago, start: soon(-5), end: soon(-4) }];
   assert.strictEqual(inferTravelNeeds(past, OPTS).length, 0);

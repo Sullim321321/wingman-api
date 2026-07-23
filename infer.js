@@ -71,10 +71,14 @@ function inferTravelNeeds(commitments, opts = {}) {
     };
     const ask = (reason, question) => needs.push({ ...base, kind: "ask", reason, question });
 
-    // Can't judge distance without knowing where you are.
+    // Can't judge distance without knowing where you are. Tag these so the grouper
+    // can collapse them into ONE prompt instead of asking once per meeting.
     if (!current || !hasCoords(current)) {
-      ask(`"${driver.title}" is in person${geo && geo.city ? ` in ${geo.city}` : ""}, but I don't know where you are right now.`,
-          `Where are you right now? I can tell you if "${driver.title}" needs travel once I know.`);
+      needs.push({
+        ...base, kind: "ask", reason_code: "no_current_location",
+        reason: `"${driver.title}" is in person, but I don't know where you are right now.`,
+        question: `Where are you right now? I'll turn your in-person meetings into trips once I know.`,
+      });
       continue;
     }
 
@@ -115,8 +119,24 @@ function groupTrips(needs, opts = {}) {
   const radius = opts.radiusMiles != null ? opts.radiusMiles : DEFAULT_RADIUS_MI;
   const hubs = (opts.hubs || []).map((h) => String(h).toLowerCase());
 
-  const proposals = [], asks = [];
-  for (const n of needs || []) (n.kind === "propose_trip" ? proposals : asks).push(n);
+  const proposals = [], rawAsks = [];
+  for (const n of needs || []) (n.kind === "propose_trip" ? proposals : rawAsks).push(n);
+
+  // "I don't know where you are" is ONE question, not one per meeting. Collapse
+  // every location-unknown ask into a single prompt that names how many meetings
+  // are waiting on it. Other asks (ambiguous, unresolved place) stay individual.
+  const locAsks = rawAsks.filter((a) => a.reason_code === "no_current_location");
+  const asks = rawAsks.filter((a) => a.reason_code !== "no_current_location");
+  if (locAsks.length) {
+    const n = locAsks.length;
+    asks.unshift({
+      kind: "ask", reason_code: "no_current_location",
+      reason: `${n} in-person meeting${n > 1 ? "s" : ""} on your calendar, but I don't know where you are.`,
+      question: `Where are you right now? I'll turn your in-person meeting${n > 1 ? "s" : ""} into trips once I know.`,
+      drivers: locAsks.map((a) => a.driver),
+      certain: false, source: "inferred_from_calendar",
+    });
+  }
 
   const clusters = [];
   for (const n of proposals) {
