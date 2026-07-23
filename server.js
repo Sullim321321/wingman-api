@@ -2613,7 +2613,8 @@ const sketches = require("./sketches");
 const tripdoc = require("./document");
 const gcal = require("./gcal");
 const { classifyMeeting } = require("./meeting");
-const { inferTravelNeeds, groupTrips, makeCityResolver } = require("./infer");
+const { inferTravelNeeds, groupTrips } = require("./infer");
+const geo = require("./geo");
 
 const MAX_STAY_NIGHTS = 30;
 const MAX_TRIP_DAYS   = 30;   // a single trip should not span longer than this
@@ -6766,23 +6767,32 @@ app.get("/calendar/travel", async (req, res) => {
   if (!email) return res.status(401).json({ error: "unauthorized" });
   try {
     const days = Math.min(Math.max(parseInt(req.query.days || "14", 10) || 14, 1), 60);
-    const currentCity = (req.query.from || "").trim() || null;
-    const bases = ["New York", "London"]; // your rotating homes; from prefs later
+    const fromText = (req.query.from || "").trim() || null;
     const { connected, accounts, events } = await readCommitments(email, days);
     if (!connected) {
       return res.json({ ok: true, connected: false, reason: "no_google_account", trips: [], asks: [] });
     }
     const anyReadable = accounts.some((p) => p.readable);
-    const needs = inferTravelNeeds(events, {
-      now: Date.now(),
-      currentCity,
-      bases,
-      resolveCity: makeCityResolver(bases),
-    });
-    const { trips, asks } = groupTrips(needs);
+
+    // Where you are now (geolocation later; a city string for now). Resolved to
+    // coordinates so "out of town" is a distance, not a string comparison.
+    const current = fromText ? await geo.resolvePlace(fromText) : null;
+
+    // Geocode ONLY the meetings that could imply travel — in-person or ambiguous,
+    // in the future. Zoom calls never get a network call. Cached + gazetteer-first,
+    // so repeat places and your common cities cost nothing.
+    const nowMs = Date.now();
+    for (const e of events) {
+      if (e.nature !== "in_person" && e.nature !== "ambiguous") continue;
+      if (new Date(e.start).getTime() <= nowMs) continue;
+      e.geo = await geo.resolvePlace(e.place || e.location || "");
+    }
+
+    const needs = inferTravelNeeds(events, { now: nowMs, current });
+    const { trips, asks } = groupTrips(needs, { hubs: geo.HUBS });
     res.json({
       ok: true, connected: true, readable: anyReadable,
-      from: currentCity,
+      from: current ? { input: fromText, city: current.city, source: current.source } : null,
       accounts,
       trips, asks,
     });

@@ -1,91 +1,62 @@
-// infer.js — a meeting in a city you're not in means you have to get there.
+// infer.js — a meeting in a place you're not near means you have to get there.
 //
 // ─────────────────────────────────────────────────────────────────────────────
-// This is the "it knows me" step: turn the calendar into travel. But the value is
-// entirely in the RESTRAINT. The dangerous version proposes a trip for every
-// meeting with a place in it; the trustworthy version proposes one only when the
-// evidence is unambiguous, and asks when it isn't.
+// This is the "it knows me" step: turn the calendar into travel. The value is
+// entirely in the RESTRAINT — propose a trip only when the evidence is clear, ask
+// when it isn't, and stay silent for the Zoom calls.
 //
-// The design that makes "handle changes so I don't have to" fall out for free:
-// travel needs are a PURE FUNCTION of the current calendar + where you are. Nobody
-// "handles" a cancellation. When a meeting moves, turns virtual, or you're already
-// in the city, re-running this simply doesn't produce the need anymore. The change
-// takes care of itself because nothing was ever stored that has to be undone.
-// (Undoing a real BOOKING is different — that's a permissioned proposal, computed
-// by diffing these needs against what's booked. It lives one layer up, not here.)
+// Now judged by DISTANCE, not string matching. Each commitment carries a resolved
+// `geo` ({ city, lat, lng }); "out of town" means the meeting is farther than
+// `radiusMiles` from where you currently are. That's why Evanston folds into a
+// Chicago trip (12 miles) instead of becoming its own question — a thing no amount
+// of city-name matching could ever get right.
 //
-// The honesty rules, in order:
-//   virtual / unknown-nature   → no travel. Ever. (A Zoom call is not a trip.)
-//   in-person, city unknown    → ASK. We saw a place we couldn't turn into a city;
-//                                 unknown never silently becomes a booked flight.
-//   in-person, same city       → no travel. You're already there.
-//   in-person, other city      → PROPOSE a trip.
-//   ambiguous (link AND place) → ASK, even if it's out of town. We don't know it's
-//                                 travel, so we don't assert it is.
+// "Handle changes so I don't have to" falls out for free: travel needs are a pure
+// function of the current calendar + where you are. Nobody "handles" a
+// cancellation — when a meeting moves, turns virtual, or you're already there,
+// re-running simply doesn't produce the need. Undoing a real BOOKING is the one
+// thing that isn't automatic: that's a permissioned proposal, computed one layer up.
 //
-// Pure and dependency-free. `resolveCity` is injected so the same logic runs on a
-// tiny built-in gazetteer today and on real geocoding later, without changing a rule.
+// Honesty rules, in order:
+//   virtual / unknown-nature → no travel, ever.
+//   we don't know where you are → ASK (can't judge distance without a "from").
+//   in-person, unresolved place → ASK (never invent a location).
+//   in-person, within radius → no travel (you're already there / it's local).
+//   in-person, far → PROPOSE a trip.
+//   ambiguous (link AND place) → ASK, even if far. We don't know it's travel.
+//
+// Pure and dependency-free (haversine is the only import, itself pure).
 // ─────────────────────────────────────────────────────────────────────────────
 
-// A pragmatic starter set — major business cities plus your bases. Not exhaustive;
-// when a place doesn't resolve, we ASK rather than pretend. Real geocoding replaces
-// this later by swapping the resolver, not the rules.
-const DEFAULT_CITIES = [
-  "New York", "London", "Nashville", "Chicago", "Dallas", "Austin", "Houston",
-  "San Francisco", "Los Angeles", "Seattle", "Boston", "Washington", "Atlanta",
-  "Miami", "Denver", "Toronto", "Paris", "Berlin", "Amsterdam", "Dublin",
-  "N.Y.C.", "Manhattan",
-];
-// Aliases fold onto a canonical city so "NYC" and "Manhattan" are New York.
-const ALIASES = {
-  "nyc": "New York", "n.y.c.": "New York", "manhattan": "New York", "new york city": "New York",
-  "sf": "San Francisco", "la": "Los Angeles", "d.c.": "Washington", "dc": "Washington",
-};
+const { haversineMiles } = require("./geo");
 
-function makeCityResolver(extraCities = []) {
-  // Longest names first so "New York" wins over a stray "York".
-  const cities = [...new Set([...DEFAULT_CITIES, ...extraCities])]
-    .sort((a, b) => b.length - a.length);
-  return (text) => {
-    const t = " " + String(text || "").toLowerCase().replace(/[^a-z. ]/g, " ").replace(/\s+/g, " ") + " ";
-    for (const alias of Object.keys(ALIASES)) {
-      if (t.includes(" " + alias + " ")) return { city: ALIASES[alias], confidence: "matched" };
-    }
-    for (const c of cities) {
-      if (t.includes(" " + c.toLowerCase() + " ")) return { city: c, confidence: "matched" };
-    }
-    return { city: null, confidence: "unknown" };
-  };
-}
-
-const sameCity = (a, b) =>
-  a && b && String(a).trim().toLowerCase() === String(b).trim().toLowerCase();
-
+const DEFAULT_RADIUS_MI = 50; // same-metro / "you're basically there" threshold
 const ms = (v) => { const t = new Date(v).getTime(); return Number.isNaN(t) ? null : t; };
+const hasCoords = (g) => !!(g && g.lat != null && g.lng != null);
+const near = (a, b, mi) => haversineMiles(a, b) <= mi;
 
 /**
  * Turn calendar commitments into travel needs, judged against where you are now.
  *
- * @param commitments  normalized events (gcal.js shape) enriched with { nature, place }
+ * @param commitments  normalized events enriched with { nature, place, geo:{city,lat,lng} }
  * @param opts.now         epoch ms; only future meetings drive travel
- * @param opts.currentCity where you are right now (from geolocation, later)
- * @param opts.bases       your home cities (["New York","London"]) — resolvable + never "away"
- * @param opts.resolveCity injected place→city; defaults to the built-in gazetteer
- * @returns array of needs: { kind:"propose_trip"|"ask", destination, reason, question, driver, arrive_by, depart_after, certain:false, source }
+ * @param opts.current    { city, lat, lng } where you are now (geolocation, later)
+ * @param opts.radiusMiles anything within this of `current` is "not travel"
+ * @returns needs: { kind:"propose_trip"|"ask", destination, geo, reason, question, driver, arrive_by, depart_after, certain:false, source }
  */
 function inferTravelNeeds(commitments, opts = {}) {
   const now = opts.now != null ? opts.now : Date.now();
-  const currentCity = opts.currentCity || null;
-  const bases = opts.bases || [];
-  const resolveCity = opts.resolveCity || makeCityResolver(bases);
+  const current = opts.current || null;
+  const radius = opts.radiusMiles != null ? opts.radiusMiles : DEFAULT_RADIUS_MI;
 
   const needs = [];
   for (const c of commitments || []) {
     if (!c) continue;
     const startMs = ms(c.start);
-    if (startMs == null || startMs <= now) continue;         // past / undated → not a live driver
-    if (c.nature === "virtual" || c.nature === "unknown") continue; // never travel
+    if (startMs == null || startMs <= now) continue;                 // past / undated
+    if (c.nature === "virtual" || c.nature === "unknown") continue;  // never travel
 
+    const geo = c.geo || null;
     const driver = {
       calendar_id: c.calendar_id || null,
       title: c.title || "(no title)",
@@ -93,77 +64,93 @@ function inferTravelNeeds(commitments, opts = {}) {
       account_email: c.account_email || null,
       nature: c.nature,
     };
-    const { city } = resolveCity(c.place || c.location || "");
+    const base = {
+      destination: geo && geo.city ? geo.city : null, geo,
+      driver, arrive_by: c.start, depart_after: c.end || c.start,
+      certain: false, source: "inferred_from_calendar",
+    };
+    const ask = (reason, question) => needs.push({ ...base, kind: "ask", reason, question });
+
+    // Can't judge distance without knowing where you are.
+    if (!current || !hasCoords(current)) {
+      ask(`"${driver.title}" is in person${geo && geo.city ? ` in ${geo.city}` : ""}, but I don't know where you are right now.`,
+          `Where are you right now? I can tell you if "${driver.title}" needs travel once I know.`);
+      continue;
+    }
 
     if (c.nature === "ambiguous") {
-      // Both a link and a place: could be a flight, could be a dial-in. A question,
-      // never a booking — this is your Texas Rangers / Dallas meeting.
-      if (city && sameCity(city, currentCity)) continue; // already there → no travel either way
-      needs.push({
-        kind: "ask", destination: city, driver,
-        arrive_by: c.start, depart_after: c.end || c.start,
-        reason: `"${driver.title}" has both a video link and a place${city ? ` (${city})` : ""}.`,
-        question: `Are you attending "${driver.title}"${city ? ` in ${city}` : ""} in person, or remotely?`,
-        certain: false, source: "inferred_from_calendar",
-      });
+      // Both a link and a place — could be a flight, could be a dial-in. Never a
+      // silent booking. (Your Texas Rangers / Dallas meeting.)
+      if (hasCoords(geo) && near(geo, current, radius)) continue; // local anyway
+      ask(`"${driver.title}" has both a video link and a place${geo && geo.city ? ` (${geo.city})` : ""}.`,
+          `Are you attending "${driver.title}"${geo && geo.city ? ` in ${geo.city}` : ""} in person, or remotely?`);
       continue;
     }
 
     // in_person
-    if (!city) {
-      needs.push({
-        kind: "ask", destination: null, driver,
-        arrive_by: c.start, depart_after: c.end || c.start,
-        reason: `"${driver.title}" looks in person but I couldn't tell what city.`,
-        question: `Where is "${driver.title}"? I couldn't read a city from "${c.place || c.location || ""}".`,
-        certain: false, source: "inferred_from_calendar",
-      });
+    if (!hasCoords(geo)) {
+      ask(`"${driver.title}" looks in person but I couldn't locate it.`,
+          `Where is "${driver.title}"? I couldn't resolve "${c.place || c.location || ""}".`);
       continue;
     }
-    if (sameCity(city, currentCity)) continue; // you're already in that city
+    if (near(geo, current, radius)) continue; // you're already there / it's local
 
     needs.push({
-      kind: "propose_trip", destination: city, driver,
-      arrive_by: c.start, depart_after: c.end || c.start,
-      reason: `In-person meeting in ${city}${currentCity ? ` and you're in ${currentCity}` : ""}.`,
+      ...base, kind: "propose_trip",
+      reason: `In-person meeting in ${geo.city || "another city"}${current.city ? ` and you're in ${current.city}` : ""} (${Math.round(haversineMiles(geo, current))} mi away).`,
       question: null,
-      certain: false, source: "inferred_from_calendar",
     });
   }
   return needs;
 }
 
 /**
- * Collapse per-meeting needs into trip proposals: several in-person meetings in the
- * same city on nearby days are ONE trip, not three. Only propose_trip needs group;
- * asks stay individual (each is a distinct open question). A trip spans from the
- * earliest arrive_by to the latest depart_after among its drivers.
+ * Collapse per-meeting needs into trip proposals: in-person meetings within
+ * `radiusMiles` of each other are ONE trip (Chicago + Evanston = one Chicago trip),
+ * spanning the earliest arrive_by to the latest depart_after. Asks stay individual —
+ * each is a distinct open question. A cluster is labeled by a `hubs` city if it
+ * contains one (so the metro name wins over the suburb), else the most common city.
  */
-function groupTrips(needs) {
-  const trips = [];
-  const asks = [];
-  const byCity = new Map();
-  for (const n of needs || []) {
-    if (n.kind !== "propose_trip") { asks.push(n); continue; }
-    const key = String(n.destination).toLowerCase();
-    if (!byCity.has(key)) byCity.set(key, []);
-    byCity.get(key).push(n);
+function groupTrips(needs, opts = {}) {
+  const radius = opts.radiusMiles != null ? opts.radiusMiles : DEFAULT_RADIUS_MI;
+  const hubs = (opts.hubs || []).map((h) => String(h).toLowerCase());
+
+  const proposals = [], asks = [];
+  for (const n of needs || []) (n.kind === "propose_trip" ? proposals : asks).push(n);
+
+  const clusters = [];
+  for (const n of proposals) {
+    let placed = false;
+    for (const cl of clusters) {
+      if (cl.some((m) => hasCoords(m.geo) && hasCoords(n.geo) && near(m.geo, n.geo, radius))) {
+        cl.push(n); placed = true; break;
+      }
+    }
+    if (!placed) clusters.push([n]);
   }
-  for (const [, group] of byCity) {
-    group.sort((a, b) => ms(a.arrive_by) - ms(b.arrive_by));
-    trips.push({
+
+  const trips = clusters.map((cl) => {
+    cl.sort((a, b) => ms(a.arrive_by) - ms(b.arrive_by));
+    // Label: prefer a hub city in the cluster, else the most frequent city.
+    const cities = cl.map((n) => n.destination).filter(Boolean);
+    const hubCity = cities.find((c) => hubs.includes(String(c).toLowerCase()));
+    const freq = {};
+    cities.forEach((c) => (freq[c] = (freq[c] || 0) + 1));
+    const topCity = Object.keys(freq).sort((a, b) => freq[b] - freq[a])[0] || null;
+    return {
       kind: "propose_trip",
-      destination: group[0].destination,
-      arrive_by: group[0].arrive_by,
-      depart_after: group.reduce((late, n) => (ms(n.depart_after) > ms(late) ? n.depart_after : late), group[0].depart_after),
-      drivers: group.map((n) => n.driver),
-      reason: group.length === 1
-        ? group[0].reason
-        : `${group.length} in-person meetings in ${group[0].destination}.`,
+      destination: hubCity || topCity,
+      arrive_by: cl[0].arrive_by,
+      depart_after: cl.reduce((late, n) => (ms(n.depart_after) > ms(late) ? n.depart_after : late), cl[0].depart_after),
+      drivers: cl.map((n) => n.driver),
+      reason: cl.length === 1
+        ? cl[0].reason
+        : `${cl.length} in-person meetings around ${hubCity || topCity}.`,
       certain: false, source: "inferred_from_calendar",
-    });
-  }
+    };
+  });
+
   return { trips, asks };
 }
 
-module.exports = { inferTravelNeeds, groupTrips, makeCityResolver, sameCity };
+module.exports = { inferTravelNeeds, groupTrips };

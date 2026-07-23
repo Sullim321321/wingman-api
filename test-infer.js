@@ -1,17 +1,18 @@
 #!/usr/bin/env node
-// test-infer.js — propose a trip only when the calendar is sure, ask when it isn't.
+// test-infer.js — propose a trip only when distance says so, ask when it can't.
 //
 //   node test-infer.js
 //
-// The fixture is Maddie's real week, read live: she's in Nashville, with a set of
-// virtual calls, one in-person Chicago meeting, and the Dallas meeting that carries
-// both a Zoom link and a place. The assertions that matter are the ones that keep a
-// booked flight from ever resting on a Zoom call — and the reactivity test, which is
-// the whole "handle changes so I don't have to": when the meeting goes away, so does
-// the trip, with nobody undoing anything.
+// Fixture: Maddie in Nashville, with virtual calls, an in-person Chicago meeting,
+// the Dallas meeting that carries a link AND a place, and the Evanston coffee that
+// a city-name matcher choked on. The load-bearing assertions: a Zoom call never
+// becomes a flight, an ambiguous meeting is a question, Evanston folds into the
+// Chicago trip because it's 12 miles away, and pushing a meeting makes its trip
+// vanish with nothing to undo.
 
 const assert = require("assert");
 const { inferTravelNeeds, groupTrips } = require("./infer");
+const { HUBS } = require("./geo");
 
 const g = "\x1b[32m", r = "\x1b[31m", d = "\x1b[2m", b = "\x1b[1m", x = "\x1b[0m";
 let pass = 0, fail = 0;
@@ -20,102 +21,96 @@ const t = (name, fn) => {
   catch (e) { console.log(`  ${r}✗${x} ${name}\n      ${e.message}`); fail++; }
 };
 
-const NOW = Date.parse("2026-07-22T12:00:00Z");
+const NOW = Date.parse("2026-07-23T12:00:00Z");
 const soon = (h) => new Date(NOW + h * 3600000).toISOString();
-const OPTS = { now: NOW, currentCity: "Nashville", bases: ["New York", "London"] };
+const NASHVILLE = { city: "Nashville", lat: 36.1627, lng: -86.7816 };
+const OPTS = { now: NOW, current: NASHVILLE };
 
-// Maddie's real week, in the shape the calendar read produces (nature + place added
-// by the classifier). Trimmed to the load-bearing cases.
+const geo = {
+  chicago:  { city: "Chicago",  lat: 41.8781, lng: -87.6298 },
+  evanston: { city: "Evanston", lat: 42.0451, lng: -87.6877 }, // 12mi N of Chicago
+  dallas:   { city: "Dallas",   lat: 32.7767, lng: -96.7970 },
+  nashville:{ city: "Nashville",lat: 36.1670, lng: -86.7780 },
+};
+
 const WEEK = [
-  { calendar_id: "1", title: "Covrly — Sales Daily", nature: "virtual", place: null, start: soon(2), end: soon(2.5) },
-  { calendar_id: "2", title: "Update Call",          nature: "virtual", place: null, start: soon(3), end: soon(3.5) },
-  { calendar_id: "3", title: "Miru Terrace — St. Regis Tower", nature: "in_person",
-    place: "401 E Wacker Dr, Chicago, IL", start: soon(20), end: soon(22) },
-  { calendar_id: "4", title: "Preston DeLong — Texas Rangers Opportunity", nature: "ambiguous",
-    place: "Conference — Dallas — Executive", start: soon(26), end: soon(27) },
-  { calendar_id: "5", title: "Maddie/JR Meet up", nature: "in_person",
-    place: "Starbucks Coffee Company", start: soon(30), end: soon(31) }, // city unknowable
+  { calendar_id: "1", title: "Covrly — Sales Daily", nature: "virtual", start: soon(2), end: soon(2.5) },
+  { calendar_id: "3", title: "Miru Terrace — St. Regis Tower", nature: "in_person", geo: geo.chicago, start: soon(20), end: soon(22) },
+  { calendar_id: "4", title: "Preston DeLong — Texas Rangers", nature: "ambiguous", geo: geo.dallas, start: soon(26), end: soon(27) },
+  { calendar_id: "5", title: "Maddie/JR Meet up", nature: "in_person", geo: geo.evanston, start: soon(30), end: soon(31) },
 ];
 
 console.log(`\n${b}From Nashville, what actually needs travel${x}`);
 console.log(`${d}──────────────────────────────────────────────────────────${x}`);
 
-t("the Zoom calls produce nothing", () => {
-  const needs = inferTravelNeeds([WEEK[0], WEEK[1]], OPTS);
-  assert.strictEqual(needs.length, 0, "a virtual call was treated as travel");
+t("the Zoom call produces nothing", () => {
+  assert.strictEqual(inferTravelNeeds([WEEK[0]], OPTS).length, 0);
 });
 
-t("the Chicago meeting proposes a trip to Chicago", () => {
-  const needs = inferTravelNeeds([WEEK[2]], OPTS);
-  assert.strictEqual(needs.length, 1);
-  assert.strictEqual(needs[0].kind, "propose_trip");
-  assert.strictEqual(needs[0].destination, "Chicago");
-  assert.strictEqual(needs[0].certain, false, "an inferred trip claimed certainty");
+t("the Chicago meeting proposes a trip", () => {
+  const n = inferTravelNeeds([WEEK[1]], OPTS);
+  assert.strictEqual(n[0].kind, "propose_trip");
+  assert.strictEqual(n[0].destination, "Chicago");
+  assert.strictEqual(n[0].certain, false);
 });
 
-t("the Dallas meeting ASKS — it is never a silent booking", () => {
-  const needs = inferTravelNeeds([WEEK[3]], OPTS);
-  assert.strictEqual(needs.length, 1);
-  assert.strictEqual(needs[0].kind, "ask", "an ambiguous meeting was booked as a trip");
-  assert.strictEqual(needs[0].destination, "Dallas");
-  assert.ok(/in person, or remotely/i.test(needs[0].question));
+t("the Dallas meeting ASKS — never a silent booking", () => {
+  const n = inferTravelNeeds([WEEK[2]], OPTS);
+  assert.strictEqual(n[0].kind, "ask");
+  assert.ok(/in person, or remotely/i.test(n[0].question));
 });
 
-t("an in-person meeting with an unreadable city ASKS, it doesn't guess", () => {
-  const needs = inferTravelNeeds([WEEK[4]], OPTS);
-  assert.strictEqual(needs[0].kind, "ask");
-  assert.strictEqual(needs[0].destination, null, "a city was invented from 'Starbucks'");
+t("a meeting near where you already are is not travel", () => {
+  const local = [{ calendar_id: "9", title: "Coffee", nature: "in_person", geo: geo.nashville, start: soon(5), end: soon(6) }];
+  assert.strictEqual(inferTravelNeeds(local, OPTS).length, 0);
 });
 
-t("a meeting in the city you're already in is not travel", () => {
-  const here = [{ calendar_id: "9", title: "Coffee", nature: "in_person", place: "Downtown Nashville, TN", start: soon(5), end: soon(6) }];
-  assert.strictEqual(inferTravelNeeds(here, OPTS).length, 0, "proposed a trip to where you already are");
+t("an in-person meeting with an unresolved place ASKS", () => {
+  const noGeo = [{ calendar_id: "z", title: "Mystery", nature: "in_person", place: "Some Cafe", geo: { city: null, lat: null, lng: null }, start: soon(8), end: soon(9) }];
+  assert.strictEqual(inferTravelNeeds(noGeo, OPTS)[0].kind, "ask");
+});
+
+t("without a 'where are you', it ASKS instead of guessing travel", () => {
+  const n = inferTravelNeeds([WEEK[1]], { now: NOW, current: null });
+  assert.strictEqual(n[0].kind, "ask");
+  assert.ok(/where are you/i.test(n[0].question));
 });
 
 t("a past meeting drives nothing", () => {
-  const past = [{ calendar_id: "0", title: "Old", nature: "in_person", place: "Chicago", start: soon(-5), end: soon(-4) }];
+  const past = [{ calendar_id: "0", title: "Old", nature: "in_person", geo: geo.chicago, start: soon(-5), end: soon(-4) }];
   assert.strictEqual(inferTravelNeeds(past, OPTS).length, 0);
 });
 
-console.log(`\n${b}The whole week at once${x}`);
+console.log(`\n${b}Distance beats string-matching${x}`);
 console.log(`${d}──────────────────────────────────────────────────────────${x}`);
 
-t("18-ish meetings collapse to one proposal and two questions", () => {
-  const needs = inferTravelNeeds(WEEK, OPTS);
-  const { trips, asks } = groupTrips(needs);
-  assert.strictEqual(trips.length, 1, "expected exactly one trip (Chicago)");
-  assert.strictEqual(trips[0].destination, "Chicago");
-  assert.strictEqual(asks.length, 2, "expected two open questions (Dallas + Starbucks)");
+t("Evanston folds into the Chicago trip (12 miles), not its own question", () => {
+  const needs = inferTravelNeeds([WEEK[1], WEEK[3]], OPTS);
+  const { trips } = groupTrips(needs, { hubs: HUBS });
+  assert.strictEqual(trips.length, 1, "Evanston and Chicago should be ONE trip");
+  assert.strictEqual(trips[0].destination, "Chicago", "the metro should win over the suburb");
+  assert.strictEqual(trips[0].drivers.length, 2, "the trip should remember both meetings");
 });
 
-t("two Chicago meetings on nearby days are ONE trip, not two", () => {
-  const twoChi = [
-    WEEK[2],
-    { calendar_id: "6", title: "Second Chicago sync", nature: "in_person", place: "River North, Chicago", start: soon(44), end: soon(45) },
-  ];
-  const { trips } = groupTrips(inferTravelNeeds(twoChi, OPTS));
-  assert.strictEqual(trips.length, 1, "same city, nearby days should be one trip");
-  assert.strictEqual(trips[0].drivers.length, 2, "the trip should remember both meetings");
+t("the whole week: one Chicago trip + one Dallas question", () => {
+  const { trips, asks } = groupTrips(inferTravelNeeds(WEEK, OPTS), { hubs: HUBS });
+  assert.strictEqual(trips.length, 1);
+  assert.strictEqual(trips[0].destination, "Chicago");
+  assert.strictEqual(asks.length, 1);
+  assert.strictEqual(asks[0].driver.title, "Preston DeLong — Texas Rangers");
 });
 
 console.log(`\n${b}Handle changes so I don't have to${x}`);
 console.log(`${d}──────────────────────────────────────────────────────────${x}`);
 
-// This is the sick-day. She pushes the Chicago meeting. Nobody cancels a trip; the
-// trip simply is not inferred anymore, because it was never anything but a function
-// of the calendar. The change handles itself.
-t("push the meeting → the trip need is gone, with nothing to undo", () => {
-  const before = groupTrips(inferTravelNeeds([WEEK[2]], OPTS)).trips;
-  assert.strictEqual(before.length, 1, "precondition: the trip existed");
-
-  const afterPush = []; // the meeting moved off this window / turned into a call
-  const after = groupTrips(inferTravelNeeds(afterPush, OPTS)).trips;
-  assert.strictEqual(after.length, 0, "the trip lingered after its reason left");
+t("push the meeting → the trip is gone, nothing to undo", () => {
+  assert.strictEqual(groupTrips(inferTravelNeeds([WEEK[1]], OPTS)).trips.length, 1);
+  assert.strictEqual(groupTrips(inferTravelNeeds([], OPTS)).trips.length, 0);
 });
 
 t("turn the meeting virtual → also no trip", () => {
-  const nowVirtual = [{ ...WEEK[2], nature: "virtual", place: null }];
-  assert.strictEqual(inferTravelNeeds(nowVirtual, OPTS).length, 0, "a meeting moved to video still pulled a trip");
+  const nowVirtual = [{ ...WEEK[1], nature: "virtual", geo: null }];
+  assert.strictEqual(inferTravelNeeds(nowVirtual, OPTS).length, 0);
 });
 
 console.log(`\n${d}──────────────────────────────────────────────────────────${x}`);
