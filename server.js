@@ -2651,6 +2651,8 @@ const reconcile = require("./reconcile");
 const autonomy = require("./autonomy");
 const watcher = require("./watcher");
 const taste = require("./taste");
+const holds = require("./holds");
+const stays = require("./stays");
 
 const MAX_STAY_NIGHTS = 30;
 const MAX_TRIP_DAYS   = 30;   // a single trip should not span longer than this
@@ -7237,6 +7239,165 @@ Rules:
     res.json({ ok: true, city: city || null, request, ...(result || { intent: "type", picks: [] }) });
   } catch (e) {
     console.error("[curate/dining]", e.message);
+    res.status(500).json({ ok: false, error: humanError(e) });
+  }
+});
+
+// ─────────────────────────────────────────────────────────────────────────────
+// C6a — Duffel Stays: real, bookable hotels behind the Curator's slate.
+//
+// The safety model is hold-then-confirm (holds.js + stays.js):
+//   /stays/search  → real availability + live prices (no money)
+//   /stays/rates   → bookable rates for one hotel, with refundability derived
+//   /stays/hold    → a QUOTE: confirms price + availability, moves NO money
+//   /stays/confirm → the CHARGE, gated on an explicit, matching, live confirm
+// There is no endpoint that charges without /stays/confirm carrying { confirm:true }
+// AND matching the held offer id and amount AND the hold still being live. Duffel stays
+// in whatever mode the key is (test until the user flips it); confirm is required either
+// way, so a live key never turns into an autonomous charge.
+// ─────────────────────────────────────────────────────────────────────────────
+function duffelModeLabel() {
+  const k = process.env.DUFFEL_API_KEY || "";
+  return k.startsWith("duffel_live_") ? "live" : k.startsWith("duffel_test_") ? "test" : "unset";
+}
+
+app.post("/stays/search", async (req, res) => {
+  const email = await verifyAccessToken(req);
+  if (!email) return res.status(401).json({ error: "unauthorized" });
+  try {
+    let { city, latitude, longitude, radius, check_in_date, check_out_date, rooms, guests } = req.body || {};
+    if (!check_in_date || !check_out_date) {
+      return res.status(400).json({ error: "check_in_date and check_out_date are required" });
+    }
+    // Resolve a typed city to coordinates when the app didn't pass device geo.
+    if ((latitude == null || longitude == null) && city) {
+      const place = await geo.resolvePlace(String(city));
+      if (place && place.lat != null) { latitude = place.lat; longitude = place.lng; }
+    }
+    if (latitude == null || longitude == null) {
+      return res.status(400).json({ error: "Need a city I can locate, or your coordinates." });
+    }
+    const duffel = getDuffel();
+    const results = await stays.searchStays(duffel, {
+      latitude, longitude, radius: radius || 8,
+      check_in_date, check_out_date,
+      rooms: rooms || 1, guests: guests || [{ type: "adult" }],
+    });
+    res.json({ ok: true, duffel_mode: duffelModeLabel(), city: city || null, results });
+  } catch (e) {
+    console.error("[stays-search]", e.message);
+    res.status(500).json({ ok: false, error: humanError(e) });
+  }
+});
+
+app.post("/stays/rates", async (req, res) => {
+  const email = await verifyAccessToken(req);
+  if (!email) return res.status(401).json({ error: "unauthorized" });
+  try {
+    const searchResultId = String(req.body?.search_result_id || "").trim();
+    if (!searchResultId) return res.status(400).json({ error: "search_result_id required" });
+    const duffel = getDuffel();
+    const { accommodation, rates } = await stays.ratesFor(duffel, searchResultId);
+    res.json({ ok: true, duffel_mode: duffelModeLabel(), accommodation, rates });
+  } catch (e) {
+    console.error("[stays-rates]", e.message);
+    res.status(500).json({ ok: false, error: humanError(e) });
+  }
+});
+
+// POST /stays/hold { rate } — place a Duffel quote (no money). Returns the hold and the
+// exact line the user will confirm. User-initiated, so we quote whatever rate they chose;
+// refundability is carried through and stated plainly in the confirm summary.
+app.post("/stays/hold", async (req, res) => {
+  const email = await verifyAccessToken(req);
+  if (!email) return res.status(401).json({ error: "unauthorized" });
+  try {
+    const rate = req.body?.rate;
+    if (!rate || !rate.id) return res.status(400).json({ error: "rate (with id) required" });
+    const duffel = getDuffel();
+    const hold = await stays.placeHold(duffel, rate);
+    await logActivity(
+      email, "hold",
+      `Hold placed: ${rate.name || "a room"}`,
+      `Quoted ${hold.currency} ${hold.amount ?? "?"} — no charge yet. ${holds.summarizeForConfirm(hold)}`,
+      null, null,
+      { provider: "duffel_stays", quote_id: hold.id, offer_id: hold.offer_id }
+    );
+    res.json({
+      ok: true, duffel_mode: duffelModeLabel(),
+      hold, confirm_line: holds.summarizeForConfirm(hold),
+      state: holds.holdState(hold),
+    });
+  } catch (e) {
+    console.error("[stays-hold]", e.message);
+    res.status(500).json({ ok: false, error: humanError(e) });
+  }
+});
+
+// POST /stays/confirm { hold, confirm:{confirm:true,offer_id,amount}, guests, phone_number? }
+// The ONLY path that charges. Gated by holds.assertChargeable inside stays.confirmBooking.
+app.post("/stays/confirm", async (req, res) => {
+  const email = await verifyAccessToken(req);
+  if (!email) return res.status(401).json({ error: "unauthorized" });
+  try {
+    let { hold, confirm, guests, phone_number } = req.body || {};
+    if (!hold || !hold.id) return res.status(400).json({ error: "hold required" });
+    if (!confirm || confirm.confirm !== true) {
+      return res.status(400).json({ ok: false, error: "A charge needs your explicit confirm." });
+    }
+    if (!guests || !guests.length) return res.status(400).json({ error: "guests required" });
+
+    const duffel = getDuffel();
+    // Harden against a tampered hold: refresh the authoritative amount + expiry from the
+    // live quote when we can, so we're always charging what Duffel says, not the client.
+    let liveHold = hold;
+    try {
+      const q = await duffel.stays.quotes.get(hold.id);
+      if (q?.data) {
+        liveHold = holds.normalizeHold({
+          id: q.data.id, offer_id: hold.offer_id, kind: "stay",
+          amount: q.data.total_amount, currency: q.data.total_currency,
+          refundable: hold.refundable, refundable_until: hold.refundable_until,
+          expires_at: q.data.expires_at || hold.expires_at, state: "held", provider: "duffel_stays",
+        });
+      }
+    } catch (_) { /* quote re-fetch best-effort; assertChargeable still guards the client hold */ }
+
+    const result = await stays.confirmBooking(duffel, {
+      hold: liveHold, confirm, guests,
+      email, phone_number: phone_number || "+10000000000",
+    });
+    if (!result.ok) return res.status(409).json({ ok: false, error: result.reason });
+
+    const bk = result.booking || {};
+    const name = bk.accommodation?.name || hold.raw?.name || "Hotel";
+    const ref = bk.reference || bk.booking_reference || bk.id || null;
+    const [trip] = await sql`
+      INSERT INTO trips (user_email, title, status, source)
+      VALUES (${email}, ${name}, 'upcoming', 'duffel_stays')
+      RETURNING id
+    `;
+    await sql`
+      INSERT INTO trip_legs (trip_id, type, origin, departs_at, arrives_at, confirmation, raw_data)
+      VALUES (
+        ${trip.id}, 'hotel',
+        ${name},
+        ${bk.check_in_date || null},
+        ${bk.check_out_date || null},
+        ${ref},
+        ${JSON.stringify({ duffel_stays_booking_id: bk.id, quote_id: liveHold.id })}
+      )
+    `;
+    await logActivity(
+      email, "booking",
+      `Hotel booked: ${name}`,
+      `Confirmed at ${liveHold.currency} ${liveHold.amount}. Reference: ${ref || "pending"}.`,
+      trip.id, null,
+      { provider: "duffel_stays", booking_id: bk.id, reference: ref, amount: liveHold.amount, currency: liveHold.currency }
+    );
+    res.json({ ok: true, booking: { id: bk.id, reference: ref, name, amount: liveHold.amount, currency: liveHold.currency, trip_id: trip.id } });
+  } catch (e) {
+    console.error("[stays-confirm]", e.message);
     res.status(500).json({ ok: false, error: humanError(e) });
   }
 });

@@ -56,9 +56,15 @@ const D = (days, hhmm) => {
 const TRIP_TITLE = "TEST — Tokyo & Bali";
 
 async function remove() {
+  // Match on what the app CAN'T rename away: source='seed' and the TEST-JL623
+  // confirmation. Title-matching alone missed the trip after the app relabeled it
+  // "Tokyo" — the exact bug that left the seed lingering on the phone.
   const trips = await sql`
     SELECT id, title FROM trips
-    WHERE user_email = ${email} AND title LIKE 'TEST —%'`;
+    WHERE user_email = ${email}
+      AND (title LIKE 'TEST —%'
+           OR source = 'seed'
+           OR id IN (SELECT trip_id FROM trip_legs WHERE confirmation = 'TEST-JL623'))`;
   if (!trips.length) { say(`  ${c.g}Nothing seeded to remove.${c.x}`); return; }
 
   for (const t of trips) {
