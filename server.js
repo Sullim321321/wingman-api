@@ -7114,7 +7114,11 @@ async function buildTasteBrief(email) {
   const dietary = prefs.dietary || (prefs.taste_profile && prefs.taste_profile.dietary) || [];
   return taste.assembleBrief({
     hotelAffinity, restaurantAffinity,
-    prefs: { dietary, cabin_preference: prefs.cabin_preference, price_tier: prefs.price_tier, home_bases: prefs.home_bases },
+    prefs: {
+      dietary, cabin_preference: prefs.cabin_preference, price_tier: prefs.price_tier,
+      home_bases: prefs.home_bases,
+      loved_cuisines: prefs.loved_cuisines, dining_notes: prefs.dining_notes,
+    },
     sources: prefs.curator_sources || [],
   });
 }
@@ -7190,6 +7194,49 @@ Rules:
     });
   } catch (e) {
     console.error("[curate]", e.message);
+    res.status(500).json({ ok: false, error: humanError(e) });
+  }
+});
+
+// POST /curate/dining { city, request } — a spoken dining wish, answered.
+// "avec and Alinea but chiller", "book Carbone", "somewhere quiet for a client
+// dinner". Reads named reference points + the modifier against your taste, and
+// either echoes the exact place to reserve or offers a few that fit the vibe.
+app.post("/curate/dining", async (req, res) => {
+  const email = await verifyAccessToken(req);
+  if (!email) return res.status(401).json({ error: "unauthorized" });
+  const city = String(req.body?.city || "").trim();
+  const request = String(req.body?.request || "").trim();
+  if (!request) return res.status(400).json({ error: "request required" });
+  try {
+    const brief = await buildTasteBrief(email);
+    const prompt = `You are Wingman's Curator answering a dining wish for a discerning traveler${city ? ` in ${city}` : ""}.
+Their taste brief (JSON): ${JSON.stringify(brief)}
+Their wish, verbatim: "${request}"
+
+The wish may name places they LOVE as reference points and a MODIFIER (e.g. "like avec and Alinea but chiller"), or name an EXACT restaurant to book, or describe a vibe/occasion.
+Return STRICT JSON only:
+{
+ "intent": "exact" | "type",
+ "picks": [ up to 4: {"name","vibe","why","source"} ]
+}
+Rules:
+- If they named an exact restaurant to book, intent="exact" and make it the first pick, with a "why" noting you'll request the table (you cannot confirm availability).
+- Otherwise intent="type": honor BOTH the reference points and the modifier ("chiller" = lower-key than Alinea, warmer than a tasting temple).
+- Respect their dietary lines and dining notes.
+- "source": one of their listed sources only if it genuinely reflects that editor; else null. Never invent one.
+- "why" under 14 words, specific — cite the reference, the modifier, or their taste.`;
+    const resp = await getAnthropic().messages.create({
+      model: "claude-sonnet-4-5", max_tokens: 1200,
+      messages: [{ role: "user", content: prompt }],
+    });
+    const rawT = (resp.content && resp.content[0] && resp.content[0].text || "").trim();
+    const m = rawT.match(/\{[\s\S]*\}/);
+    let result = null;
+    try { result = m ? JSON.parse(m[0]) : null; } catch { result = null; }
+    res.json({ ok: true, city: city || null, request, ...(result || { intent: "type", picks: [] }) });
+  } catch (e) {
+    console.error("[curate/dining]", e.message);
     res.status(500).json({ ok: false, error: humanError(e) });
   }
 });

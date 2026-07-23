@@ -37,6 +37,10 @@ function assembleBrief({ hotelAffinity = [], restaurantAffinity = [], prefs = {}
       cuisines: uniq(rests.map((r) => r.cuisine)).slice(0, 6),
       favorites: rests.slice(0, 6).map((r) => ({ name: r.restaurant_name, city: r.city || null })),
       dietary: uniq(prefs.dietary),
+      // Richer than a flag: cuisines you love and free-text notes ("no fusion",
+      // "counter seats", "quiet enough to talk"). The curator reads these too.
+      loved: uniq(prefs.loved_cuisines),
+      notes: (prefs.dining_notes && String(prefs.dining_notes).trim()) || null,
     },
     cabin: prefs.cabin_preference || null,
     price_tier: prefs.price_tier || null,

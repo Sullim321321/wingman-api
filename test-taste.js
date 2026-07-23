@@ -23,7 +23,8 @@ const src = {
     { restaurant_name: "Elske", cuisine: "New American", city: "Chicago", visit_count: 2 },
     { restaurant_name: "Kumiko", cuisine: "cocktails", city: "Chicago", visit_count: 1 },
   ],
-  prefs: { dietary: ["vegetarian", "vegan"], cabin_preference: "business", price_tier: "premium" },
+  prefs: { dietary: ["vegetarian", "vegan"], cabin_preference: "business", price_tier: "premium",
+           loved_cuisines: ["omakase", "natural wine"], dining_notes: "counter seats, quiet enough to talk" },
   sources: ["NYT 36 Hours", "Service 95", "Hotels Above Par", "Service 95"],
 };
 
@@ -42,6 +43,12 @@ t("dietary lines carry through", () => {
 
 t("cuisines come from your restaurants", () => {
   assert.ok(assembleBrief(src).dining.cuisines.includes("New American"));
+});
+
+t("loved cuisines and free-text dining notes carry through", () => {
+  const brief = assembleBrief(src);
+  assert.ok(brief.dining.loved.includes("omakase"));
+  assert.strictEqual(brief.dining.notes, "counter seats, quiet enough to talk");
 });
 
 t("sources are deduped", () => {
