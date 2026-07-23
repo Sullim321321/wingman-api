@@ -6768,15 +6768,22 @@ app.get("/calendar/travel", async (req, res) => {
   try {
     const days = Math.min(Math.max(parseInt(req.query.days || "14", 10) || 14, 1), 60);
     const fromText = (req.query.from || "").trim() || null;
+    const fromLat = parseFloat(req.query.from_lat);
+    const fromLng = parseFloat(req.query.from_lng);
     const { connected, accounts, events } = await readCommitments(email, days);
     if (!connected) {
       return res.json({ ok: true, connected: false, reason: "no_google_account", trips: [], asks: [] });
     }
     const anyReadable = accounts.some((p) => p.readable);
 
-    // Where you are now (geolocation later; a city string for now). Resolved to
-    // coordinates so "out of town" is a distance, not a string comparison.
-    const current = fromText ? await geo.resolvePlace(fromText) : null;
+    // Where you are now. The app sends device coordinates when it has them — the
+    // truest signal, and no geocode needed. Otherwise fall back to a city string.
+    let current = null;
+    if (!Number.isNaN(fromLat) && !Number.isNaN(fromLng)) {
+      current = { city: fromText || null, lat: fromLat, lng: fromLng, source: "device" };
+    } else if (fromText) {
+      current = await geo.resolvePlace(fromText);
+    }
 
     // Geocode ONLY the meetings that could imply travel — in-person or ambiguous,
     // in the future. Zoom calls never get a network call. Cached + gazetteer-first,
