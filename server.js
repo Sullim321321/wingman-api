@@ -2649,6 +2649,7 @@ const { proposeItinerary } = require("./itinerary");
 const hygiene = require("./hygiene");
 const reconcile = require("./reconcile");
 const autonomy = require("./autonomy");
+const watcher = require("./watcher");
 
 const MAX_STAY_NIGHTS = 30;
 const MAX_TRIP_DAYS   = 30;   // a single trip should not span longer than this
@@ -7005,6 +7006,96 @@ app.post("/plan/propose-trip", async (req, res) => {
     res.json({ ok: true, trip_id: trip.id, leg_id: leg.id });
   } catch (e) {
     console.error("[plan/propose-trip]", e.message);
+    res.status(500).json({ ok: false, error: humanError(e) });
+  }
+});
+
+// POST /autonomy/run?execute=1 — the proactive watcher (Pillar 5d). Runs the loop
+// unattended: finds your proposed flights, prices them, decides per your dial +
+// standing orders, and (with execute=1) SECURES A HOLD on the best qualifying one.
+// Safety, non-negotiable: default is dry-run; it only ever places an internal hold,
+// never a real order; live-money book decisions are downgraded to holds; capped per
+// run; a held leg is no longer 'proposed' so it can't be re-acted. Schedulable.
+app.post("/autonomy/run", async (req, res) => {
+  const email = await verifyAccessToken(req);
+  if (!email) return res.status(401).json({ error: "unauthorized" });
+  const execute = req.query.execute === "1";
+  try {
+    const [uRow] = await sql`SELECT preferences FROM users WHERE email = ${email}`;
+    const uprefs = uRow?.preferences || {};
+    const level = autonomy.levelFromMode(uprefs.autonomy_mode, uprefs.threshold);
+    if (level === "watch" || level === "suggest") {
+      return res.json({ ok: true, level, ran: false, reason: `Dial is at "${level}" — I won't act unattended.`, actions: [], skipped: [] });
+    }
+    const key = process.env.DUFFEL_API_KEY || "";
+    const liveMoney = key.startsWith("duffel_live_");
+    const duffel = key ? getDuffel() : null;
+    const passenger = await passengerFor(email);
+
+    const legs = await sql`
+      SELECT tl.*, t.user_email FROM trip_legs tl JOIN trips t ON t.id = tl.trip_id
+      WHERE t.user_email = ${email} AND t.archived = false
+        AND tl.type = 'flight' AND tl.state = 'proposed'
+        AND tl.departs_at IS NOT NULL AND tl.departs_at > NOW()`;
+
+    const items = [];
+    const not_ready = [];
+    for (const leg of legs) {
+      const ready = booking.readiness({ leg, trip: { id: leg.trip_id }, passenger });
+      if (!ready.ready) { not_ready.push({ leg_id: leg.id, missing: (ready.missing || []).map((m) => m.field) }); continue; }
+      if (!duffel) { not_ready.push({ leg_id: leg.id, missing: ["duffel"] }); continue; }
+      const [from, to] = await Promise.all([
+        booking.resolveAirport(duffel, ready.from_city),
+        booking.resolveAirport(duffel, ready.to_city),
+      ]);
+      if (!from || !to) { not_ready.push({ leg_id: leg.id, missing: ["airport"] }); continue; }
+      const { options } = await booking.offersFor(sql, duffel, {
+        leg: { ...leg, user_email: email }, from, to, departs_at: ready.departs_at,
+      });
+      const [soRow] = await sql`SELECT enabled, max_price, min_cabin, avoid_airports FROM standing_orders WHERE trip_id = ${leg.trip_id}`;
+      const so = soRow && soRow.enabled ? soRow : null;
+      const standingOrders = {
+        max_price: so ? so.max_price : (uprefs.threshold ?? null),
+        min_cabin: so ? so.min_cabin : (uprefs.cabin_preference || null),
+        avoid_airports: so ? (so.avoid_airports || []) : [],
+        no_red_eyes: !!uprefs.no_red_eyes,
+        require_refundable: !!uprefs.require_refundable,
+      };
+      const autoOffers = options.map((o) => ({
+        id: o.offer_id, price: o.price, currency: o.currency, cabin: o.cabin, departs_at: o.departs_at,
+        red_eye: autonomy.isRedEye(o.departs_at),
+        refundable: !!(o.offer?.conditions?.refund_before_departure?.allowed),
+        airports: [...new Set((o.offer?.slices || []).flatMap((s) => (s.segments || []).flatMap((g) => [g.origin?.iata_code, g.destination?.iata_code])).filter(Boolean))],
+      }));
+      const decision = autonomy.decideAction({ mode: uprefs.autonomy_mode, threshold: uprefs.threshold, standingOrders, offers: autoOffers });
+      items.push({ key: leg.id, decision });
+    }
+
+    const { actions, skipped } = watcher.planRun({ items, liveMoney, maxActions: 3 });
+
+    const held = [];
+    if (execute) {
+      for (const a of actions) {
+        // v1 safe execution: an INTERNAL hold. Mark the leg held and remember the
+        // chosen offer. No Duffel order is created here — the ticket is placed via
+        // the confirm path, which re-earns permission and, in live mode, requires
+        // your yes. This removes the searching/holding labor, not the final say.
+        await sql`
+          UPDATE trip_legs
+          SET state = 'held',
+              raw_data = COALESCE(raw_data, '{}'::jsonb) || ${JSON.stringify({
+                auto_held: true, held_by: "wingman", held_at: new Date().toISOString(),
+                held_offer_id: a.offer.id, held_price: a.offer.price, held_currency: a.offer.currency,
+                intended_action: a.action, downgraded: a.downgraded,
+              })}::jsonb
+          WHERE id = ${a.key} AND state = 'proposed'`;
+        held.push({ leg_id: a.key, offer_id: a.offer.id, price: a.offer.price, currency: a.offer.currency, downgraded: a.downgraded, reason: a.reason });
+      }
+    }
+
+    res.json({ ok: true, level, liveMoney, executed: execute, actions, skipped, not_ready, held });
+  } catch (e) {
+    console.error("[autonomy/run]", e.message);
     res.status(500).json({ ok: false, error: humanError(e) });
   }
 });
