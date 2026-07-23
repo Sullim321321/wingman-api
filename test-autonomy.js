@@ -89,9 +89,14 @@ console.log(`${d}─────────────────────
 t("always_ask maps to suggest", () => {
   assert.strictEqual(decideAction({ mode: "always_ask", offers: [cheap] }).action, "suggest");
 });
-t("fully_auto + threshold maps to book_under", () => {
-  assert.strictEqual(decideAction({ mode: "fully_auto", threshold: 250, offers: [cheap] }).action, "book");
-  assert.strictEqual(decideAction({ mode: "fully_auto", threshold: 150, offers: [cheap] }).action, "hold"); // 210 > 150
+t("auto_under_threshold maps to book_under (threshold gates)", () => {
+  assert.strictEqual(decideAction({ mode: "auto_under_threshold", threshold: 250, offers: [cheap] }).action, "book");
+  assert.strictEqual(decideAction({ mode: "auto_under_threshold", threshold: 150, offers: [cheap] }).action, "hold"); // 210 > 150
+});
+t("fully_auto maps to full — books best fit, still bounded by a standing-order cap", () => {
+  assert.strictEqual(decideAction({ mode: "fully_auto", offers: [cheap] }).action, "book");
+  // full still can't cross a standing-order max_price
+  assert.strictEqual(decideAction({ mode: "fully_auto", standingOrders: { max_price: 100 }, offers: [cheap] }).action, "suggest");
 });
 t("red-eye detection reads the departure hour", () => {
   assert.strictEqual(isRedEye("2026-08-15T23:30:00-05:00"), true);

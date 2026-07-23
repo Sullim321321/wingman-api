@@ -28,9 +28,12 @@
 const LEVELS = ["watch", "suggest", "hold", "book_under", "full"];
 const CABIN_RANK = { economy: 0, premium_economy: 1, business: 2, first: 3 };
 
-// Legacy autonomy_mode ("always_ask" / "fully_auto") → a dial level.
+// The app's autonomy_mode ("always_ask" / "auto_under_threshold" / "fully_auto")
+// → a dial level. auto_under_threshold is the Book-under-$X level; without it, that
+// mode silently fell through to "suggest" and the dial did nothing.
 function levelFromMode(mode, threshold) {
-  if (mode === "fully_auto") return threshold != null ? "book_under" : "full";
+  if (mode === "fully_auto") return "full";
+  if (mode === "auto_under_threshold") return "book_under";
   return "suggest"; // always_ask and anything unknown → propose only
 }
 

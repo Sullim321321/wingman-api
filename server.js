@@ -2648,6 +2648,7 @@ const geo = require("./geo");
 const { proposeItinerary } = require("./itinerary");
 const hygiene = require("./hygiene");
 const reconcile = require("./reconcile");
+const autonomy = require("./autonomy");
 
 const MAX_STAY_NIGHTS = 30;
 const MAX_TRIP_DAYS   = 30;   // a single trip should not span longer than this
@@ -7315,6 +7316,9 @@ app.get("/policy", auth, async (req, res) => {
         threshold: prefs.threshold || 500,
         payment_preference: prefs.payment_preference || "best_value",
         cabin_preference: prefs.cabin_preference || "economy",
+        // Standing orders — hard walls the autonomy dial can never cross.
+        no_red_eyes: !!prefs.no_red_eyes,
+        require_refundable: !!prefs.require_refundable,
         notify_on_action: prefs.notify_on_action !== false,
         calendar_connected: prefs.calendar_connected || false,
         messages_connected: prefs.messages_connected || false,
@@ -15152,6 +15156,35 @@ app.get("/plan/leg/:legId/book", async (req, res) => {
       user_email: email, trip_id: leg.trip_id, choice: top,
     });
 
+    // ── What Wingman WOULD do at your current dial level ─────────────────────
+    // Surfaced, not executed here — the book screen shows "at your setting, I'd
+    // hold/book this". Standing orders are hard walls (autonomy.js); over-budget or
+    // rule-breaking is never chosen, at any level.
+    const [uRow] = await sql`SELECT preferences FROM users WHERE email = ${email}`;
+    const uprefs = uRow?.preferences || {};
+    const [soRow] = await sql`SELECT enabled, max_price, min_cabin, avoid_airports FROM standing_orders WHERE trip_id = ${leg.trip_id}`;
+    const so = soRow && soRow.enabled ? soRow : null;
+    const standingOrders = {
+      max_price: so ? so.max_price : (uprefs.threshold ?? null),
+      min_cabin: so ? so.min_cabin : (uprefs.cabin_preference || null),
+      avoid_airports: so ? (so.avoid_airports || []) : [],
+      no_red_eyes: !!uprefs.no_red_eyes,
+      require_refundable: !!uprefs.require_refundable,
+    };
+    const autoOffers = options.map((o) => ({
+      id: o.offer_id, price: o.price, currency: o.currency, cabin: o.cabin,
+      departs_at: o.departs_at,
+      red_eye: autonomy.isRedEye(o.departs_at),
+      refundable: !!(o.offer?.conditions?.refund_before_departure?.allowed),
+      airports: [...new Set((o.offer?.slices || [])
+        .flatMap((s) => (s.segments || []).flatMap((g) => [g.origin?.iata_code, g.destination?.iata_code]))
+        .filter(Boolean))],
+    }));
+    const recommendation = autonomy.decideAction({
+      mode: uprefs.autonomy_mode, threshold: uprefs.threshold,
+      standingOrders, offers: autoOffers,
+    });
+
     res.json({
       ready: true,
       leg: { id: leg.id, title: leg.destination, departs_at: ready.departs_at },
@@ -15164,6 +15197,8 @@ app.get("/plan/leg/:legId/book", async (req, res) => {
       no_recommendation_because,
       // Can I do this without you? The graph answers; the setting doesn't.
       may_act_alone: permission,
+      // What my current autonomy dial would do with these offers (not executed here).
+      recommendation,
     });
   } catch (e) {
     console.error("[plan/book/get]", e.message);
