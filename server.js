@@ -6675,15 +6675,16 @@ app.get("/trips/:id/dossier", async (req, res) => {
     }
 
     const now = Date.now();
-    const firstDep = legs.map((l) => l.departs_at).filter(Boolean).sort()[0];
-    const lastArr = legs.map((l) => l.arrives_at || l.departs_at).filter(Boolean).sort().slice(-1)[0];
-    const inMotion = firstDep && lastArr &&
-      now >= new Date(firstDep).getTime() && now <= new Date(lastArr).getTime();
 
     // Chapters, rides and names come from document.js — the same rules Home reads.
     // Home showing a different answer to "is this happening now" than the Dossier
     // would be the trip-title bug again, wearing a new hat.
     const { chapters, rides } = tripdoc.toChapters(legs, now, flightid, depBy);
+
+    // "In motion" means a LEG is actually happening now — not that `now` falls inside
+    // a naive first-to-last span. The old span read the 2012 flight as the start, so a
+    // trip stretching to today declared itself in progress. A finished trip is not.
+    const inMotion = chapters.in_motion.length > 0 && !tripdoc.tripIsPast(legs, now);
 
     // ── Is any of this real? ────────────────────────────────────────────────
     // A trip built entirely from proposals is an IDEA, and the screen has to say so

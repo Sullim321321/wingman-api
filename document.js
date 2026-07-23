@@ -40,25 +40,65 @@ function chapterOf(leg, nowMs) {
 }
 
 /**
+ * A property_name that is just the CITY is not a name — it's a label the importer
+ * fell back to. Those four "Nashville" cards were address-to-address rides whose
+ * property_name had been set to "Nashville", which made isRide think they had a name
+ * and legName proudly print the city. A ride to 250 Rep John Lewis Way is not "the
+ * Nashville". So a city-as-name counts as no name at all.
+ */
+function isCityLabel(leg) {
+  const n = String(leg?.property_name || "").trim().toLowerCase();
+  if (!n) return false;
+  const city = String(leg.destination_city || leg.destination || "").trim().toLowerCase();
+  return !!city && n === city;
+}
+
+// A real, specific name — not blank, not the city.
+function hasRealName(leg) {
+  return (!!leg.property_name && !isCityLabel(leg)) || !!leg.vehicle_class || !!leg.nights || !!leg.confirmation;
+}
+
+// Pull a specific place out of an address, when that's all we have. "2021 Broadway,
+// Nashville, TN" → "2021 Broadway". A bare ZIP or the city itself doesn't count.
+function venueFrom(leg) {
+  const raw = leg.location || leg.address || leg.destination || "";
+  const first = String(raw).split(/\s*(?:→|->|;|\n)\s*/)[0].split(",")[0].trim();
+  const city = String(leg.destination_city || "").trim().toLowerCase();
+  if (!first || /^\d{4,6}$/.test(first) || first.toLowerCase() === city) return "";
+  return first;
+}
+
+/**
  * An Uber is an expense; a seaplane is an appointment.
  *
- * Four address-to-address "Nashville" rides sitting in an itinerary with the same
- * weight as a hotel is noise, and noise is what makes a briefing unreadable. But
- * pretending they didn't happen is its own lie, so they're counted, not deleted.
- *
- * The distinction is a NAME. An Uber doesn't have one. "Seaplane transfer" does, and
- * a named transfer stays visible — it's exactly the kind of thing the cascade defends.
+ * Address-to-address rides with the same weight as a hotel are noise. But pretending
+ * they didn't happen is its own lie, so they're counted, not deleted. The distinction
+ * is a real NAME — and the city is not one.
  */
 function isRide(leg) {
-  return (leg?.type === "car" || leg?.type === "transfer") &&
-    !leg.property_name && !leg.vehicle_class && !leg.nights && !leg.confirmation;
+  const t = String(leg?.type || "").toLowerCase();
+  return (t === "car" || t === "transfer" || t === "ride" || t === "taxi") && !hasRealName(leg);
 }
 
 /** What a person should see on the card. `fid` is the flightid module. */
 function legName(leg, fid) {
   if (!leg) return "";
   if (leg.type === "flight" && fid) return fid.displayName(leg);
-  return leg.property_name || leg.destination_city || leg.destination || leg.type || "booking";
+  if (leg.property_name && !isCityLabel(leg)) return leg.property_name;
+  // property_name is missing or just the city — reach for a specific place first.
+  return venueFrom(leg) || leg.property_name || leg.destination_city || leg.destination || leg.type || "booking";
+}
+
+/**
+ * Is this whole trip in the past? True only when there IS dated, real (non-proposed)
+ * evidence and every bit of it has finished — so a finished trip stops calling itself
+ * "in motion". A trip with any live or upcoming leg, or with nothing dated to judge,
+ * is not "past".
+ */
+function tripIsPast(legs, nowMs) {
+  const dated = (legs || []).filter((l) => l.state !== "proposed" && l.departs_at && !Number.isNaN(new Date(l.departs_at).getTime()));
+  if (!dated.length) return false;
+  return dated.every((l) => chapterOf(l, nowMs) === "after");
 }
 
 /**
@@ -85,4 +125,4 @@ function toChapters(legs, nowMs, fid, depBy = {}) {
   return { chapters, rides };
 }
 
-module.exports = { chapterOf, isRide, legName, certaintyOf, toChapters };
+module.exports = { chapterOf, isRide, legName, certaintyOf, toChapters, isCityLabel, tripIsPast, venueFrom };

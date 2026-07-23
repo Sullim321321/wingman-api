@@ -237,6 +237,55 @@ t("a trip made only of proposals is upcoming, never active", () => {
   assert.strictEqual(statusOf([{ state: "proposed", type: "flight", departs_at: "2026-07-21T23:00:00Z" }], NOW), "upcoming");
 });
 
+console.log(`\n${b}A city is not a name — the "Nashville" rides collapse${x}`);
+console.log(`${d}──────────────────────────────────────────────────────────${x}`);
+
+// The exact mess: a ride whose property_name got set to the city, so it rendered as
+// a named card called "Nashville" instead of being counted like the Uber it is.
+const cityRide = {
+  type: "transfer", property_name: "Nashville", destination_city: "Nashville",
+  location: "2021 Broadway, Nashville, TN → 250 Rep John Lewis Way S, Nashville, TN",
+  departs_at: "2026-07-18T10:45:00Z",
+};
+
+t("a ride whose 'name' is just the city is still a ride (gets counted)", () => {
+  assert.strictEqual(doc.isRide(cityRide), true, "a city-labelled ride was listed as a named leg");
+});
+
+t("a named transfer is still not a ride", () => {
+  assert.strictEqual(doc.isRide({ type: "transfer", property_name: "Seaplane transfer", destination_city: "Tokyo" }), false);
+});
+
+t("legName never prints the bare city when there's an address", () => {
+  const n = doc.legName(cityRide, null);
+  assert.notStrictEqual(n.toLowerCase(), "nashville", "the card just said the city");
+  assert.ok(/Broadway/.test(n), `expected the venue, got "${n}"`);
+});
+
+t("a real hotel keeps its name", () => {
+  assert.strictEqual(doc.legName({ type: "hotel", property_name: "Kimpton Aertson", destination_city: "Nashville" }, null), "Kimpton Aertson");
+});
+
+console.log(`\n${b}A finished trip stops calling itself "in motion"${x}`);
+console.log(`${d}──────────────────────────────────────────────────────────${x}`);
+
+t("all legs in the past → tripIsPast is true", () => {
+  const past = [
+    { state: "booked", type: "flight", departs_at: "2026-07-17T11:00:00Z", arrives_at: "2026-07-17T13:00:00Z" },
+    { state: "booked", type: "hotel",  departs_at: "2026-07-17T20:00:00Z", arrives_at: "2026-07-19T16:00:00Z" },
+  ];
+  assert.strictEqual(doc.tripIsPast(past, NOW), true);
+});
+
+t("any live or upcoming leg → not past", () => {
+  const live = [{ state: "booked", type: "hotel", departs_at: "2026-07-19T15:00:00Z", arrives_at: "2026-07-21T16:00:00Z" }];
+  assert.strictEqual(doc.tripIsPast(live, NOW), false);
+});
+
+t("nothing dated → not past (we don't guess)", () => {
+  assert.strictEqual(doc.tripIsPast([{ state: "proposed", type: "flight" }], NOW), false);
+});
+
 console.log(`\n${d}──────────────────────────────────────────────────────────${x}`);
 console.log(`${fail === 0 ? g + "all " + pass + " held" : r + fail + " FAILED, " + pass + " held"}${x}\n`);
 process.exit(fail ? 1 : 0);
