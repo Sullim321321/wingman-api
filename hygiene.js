@@ -34,7 +34,14 @@ function normalizeProperty(name) {
   return s;
 }
 
-const dayOf = (v) => { const t = new Date(v).getTime(); return Number.isNaN(t) ? null : Math.floor(t / 86400000); };
+// NOTE: `new Date(null)` is 1970, not "invalid" — so a null date must be rejected
+// BEFORE parsing, or an undated leg reads as an epoch outlier and gets wrongly
+// flagged stale. This is the 1970 trap; it bites every time it isn't guarded.
+const dayOf = (v) => {
+  if (v == null || v === "") return null;
+  const t = new Date(v).getTime();
+  return Number.isNaN(t) ? null : Math.floor(t / 86400000);
+};
 const isLodging = (l) => l && (LODGING.has(String(l.type || "").toLowerCase()) || !!l.property_name);
 
 // How complete / trustworthy a leg is — used to pick which duplicate to KEEP.

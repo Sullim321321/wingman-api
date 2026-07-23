@@ -92,6 +92,20 @@ t("a tight July cluster flags nothing", () => {
   assert.strictEqual(staleLegs(legs).length, 0, "flagged a leg inside a normal 3-day trip");
 });
 
+t("a NULL-dated leg is never flagged stale (the 1970 trap)", () => {
+  // Real case: a Kimpton with no departure date was read as 1970 and flagged as a
+  // wild outlier from a 2026 trip. A leg with no date has nothing to judge.
+  const legs = [
+    { id: 1, type: "hotel", property_name: "Kimpton Aertson", departs_at: null },
+    { id: 2, type: "flight", departs_at: "2026-07-17T12:00:00Z" },
+    { id: 3, type: "hotel", departs_at: "2026-07-17T20:00:00Z" },
+    { id: 4, type: "dining", departs_at: "2026-07-18T23:00:00Z" },
+    { id: 5, type: "flight", departs_at: "2026-07-19T18:00:00Z" },
+  ];
+  const stale = staleLegs(legs);
+  assert.ok(!stale.some((l) => l.id === 1), "an undated leg was flagged stale (1970 trap)");
+});
+
 t("too few dated legs = no guessing (never flags)", () => {
   const legs = [
     { id: 1, type: "flight", departs_at: "2026-05-16T07:55:00Z" },
