@@ -57,6 +57,31 @@ function haversineMiles(a, b) {
 
 const _cache = new Map();
 
+// A calendar location is messy — "Starbucks Coffee Company\n1734 Sherman Ave,
+// Evanston, IL 60201, United States". Nominatim's free-form search does badly with
+// a business-name prefix, so we try a few progressively cleaner queries and take
+// the first that resolves: the street address without the business name, the whole
+// thing, then just "city, state, country".
+function queryCandidates(raw) {
+  const one = raw.replace(/\s+/g, " ").trim();
+  const parts = one.split(",").map((s) => s.trim()).filter(Boolean);
+  const out = [];
+  const fromDigit = one.match(/\d.*/);            // "1734 Sherman Ave, Evanston, IL..."
+  if (fromDigit) out.push(fromDigit[0]);
+  out.push(one);
+  if (parts.length >= 3) out.push(parts.slice(-3).join(", "));
+  if (parts.length >= 2) out.push(parts.slice(-2).join(", "));
+  return [...new Set(out)];
+}
+
+// Nominatim asks for <= 1 request/second. Serialize network calls to stay polite.
+let _lastCall = 0;
+async function throttle() {
+  const wait = 1100 - (Date.now() - _lastCall);
+  if (wait > 0) await new Promise((r) => setTimeout(r, wait));
+  _lastCall = Date.now();
+}
+
 async function resolvePlace(text, { fetchImpl } = {}) {
   const raw = String(text || "").trim();
   if (!raw) return { city: null, lat: null, lng: null, source: "empty" };
@@ -75,25 +100,32 @@ async function resolvePlace(text, { fetchImpl } = {}) {
 
   const f = fetchImpl || (typeof fetch !== "undefined" ? fetch : null);
   if (!f) { const r = { city: null, lat: null, lng: null, source: "no_fetch" }; _cache.set(key, r); return r; }
-  try {
-    const url = "https://nominatim.openstreetmap.org/search?format=jsonv2&addressdetails=1&limit=1&q=" + encodeURIComponent(raw);
-    const resp = await f(url, { headers: { "User-Agent": "Wingman/1.0 (personal travel assistant)" } });
-    const arr = await resp.json();
-    if (Array.isArray(arr) && arr[0]) {
-      const a = arr[0], ad = a.address || {};
-      const city = ad.city || ad.town || ad.village || ad.suburb || ad.municipality || ad.county || null;
-      const r = {
-        city, lat: parseFloat(a.lat), lng: parseFloat(a.lon),
-        state: ad.state || null, country: ad.country || null,
-        source: "nominatim", display: a.display_name || null,
-      };
-      _cache.set(key, r);
-      return r;
+
+  let detail = "no match";
+  for (const q of queryCandidates(raw)) {
+    try {
+      if (!fetchImpl) await throttle(); // don't throttle mocked tests
+      const url = "https://nominatim.openstreetmap.org/search?format=jsonv2&addressdetails=1&limit=1&q=" + encodeURIComponent(q);
+      const resp = await f(url, { headers: { "User-Agent": "Wingman/1.0 (personal travel assistant; maddie@welcometothefight.club)" } });
+      if (resp && resp.ok === false) { detail = "http " + resp.status; continue; }
+      const arr = await resp.json();
+      if (Array.isArray(arr) && arr[0]) {
+        const a = arr[0], ad = a.address || {};
+        const city = ad.city || ad.town || ad.village || ad.suburb || ad.municipality || ad.county || null;
+        const r = {
+          city, lat: parseFloat(a.lat), lng: parseFloat(a.lon),
+          state: ad.state || null, country: ad.country || null,
+          source: "nominatim", query: q, display: a.display_name || null,
+        };
+        _cache.set(key, r);
+        return r;
+      }
+    } catch (e) {
+      detail = e.message;
+      console.error("[geo] nominatim failed for", JSON.stringify(q), "-", e.message);
     }
-  } catch (e) {
-    console.error("[geo] nominatim failed:", e.message);
   }
-  const miss = { city: null, lat: null, lng: null, source: "geocode_failed" };
+  const miss = { city: null, lat: null, lng: null, source: "geocode_failed", detail };
   _cache.set(key, miss);
   return miss;
 }
