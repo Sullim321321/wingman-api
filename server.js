@@ -618,6 +618,22 @@ async function bootstrapDB() {
         UNIQUE(user_email, restaurant_name)
       )
     `;
+    // Soft signals pulled from pasted/forwarded messages — a text saying "let's
+    // cancel Thursday". These reconcile against the calendar (see reconcile.js);
+    // they never delete a calendar event, only decide whether Wingman keeps treating
+    // a meeting as live. Provenance kept (quote) so a decision can be traced.
+    await sql`
+      CREATE TABLE IF NOT EXISTS message_signals (
+        id SERIAL PRIMARY KEY,
+        user_email TEXT NOT NULL,
+        intent TEXT NOT NULL,
+        names JSONB DEFAULT '[]',
+        topic TEXT,
+        signal_date TIMESTAMPTZ,
+        quote TEXT,
+        created_at TIMESTAMPTZ DEFAULT NOW()
+      )
+    `;
     await sql`
       CREATE TABLE IF NOT EXISTS destination_images (
         city TEXT PRIMARY KEY,
@@ -2631,6 +2647,7 @@ const { inferTravelNeeds, groupTrips } = require("./infer");
 const geo = require("./geo");
 const { proposeItinerary } = require("./itinerary");
 const hygiene = require("./hygiene");
+const reconcile = require("./reconcile");
 
 const MAX_STAY_NIGHTS = 30;
 const MAX_TRIP_DAYS   = 30;   // a single trip should not span longer than this
@@ -6822,6 +6839,53 @@ app.get("/calendar/events", async (req, res) => {
   }
 });
 
+// Extract cancel/move/confirm signals from a pasted or forwarded message thread.
+// The LLM only reads the TEXT — it says what the message means, not which calendar
+// event it hits. reconcile.js does the matching. Cheap model; the task is small.
+async function extractMessageSignals(text, nowISO) {
+  const today = nowISO || new Date().toISOString();
+  const prompt = `Today is ${today}. From the message thread below, extract any statements that CANCEL, MOVE/RESCHEDULE, or CONFIRM a meeting, plan, or reservation. Return ONLY a JSON array (use [] if there are none). Each element:
+{"intent":"cancel"|"move"|"confirm","names":[people or orgs named],"topic":"short phrase naming the meeting/place/city","date":"ISO 8601 date if a specific day is stated — resolve relative days like 'Thursday' or 'tomorrow' against today; else null","quote":"the exact words"}
+
+Thread:
+${text}`;
+  const resp = await getAnthropic().messages.create({
+    model: "claude-haiku-4-5",
+    max_tokens: 1024,
+    messages: [{ role: "user", content: prompt }],
+  });
+  const raw = (resp.content && resp.content[0] && resp.content[0].text || "").trim();
+  const m = raw.match(/\[[\s\S]*\]/);
+  if (!m) return [];
+  try { const arr = JSON.parse(m[0]); return Array.isArray(arr) ? arr : []; }
+  catch { return []; }
+}
+
+// POST /reconcile/message { text } — parse a thread into signals and store them.
+// These then reconcile against your calendar on the next /calendar/travel read.
+app.post("/reconcile/message", async (req, res) => {
+  const email = await verifyAccessToken(req);
+  if (!email) return res.status(401).json({ error: "unauthorized" });
+  const text = String((req.body && req.body.text) || "").trim();
+  if (!text) return res.status(400).json({ error: "no text" });
+  try {
+    const signals = await extractMessageSignals(text);
+    const stored = [];
+    for (const s of signals) {
+      if (!s || !s.intent) continue;
+      const [row] = await sql`
+        INSERT INTO message_signals (user_email, intent, names, topic, signal_date, quote)
+        VALUES (${email}, ${s.intent}, ${JSON.stringify(s.names || [])}, ${s.topic || null}, ${s.date || null}, ${s.quote || null})
+        RETURNING id`;
+      stored.push({ id: row.id, ...s });
+    }
+    res.json({ ok: true, count: stored.length, signals: stored });
+  } catch (e) {
+    console.error("[reconcile/message]", e.message);
+    res.status(500).json({ ok: false, error: humanError(e) });
+  }
+});
+
 // GET /calendar/travel?days=N&from=CITY — what your calendar says you need to travel
 // for, judged from where you are. `from` is your current city (device geolocation,
 // later; a query param for now). Returns { trips, asks } — trips are proposals to
@@ -6840,6 +6904,20 @@ app.get("/calendar/travel", async (req, res) => {
       return res.json({ ok: true, connected: false, reason: "no_google_account", trips: [], asks: [] });
     }
     const anyReadable = accounts.some((p) => p.readable);
+
+    // Reconcile against message signals BEFORE inferring travel. A meeting cancelled
+    // by text (but still on the calendar) gets suppressed here, so it never proposes
+    // a trip — the Chicago-phantom fix. High-confidence cancels drop out; weaker
+    // matches become questions (recAsks). Nothing deletes the calendar event; this
+    // only decides what Wingman still treats as live.
+    const sigRows = await sql`
+      SELECT intent, names, topic, signal_date, quote FROM message_signals
+      WHERE user_email = ${email} AND created_at > NOW() - INTERVAL '45 days'`;
+    const signals = sigRows.map((r) => ({
+      intent: r.intent, names: r.names || [], topic: r.topic, date: r.signal_date, quote: r.quote,
+    }));
+    const { commitments: reconciled, asks: recAsks } = reconcile.reconcile(events, signals);
+    const liveEvents = reconciled.filter((e) => !e.suppressed);
 
     // Where you are now. The app sends device coordinates when it has them — the
     // truest signal, and no geocode needed. Otherwise fall back to a city string.
@@ -6860,13 +6938,13 @@ app.get("/calendar/travel", async (req, res) => {
     // in the future. Zoom calls never get a network call. Cached + gazetteer-first,
     // so repeat places and your common cities cost nothing.
     const nowMs = Date.now();
-    for (const e of events) {
+    for (const e of liveEvents) {
       if (e.nature !== "in_person" && e.nature !== "ambiguous") continue;
       if (new Date(e.start).getTime() <= nowMs) continue;
       e.geo = await geo.resolvePlace(e.place || e.location || "");
     }
 
-    const needs = inferTravelNeeds(events, { now: nowMs, current });
+    const needs = inferTravelNeeds(liveEvents, { now: nowMs, current });
     const grouped = groupTrips(needs, { hubs: geo.HUBS });
 
     // The taste layer: name the hotel you actually use in that city, from your stay
@@ -6893,7 +6971,8 @@ app.get("/calendar/travel", async (req, res) => {
       ok: true, connected: true, readable: anyReadable,
       from: current ? { input: fromText, city: current.city, source: current.source } : null,
       accounts,
-      trips, asks: grouped.asks,
+      trips,
+      asks: [...recAsks, ...grouped.asks],
     });
   } catch (e) {
     console.error("[calendar/travel]", e.message);
