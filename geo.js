@@ -130,4 +130,34 @@ async function resolvePlace(text, { fetchImpl } = {}) {
   return miss;
 }
 
-module.exports = { resolvePlace, haversineMiles, GAZETTEER, HUBS };
+// Reverse: device coordinates → a city name, so "where you are" (from the phone's
+// GPS, which has no city string) can resolve to an airport. Cached + throttled like
+// the forward path; honest null when it can't tell.
+async function resolveCoords(lat, lng, { fetchImpl } = {}) {
+  const la = parseFloat(lat), lo = parseFloat(lng);
+  if (Number.isNaN(la) || Number.isNaN(lo)) return { city: null, lat: null, lng: null, source: "bad_coords" };
+  const key = `rev:${la.toFixed(3)},${lo.toFixed(3)}`;
+  if (_cache.has(key)) return _cache.get(key);
+
+  const f = fetchImpl || (typeof fetch !== "undefined" ? fetch : null);
+  if (!f) { const r = { city: null, lat: la, lng: lo, source: "no_fetch" }; _cache.set(key, r); return r; }
+  try {
+    if (!fetchImpl) await throttle();
+    const url = `https://nominatim.openstreetmap.org/reverse?format=jsonv2&zoom=10&lat=${la}&lon=${lo}`;
+    const resp = await f(url, { headers: { "User-Agent": "Wingman/1.0 (personal travel assistant; maddie@welcometothefight.club)" } });
+    if (resp && resp.ok === false) { const r = { city: null, lat: la, lng: lo, source: "http " + resp.status }; _cache.set(key, r); return r; }
+    const data = await resp.json();
+    const ad = (data && data.address) || {};
+    const city = ad.city || ad.town || ad.village || ad.municipality || ad.county || null;
+    const r = { city, lat: la, lng: lo, state: ad.state || null, country: ad.country || null, source: "nominatim_reverse" };
+    _cache.set(key, r);
+    return r;
+  } catch (e) {
+    console.error("[geo] reverse failed:", e.message);
+    const r = { city: null, lat: la, lng: lo, source: "reverse_failed" };
+    _cache.set(key, r);
+    return r;
+  }
+}
+
+module.exports = { resolvePlace, resolveCoords, haversineMiles, GAZETTEER, HUBS };

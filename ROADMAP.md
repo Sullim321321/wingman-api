@@ -33,6 +33,8 @@ Each pillar is one of your wants, translated into what gets built. The order is 
 ### Pillar 1 — It knows me (the inputs)
 *Your want #1 and #2.*
 
+> **Status: 🟢 calendar LIVE · 🟡 texts started.** Google Calendar reads across both accounts (work `maddie@` for meetings, `sullim321@` for bookings) with honest connection states; the OAuth account-clobber bug is fixed. Text/message reconciliation (`reconcile.js`) is built and tested but not wired live. Email ingest pre-exists; Town profile not started.
+
 Wingman interrogates because it's **blind** — it has no calendar, so it has to ask. No amount of prompt-tuning fixes a missing input. So the whole arc starts here.
 
 - **Calendar first** (Google / Apple, read-only). This is the skeleton — your committed time, highest trust. It's what lets Wingman infer "you have Chicago meetings Thursday, so you need a flight in Wednesday night."
@@ -45,6 +47,8 @@ Wingman interrogates because it's **blind** — it has no calendar, so it has to
 ### Pillar 2 — It proposes, it doesn't interrogate
 *Your want #4.*
 
+> **Status: 🟢 LIVE on your phone (calendar-driven).** classifier (virtual/in-person/ambiguous) → geocoding (gazetteer + Nominatim) → distance-based inference → trip proposal on Home from your real location. Your 18-meeting week collapsed to one Chicago trip. Remaining: the *taste* layer — feed 17 years of history so proposals name the hotel you actually use.
+
 Once it can see your week and your history, the planner stops asking and starts offering.
 
 - Feed the planner standing context: calendar, loyalty, 17 years of where you actually stay.
@@ -53,6 +57,8 @@ Once it can see your week and your history, the planner stops asking and starts 
 
 ### Pillar 3 — It acts on intent, with permission
 *Your want #3 — the showcase.*
+
+> **Status: ⬜ not started.** "Fill in the trip" (propose the flight in + your usual hotel) is the on-ramp and is next. Live booking needs the real Duffel key.
 
 The search→flag→hold→book→change loop. This is **not a new system** — it's a new soft input plus the booking verb, permission gate, and ledger you already built.
 
@@ -63,6 +69,8 @@ The search→flag→hold→book→change loop. This is **not a new system** — 
 
 ### Pillar 4 — It stays clean on its own *(the pillar v1 missed)*
 *Your want #5 — the thing that frustrated you most last night.*
+
+> **Status: 🟡 partial.** Killed the Tokyo seed phantom and hardened the seed cleanup (matches on `source='seed'`, not a title the app can rename). Reconciliation is itself a hygiene mechanism (a cancelled-by-text meeting stops proposing a trip). Still to build: stale-leg guard at ingest, name backfill, one-tap tidy.
 
 You should **never** hand-delete a stray leg. That you had to, twenty times, is the failure. Trips accumulate junk from years of imports; the app has to groom itself.
 
@@ -75,6 +83,8 @@ You should **never** hand-delete a stray leg. That you had to, twenty times, is 
 ### Pillar 5 — It earns more autonomy over time
 *The payoff.*
 
+> **Status: ⬜ not advanced.** The delegation dial pre-exists; it doesn't yet govern the calendar→trip loop.
+
 You already have the delegation dial. Make it govern the loop: Watch → Suggest → Hold-for-me → Book-under-$X → Full, with standing orders ("aisle, never red-eyes, book the Kimpton under $400"). Every step logged to the ledger.
 
 ---
@@ -82,8 +92,8 @@ You already have the delegation dial. Make it govern the loop: Watch → Suggest
 ## Build sequence
 
 ```
-Phase 0  Foundation        ✅ mostly done last night
-         crash guard · OTA (free/instant deploys) · dismiss/remove legs
+Phase 0  Foundation        ✅ done — OTA now GENUINELY works (channel was never
+         wired; fixed in build 324). crash guard · dismiss/remove legs · instant JS deploys
 Phase 1  It knows me        ← calendar first, then email, Town, WhatsApp
 Phase 2  It proposes        ← priors into the planner
 Phase 3  It acts on intent  ← the search→book loop (needs live Duffel)

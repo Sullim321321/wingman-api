@@ -2615,6 +2615,7 @@ const gcal = require("./gcal");
 const { classifyMeeting } = require("./meeting");
 const { inferTravelNeeds, groupTrips } = require("./infer");
 const geo = require("./geo");
+const { proposeItinerary } = require("./itinerary");
 
 const MAX_STAY_NIGHTS = 30;
 const MAX_TRIP_DAYS   = 30;   // a single trip should not span longer than this
@@ -6781,6 +6782,12 @@ app.get("/calendar/travel", async (req, res) => {
     let current = null;
     if (!Number.isNaN(fromLat) && !Number.isNaN(fromLng)) {
       current = { city: fromText || null, lat: fromLat, lng: fromLng, source: "device" };
+      // The phone sends coordinates, not a city name. Reverse-geocode so we can name
+      // your home airport ("fly BNA→ORD") instead of a blank origin.
+      if (!current.city) {
+        const rev = await geo.resolveCoords(fromLat, fromLng);
+        if (rev.city) current = { ...current, city: rev.city };
+      }
     } else if (fromText) {
       current = await geo.resolvePlace(fromText);
     }
@@ -6796,12 +6803,16 @@ app.get("/calendar/travel", async (req, res) => {
     }
 
     const needs = inferTravelNeeds(events, { now: nowMs, current });
-    const { trips, asks } = groupTrips(needs, { hubs: geo.HUBS });
+    const grouped = groupTrips(needs, { hubs: geo.HUBS });
+    // Fill in each proposed trip with a skeleton — fly-in/out targets and nights.
+    // hotelOf is null for now (the stay-history "Kimpton" layer comes next); the
+    // module names no hotel it can't justify.
+    const trips = grouped.trips.map((t) => ({ ...t, itinerary: proposeItinerary(t, { current }) }));
     res.json({
       ok: true, connected: true, readable: anyReadable,
       from: current ? { input: fromText, city: current.city, source: current.source } : null,
       accounts,
-      trips, asks,
+      trips, asks: grouped.asks,
     });
   } catch (e) {
     console.error("[calendar/travel]", e.message);
