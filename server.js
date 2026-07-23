@@ -10720,14 +10720,26 @@ app.post("/plan/confirm", auth, async (req, res) => {
 // GET /signals — return recent parsed signals from messages/calendar/email
 app.get("/signals", auth, async (req, res) => {
   try {
-    // Pull recent activity events of type 'signal' or 'gmail_scan'
+    // A signal is meant to be recent and TRUE. The feed was showing neither: a
+    // "Gmail disconnected" from days ago (reconnected since), and duplicate test
+    // disruption lines. Three honest filters —
+    //   • recency: older than 10 days ages out.
+    //   • resolved: don't say "disconnected" when Gmail is currently connected.
+    //   • dedupe: collapse identical (type,title,body) so one event shows once.
+    const gmailRows = await sql`SELECT 1 FROM gmail_tokens WHERE user_email = ${req.email} LIMIT 1`;
+    const gmailConnected = gmailRows.length > 0;
     const signals = await sql`
-      SELECT ae.*, t.title as trip_title
-      FROM activity_events ae
-      LEFT JOIN trips t ON t.id = ae.trip_id
-      WHERE ae.user_email = ${req.email}
-        AND ae.type IN ('signal', 'gmail_scan', 'calendar_sync', 'message_sync')
-      ORDER BY ae.created_at DESC
+      SELECT * FROM (
+        SELECT DISTINCT ON (ae.type, ae.title, ae.body) ae.*, t.title as trip_title
+        FROM activity_events ae
+        LEFT JOIN trips t ON t.id = ae.trip_id
+        WHERE ae.user_email = ${req.email}
+          AND ae.type IN ('signal', 'gmail_scan', 'calendar_sync', 'message_sync')
+          AND ae.created_at > NOW() - INTERVAL '10 days'
+          AND NOT (${gmailConnected} AND ae.title ILIKE '%disconnect%')
+        ORDER BY ae.type, ae.title, ae.body, ae.created_at DESC
+      ) d
+      ORDER BY d.created_at DESC
       LIMIT 20
     `;
     // Also pull recent booking imports
