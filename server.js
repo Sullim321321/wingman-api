@@ -2272,7 +2272,21 @@ async function dedupeLegs(userEmail) {
       WHERE ranked.rn > 1
     )
     RETURNING id`;
-  return removed.length;
+
+  // Exact-match dedupe (above) can't see that "Kimpton Aertson Hotel" and
+  // "…by IHG" are one stay. Collapse those name-variants per trip. Safe and
+  // conservative — only lodging, only within ~3 days, keeps the booked copy.
+  let variantRemoved = 0;
+  const trips = await sql`SELECT id FROM trips WHERE user_email = ${userEmail}`;
+  for (const t of trips) {
+    const legs = await sql`SELECT * FROM trip_legs WHERE trip_id = ${t.id}`;
+    const { removed: dupes } = hygiene.dedupeStays(legs);
+    for (const l of dupes) {
+      await sql`DELETE FROM trip_legs WHERE id = ${l.id}`;
+      variantRemoved++;
+    }
+  }
+  return removed.length + variantRemoved;
 }
 
 async function scanGmailAccountForTrips(userEmail, accountEmail) {
@@ -2616,6 +2630,7 @@ const { classifyMeeting } = require("./meeting");
 const { inferTravelNeeds, groupTrips } = require("./infer");
 const geo = require("./geo");
 const { proposeItinerary } = require("./itinerary");
+const hygiene = require("./hygiene");
 
 const MAX_STAY_NIGHTS = 30;
 const MAX_TRIP_DAYS   = 30;   // a single trip should not span longer than this
@@ -4070,6 +4085,54 @@ app.delete("/trips/:id", async (req, res) => {
     res.json({ ok: true });
   } catch (e) {
     res.status(500).json({ error: "db error" });
+  }
+});
+
+// ---------------------------------------------------------------------------
+// POST /trips/:id/tidy — Pillar 4 "one-tap tidy": collapse duplicate stays and
+// drop legs that don't belong to this trip (date outliers). Pass ?dryRun=1 to see
+// what WOULD change without touching anything. The user taps this — it's their
+// call, and it shows exactly what it removed and why.
+// ---------------------------------------------------------------------------
+app.post("/trips/:id/tidy", async (req, res) => {
+  const email = await verifyAccessToken(req);
+  if (!email) return res.status(401).json({ error: "unauthorized" });
+  const dryRun = req.query.dryRun === "1" || req.query.dry === "1";
+  try {
+    const trip = await sql`SELECT id FROM trips WHERE id = ${req.params.id} AND user_email = ${email}`;
+    if (!trip[0]) return res.status(404).json({ error: "trip not found" });
+
+    const legs = await sql`SELECT * FROM trip_legs WHERE trip_id = ${req.params.id}`;
+    const { removed: dupes } = hygiene.dedupeStays(legs);
+    const stale = hygiene.staleLegs(legs);
+
+    // Union by id, tagging the reason (a leg can be both; duplicate wins the label).
+    const dupeIds = new Set(dupes.map((l) => l.id));
+    const byId = new Map();
+    for (const l of dupes) byId.set(l.id, { leg: l, reason: "duplicate" });
+    for (const l of stale) if (!byId.has(l.id)) byId.set(l.id, { leg: l, reason: "stale" });
+    const toRemove = [...byId.values()];
+
+    if (!dryRun) {
+      for (const { leg } of toRemove) {
+        await sql`DELETE FROM trip_legs WHERE id = ${leg.id} AND trip_id = ${req.params.id}`;
+      }
+    }
+    res.json({
+      ok: true,
+      dryRun,
+      removed_count: toRemove.length,
+      removed: toRemove.map(({ leg, reason }) => ({
+        id: leg.id,
+        type: leg.type,
+        name: leg.property_name || (leg.carrier ? `${leg.carrier} ${leg.flight_number || ""}`.trim() : null) || leg.destination || "(leg)",
+        when: leg.departs_at || null,
+        reason,
+      })),
+    });
+  } catch (e) {
+    console.error("[trips/tidy]", e.message);
+    res.status(500).json({ ok: false, error: humanError(e) });
   }
 });
 
