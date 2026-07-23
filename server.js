@@ -2650,6 +2650,7 @@ const hygiene = require("./hygiene");
 const reconcile = require("./reconcile");
 const autonomy = require("./autonomy");
 const watcher = require("./watcher");
+const taste = require("./taste");
 
 const MAX_STAY_NIGHTS = 30;
 const MAX_TRIP_DAYS   = 30;   // a single trip should not span longer than this
@@ -7096,6 +7097,99 @@ app.post("/autonomy/run", async (req, res) => {
     res.json({ ok: true, level, liveMoney, executed: execute, actions, skipped, not_ready, held });
   } catch (e) {
     console.error("[autonomy/run]", e.message);
+    res.status(500).json({ ok: false, error: humanError(e) });
+  }
+});
+
+// ── The Curator (CURATOR.md) ─────────────────────────────────────────────────
+// Everything Wingman knows about your palate, assembled into one brief, and the
+// curation that reasons over it. History + stated prefs + the editors you read.
+async function buildTasteBrief(email) {
+  const [hotelAffinity, restaurantAffinity, uRows] = await Promise.all([
+    sql`SELECT property_name, brand, city, stay_count FROM hotel_affinity WHERE user_email = ${email}`,
+    sql`SELECT restaurant_name, cuisine, city, visit_count FROM restaurant_affinity WHERE user_email = ${email}`,
+    sql`SELECT preferences FROM users WHERE email = ${email}`,
+  ]);
+  const prefs = uRows[0]?.preferences || {};
+  const dietary = prefs.dietary || (prefs.taste_profile && prefs.taste_profile.dietary) || [];
+  return taste.assembleBrief({
+    hotelAffinity, restaurantAffinity,
+    prefs: { dietary, cabin_preference: prefs.cabin_preference, price_tier: prefs.price_tier, home_bases: prefs.home_bases },
+    sources: prefs.curator_sources || [],
+  });
+}
+
+// GET /curator/taste — the brief itself ("here's what I know about you").
+app.get("/curator/taste", async (req, res) => {
+  const email = await verifyAccessToken(req);
+  if (!email) return res.status(401).json({ error: "unauthorized" });
+  try { res.json({ ok: true, brief: await buildTasteBrief(email) }); }
+  catch (e) { console.error("[curator/taste]", e.message); res.status(500).json({ ok: false, error: humanError(e) }); }
+});
+
+// GET/POST /curator/sources — the editors you read (36 Hours, Service 95, ...).
+app.get("/curator/sources", async (req, res) => {
+  const email = await verifyAccessToken(req);
+  if (!email) return res.status(401).json({ error: "unauthorized" });
+  const [u] = await sql`SELECT preferences FROM users WHERE email = ${email}`;
+  res.json({ ok: true, sources: (u?.preferences?.curator_sources) || [] });
+});
+app.post("/curator/sources", async (req, res) => {
+  const email = await verifyAccessToken(req);
+  if (!email) return res.status(401).json({ error: "unauthorized" });
+  const sources = Array.isArray(req.body?.sources) ? req.body.sources.map((s) => String(s).trim()).filter(Boolean) : null;
+  if (!sources) return res.status(400).json({ error: "sources array required" });
+  try {
+    const [u] = await sql`SELECT preferences FROM users WHERE email = ${email}`;
+    const prefs = u?.preferences || {};
+    const merged = { ...prefs, curator_sources: [...new Set(sources)].slice(0, 25) };
+    await sql`UPDATE users SET preferences = ${JSON.stringify(merged)}::jsonb WHERE email = ${email}`;
+    res.json({ ok: true, sources: merged.curator_sources });
+  } catch (e) { console.error("[curator/sources]", e.message); res.status(500).json({ ok: false, error: humanError(e) }); }
+});
+
+// GET /curate?city=CITY — the curated short list, to your taste, sourced.
+app.get("/curate", async (req, res) => {
+  const email = await verifyAccessToken(req);
+  if (!email) return res.status(401).json({ error: "unauthorized" });
+  const city = String(req.query.city || "").trim();
+  if (!city) return res.status(400).json({ error: "city required" });
+  try {
+    const brief = await buildTasteBrief(email);
+    if (!brief.known) {
+      return res.json({ ok: true, city, known: false, picks: null,
+        note: "I don't know your taste yet. Add a source or two you read (Settings → Sources) or connect your bookings, and I'll curate to you." });
+    }
+    const prompt = `You are Wingman's Curator for a discerning, frequent business traveler. Curate ONLY from their taste brief — never generic "top-rated" filler.
+Taste brief (JSON): ${JSON.stringify(brief)}
+City: ${city}
+
+Return STRICT JSON only, no prose, exactly this shape:
+{
+ "stay": [ up to 4 hotels: {"name","area","why","rationale","source"} ],
+ "dine": [ up to 2: {"name","why","source"} ],
+ "do":   [ up to 3 OFF-BEAT things: {"name","why","source"} ]
+}
+Rules:
+- "rationale" is one of: "usual" (matches a brand/hotel they favor), "deal" (great value in their taste), "discovery" (their vibe, new to them), "memory" (somewhere they've been and liked). Give a variety across the 4 stays.
+- "source": attribute to ONE of their listed sources ONLY when the pick genuinely reflects that editor's sensibility; otherwise null. Never invent a source not in their list.
+- Respect their dietary lines in "dine".
+- Each "why" under 12 words, specific to THEM (name a brand, past stay, cuisine, or source).`;
+    const resp = await getAnthropic().messages.create({
+      model: "claude-sonnet-4-5", max_tokens: 1600,
+      messages: [{ role: "user", content: prompt }],
+    });
+    const rawT = (resp.content && resp.content[0] && resp.content[0].text || "").trim();
+    const m = rawT.match(/\{[\s\S]*\}/);
+    let picks = null;
+    try { picks = m ? JSON.parse(m[0]) : null; } catch { picks = null; }
+    res.json({
+      ok: true, city, known: true,
+      taste: { brands: brief.hotels.brands, sources: brief.sources, dietary: brief.dining.dietary },
+      picks,
+    });
+  } catch (e) {
+    console.error("[curate]", e.message);
     res.status(500).json({ ok: false, error: humanError(e) });
   }
 });
