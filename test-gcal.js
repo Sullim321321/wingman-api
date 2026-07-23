@@ -78,6 +78,22 @@ t("a transparent 'free' event is kept but marked not-busy", () => {
   assert.strictEqual(c.busy, false, "a birthday was treated as occupying your day");
 });
 
+t("the description and conferenceData are carried through for the meeting classifier", () => {
+  const c = normalizeEvent({
+    id: "k", summary: "Board sync",
+    start: { dateTime: "2026-07-23T14:00:00Z" }, end: { dateTime: "2026-07-23T15:00:00Z" },
+    description: "Join: https://meet.google.com/abc-defg-hij",
+    conferenceData: { entryPoints: [{ entryPointType: "video" }, { entryPointType: "phone" }] },
+  });
+  assert.ok(/meet\.google\.com/.test(c.description), "the join link in the notes was dropped");
+  assert.deepStrictEqual(c.conference, ["video", "phone"], "Google's conference types were lost");
+});
+
+t("no conferenceData yields conference:null, not a fake empty signal", () => {
+  const c = normalizeEvent({ id: "l", summary: "Coffee", location: "Maialino, NYC", start: { dateTime: "2026-07-23T14:00:00Z" } });
+  assert.strictEqual(c.conference, null);
+});
+
 t("a missing end becomes a point in time, not NaN", () => {
   const c = normalizeEvent({ id: "i", summary: "Call", start: { dateTime: "2026-07-23T14:00:00Z" } });
   assert.strictEqual(c.end, c.start);

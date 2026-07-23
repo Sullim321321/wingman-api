@@ -63,6 +63,13 @@ function normalizeEvent(ev, { selfEmail = null } = {}) {
     calendar_id: ev.id || null,
     title: (ev.summary || "").trim() || "(no title)",
     location: (ev.location || "").trim() || null,
+    // Notes carry the thing location often doesn't: the Zoom/Meet link that tells
+    // us this meeting is virtual, not a place to fly to. Kept (capped) so the
+    // meeting classifier can read it. Not shown to the user; a working signal.
+    description: (ev.description || "").trim().slice(0, 2000) || null,
+    // Google's own conference block is the highest-trust "this is virtual" signal.
+    // entryPointType is "video" | "phone" | "sip" | "more"; we keep the types.
+    conference: conferenceTypes(ev),
     all_day: allDay,
     start: new Date(startMs).toISOString(),
     end: new Date(endMs).toISOString(),
@@ -71,6 +78,16 @@ function normalizeEvent(ev, { selfEmail = null } = {}) {
     certain: true,
     response: self ? self.responseStatus || "accepted" : "accepted",
   };
+}
+
+// The kinds of ways you can join a meeting, straight from Google's conferenceData.
+// Returns e.g. ["video"] or ["video","phone"], or null when there's no conference
+// attached — which is itself a (weak) hint that the meeting might be in person.
+function conferenceTypes(ev) {
+  const eps = ev && ev.conferenceData && ev.conferenceData.entryPoints;
+  if (!Array.isArray(eps)) return null;
+  const types = [...new Set(eps.map((e) => e && e.entryPointType).filter(Boolean))];
+  return types.length ? types : null;
 }
 
 /**

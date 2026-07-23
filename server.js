@@ -2612,6 +2612,7 @@ const { usableConfirmation, confirmationReachOk } = require("./grouping");
 const sketches = require("./sketches");
 const tripdoc = require("./document");
 const gcal = require("./gcal");
+const { classifyMeeting } = require("./meeting");
 
 const MAX_STAY_NIGHTS = 30;
 const MAX_TRIP_DAYS   = 30;   // a single trip should not span longer than this
@@ -6713,8 +6714,13 @@ app.get("/calendar/events", async (req, res) => {
           maxResults: 250,
         });
         // selfEmail is per-account: "did I decline" is judged against THIS account.
+        // Classify each on the way out: is this a place you must BE (possible
+        // travel) or one you dial into? nature is virtual|in_person|ambiguous|unknown.
         const events = gcal.commitmentsFrom(resp.data.items || [], { selfEmail: acct })
-          .map((ev) => ({ ...ev, account_email: acct }));
+          .map((ev) => {
+            const k = classifyMeeting(ev);
+            return { ...ev, account_email: acct, nature: k.nature, place: k.place };
+          });
         all = all.concat(events);
         perAccount.push({ account: acct, readable: true, count: events.length });
       } catch (e) {
@@ -6726,11 +6732,15 @@ app.get("/calendar/events", async (req, res) => {
 
     all.sort((x, y) => new Date(x.start) - new Date(y.start));
     const anyReadable = perAccount.some((p) => p.readable);
+    // How the week breaks down by meeting nature — the count that tells us whether
+    // the classifier is separating real travel from Zoom before we build on it.
+    const byNature = all.reduce((acc, e) => { acc[e.nature] = (acc[e.nature] || 0) + 1; return acc; }, {});
     // readable:true means AT LEAST one calendar was read. count spans all of them.
     // The per-account array carries the honesty: which read, which didn't, and why.
     res.json({
       ok: true, connected: true, readable: anyReadable,
       count: all.length,
+      by_nature: byNature,
       accounts: perAccount,
       events: all,
     });
