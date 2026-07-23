@@ -6804,10 +6804,27 @@ app.get("/calendar/travel", async (req, res) => {
 
     const needs = inferTravelNeeds(events, { now: nowMs, current });
     const grouped = groupTrips(needs, { hubs: geo.HUBS });
-    // Fill in each proposed trip with a skeleton — fly-in/out targets and nights.
-    // hotelOf is null for now (the stay-history "Kimpton" layer comes next); the
-    // module names no hotel it can't justify.
-    const trips = grouped.trips.map((t) => ({ ...t, itinerary: proposeItinerary(t, { current }) }));
+
+    // The taste layer: name the hotel you actually use in that city, from your stay
+    // history. Most-stayed wins; no history for the city → null, and the itinerary
+    // says "a hotel in <city>" rather than inventing one.
+    const affinity = await sql`
+      SELECT property_name, city, stay_count FROM hotel_affinity
+      WHERE user_email = ${email} AND property_name IS NOT NULL`;
+    const hotelOf = (city) => {
+      if (!city) return null;
+      const c = String(city).toLowerCase();
+      const matches = affinity.filter((a) => {
+        const ac = String(a.city || "").toLowerCase();
+        return ac && (ac === c || ac.includes(c) || c.includes(ac));
+      });
+      if (!matches.length) return null;
+      matches.sort((x, y) => (y.stay_count || 0) - (x.stay_count || 0));
+      return matches[0].property_name;
+    };
+
+    // Fill in each proposed trip with a skeleton — fly-in/out targets, nights, hotel.
+    const trips = grouped.trips.map((t) => ({ ...t, itinerary: proposeItinerary(t, { current, hotelOf }) }));
     res.json({
       ok: true, connected: true, readable: anyReadable,
       from: current ? { input: fromText, city: current.city, source: current.source } : null,
