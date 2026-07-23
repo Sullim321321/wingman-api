@@ -66,17 +66,22 @@ function reconcileMessage(commitment, signal) {
   const topicTokens = tokens(signal.topic);
   const topicMatch = topicTokens.some((t) => titleTokens.has(t));
 
-  const strength = (dateMatch ? 1 : 0) + (personMatch ? 1 : 0) + (topicMatch ? 1 : 0);
-
-  // No overlap at all → this message is about something else. Refusing here is what
-  // stops a "cancel the dentist" text from deleting your Chicago trip.
-  if (strength === 0) {
-    return { effect: "none", confidence: "low", reason: "message doesn't match this meeting" };
+  // A match must IDENTIFY the meeting — by who or what, not merely by day. Dozens of
+  // things share a Thursday; letting a date alone match is how "cancel the dentist"
+  // ends up querying every meeting on that date (it did, in testing: a mis-dated
+  // cancel flagged two unrelated meetings that happened to fall on the same day).
+  const identifies = personMatch || topicMatch;
+  if (!identifies) {
+    return {
+      effect: "none", confidence: "low",
+      reason: dateMatch ? "same day, but nothing names this meeting" : "message doesn't match this meeting",
+    };
   }
 
-  // Confidence: two independent signals (e.g. date + topic) is a confident match;
-  // one is plausible but a question.
-  const confidence = strength >= 2 ? "high" : "medium";
+  // Confidence: an identifying match PLUS corroboration (the date, or both who and
+  // what) is high — enough to suppress. An identifying match alone is a question.
+  const strong = (personMatch && topicMatch) || (identifies && dateMatch);
+  const confidence = strong ? "high" : "medium";
 
   const effect = signal.intent === "cancel" ? "contradicts"
                : signal.intent === "move" ? "reschedules"

@@ -70,6 +70,21 @@ t("no overlap at all = none, no ask", () => {
   assert.strictEqual(reconcileMessage(chicago, sig).effect, "none");
 });
 
+t("a cancel that only shares the DAY does not query unrelated meetings", () => {
+  // The real bug: a St-Regis cancel mis-dated to the 24th matched "Covrly Sales
+  // Daily" and "Maddie/JR Meet up" purely because they fell on the 24th too.
+  const covrly = { calendar_id: "z", title: "Covrly — Sales Daily", start: "2026-07-24T13:00:00Z" };
+  const sig = { intent: "cancel", topic: "St. Regis / Miru Terrace", date: "2026-07-24T09:00:00Z" };
+  assert.strictEqual(reconcileMessage(covrly, sig).effect, "none", "a same-day, unrelated meeting was flagged");
+  const { asks } = reconcile([covrly], [sig]);
+  assert.strictEqual(asks.length, 0, "produced a false 'was this cancelled?' question");
+});
+
+t("topic + date is confident enough to suppress", () => {
+  const sig = { intent: "cancel", topic: "St Regis", date: "2026-07-23T09:00:00Z" };
+  assert.strictEqual(reconcileMessage(chicago, sig).confidence, "high");
+});
+
 console.log(`\n${b}Medium matches ask; moves and confirms don't silently act${x}`);
 console.log(`${d}──────────────────────────────────────────────────────────${x}`);
 
