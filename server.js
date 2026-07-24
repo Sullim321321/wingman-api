@@ -4658,6 +4658,11 @@ async function unmergeMegaTrips(userEmail, { dryRun = true } = {}) {
       AND t.title NOT IN ('Needs review', 'Reservations')
   `;
   const toFlag = implausible.filter((l) => !regroup.plausibleDate(l.departs_at, nowMs));
+  // Record every flagged leg id so the SPLIT pass below skips them — in dry-run too.
+  // Without this, dry-run leaves the legs in place (correctly writing nothing), the split
+  // pass still sees them, and the preview reports splits/new-trips that a real apply would
+  // never make (the legs get quarantined first). The preview must match the apply.
+  const flaggedLegIds = new Set(toFlag.map((l) => l.id));
   if (toFlag.length) {
     let bucket = null;
     for (const l of toFlag) {
@@ -4829,11 +4834,16 @@ async function unmergeMegaTrips(userEmail, { dryRun = true } = {}) {
   `;
 
   for (const t of longTrips) {
-    const legs = await sql`
+    const legsRaw = await sql`
       SELECT id, departs_at, arrives_at, destination_city, destination, confirmation
       FROM trip_legs WHERE trip_id = ${t.id}
       ORDER BY departs_at ASC NULLS LAST
     `;
+    // Skip legs pass 0 flagged as implausible. On apply they're already moved to
+    // "Needs review" (so this is a no-op); in dry-run they're still here, and excluding
+    // them keeps the split preview honest — we don't preview splitting a 2010 leg that a
+    // real run would have quarantined first.
+    const legs = legsRaw.filter((l) => !flaggedLegIds.has(l.id));
     const dated = legs.filter(l => l.departs_at);
     const undated = legs.filter(l => !l.departs_at);
 
