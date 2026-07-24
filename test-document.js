@@ -73,12 +73,37 @@ t("an unnamed car leg is a ride", () => {
 
 t("a NAMED transfer is not a ride — the cascade defends it", () => {
   assert.strictEqual(doc.isRide({ type: "transfer", property_name: "Seaplane transfer" }), false);
-  assert.strictEqual(doc.isRide({ type: "car", confirmation: "ABC123XY" }), false);
-  assert.strictEqual(doc.isRide({ type: "car", vehicle_class: "Sprinter" }), false);
+  assert.strictEqual(doc.isRide({ type: "car", vehicle_class: "Sprinter" }), false);   // a rental
+  assert.strictEqual(doc.isRide({ type: "car", nights: 3 }), false);                    // a multi-day rental
+});
+
+t("a point-to-point ride collapses even with an address name or a confirmation", () => {
+  // Ubers carry both — they're still expenses, not appointments worth a card.
+  assert.strictEqual(doc.isRide({ type: "car", confirmation: "ABC123XY" }), true);
+  assert.strictEqual(doc.isRide({ type: "car", property_name: "250 Rep John Lewis Way S" }), true);
+  assert.strictEqual(doc.isRide({ type: "transfer", property_name: "500 Houston St", confirmation: "Z9" }), true);
 });
 
 t("a hotel is never a ride", () => {
   assert.strictEqual(doc.isRide(kimpton), false);
+});
+
+t("a city-only, route-less, booking-less leg is a placeholder", () => {
+  assert.strictEqual(doc.isPlaceholder({ type: "car", property_name: "Nashville", destination_city: "Nashville" }), true);
+  assert.strictEqual(doc.isPlaceholder({ type: "flight", origin: "BNA", destination: "ORD" }), false);
+  assert.strictEqual(doc.isPlaceholder({ type: "car", origin: "A", destination: "B" }), false); // has a route
+  assert.strictEqual(doc.isPlaceholder(kimpton), false);
+});
+
+t("stay name-variants dedupe to one when a normalizer is given", () => {
+  const norm = require("./hygiene").normalizeProperty;
+  const legs = [
+    { id: 1, type: "hotel", property_name: "Kimpton Aertson Hotel", departs_at: "2026-07-19T17:00:00Z" },
+    { id: 2, type: "hotel", property_name: "Kimpton Aertson Hotel by IHG", departs_at: "2026-07-21T17:00:00Z" },
+  ];
+  const { chapters } = doc.toChapters(legs, NOW, null, {}, norm);
+  const hotels = Object.values(chapters).flat().filter((l) => l.type === "hotel");
+  assert.strictEqual(hotels.length, 1, "the Kimpton should appear once");
 });
 
 console.log(`\n${b}Today's page and the whole document agree${x}`);

@@ -77,7 +77,36 @@ function venueFrom(leg) {
  */
 function isRide(leg) {
   const t = String(leg?.type || "").toLowerCase();
-  return (t === "car" || t === "transfer" || t === "ride" || t === "taxi") && !hasRealName(leg);
+  if (!["car", "transfer", "ride", "taxi"].includes(t)) return false;
+  // A multi-day car RENTAL is a real booking worth a card.
+  if (leg.vehicle_class || Number(leg.nights) > 0) return false;
+  // Everything else point-to-point is an expense, not an appointment — and it collapses
+  // even when it carries a destination ADDRESS or a confirmation number. An Uber to
+  // "250 Rep John Lewis Way S" has both and is still a ride; a street address (starts
+  // with a digit) and the city are not venue names. Only a genuine name — "Seaplane
+  // transfer" — keeps a ride-type leg as its own card.
+  const name = String(leg.property_name || leg.title || "").trim();
+  const named = !!name && !isCityLabel(leg) && !/^\d/.test(name);
+  return !named;
+}
+
+/**
+ * A leg that carries nothing — no route, no booking, no real venue, just a city and a
+ * time — is a geocode/import artifact, not an event. The "Nashville · 11:00 AM" card
+ * with no origin, destination, carrier, or confirmation is noise. Flights, hotels and
+ * anything with a real name or route are never placeholders.
+ */
+function isPlaceholder(leg) {
+  const t = String(leg?.type || "").toLowerCase();
+  if (["flight", "hotel", "airbnb", "train", "ferry", "cruise"].includes(t)) return false;
+  const venue = venueFrom(leg) || (leg.property_name && !isCityLabel(leg) ? leg.property_name : "");
+  if (venue) return false;
+  const hasRoute = !!(leg.origin && String(leg.origin).trim() && leg.destination && String(leg.destination).trim()
+    && String(leg.origin).trim().toLowerCase() !== String(leg.destination).trim().toLowerCase());
+  if (hasRoute) return false;
+  const hasBooking = !!leg.confirmation || !!leg.carrier || !!leg.flight_number || Number(leg.nights) > 0;
+  if (hasBooking) return false;
+  return true;
 }
 
 /** What a person should see on the card. `fid` is the flightid module. */
@@ -113,16 +142,40 @@ function certaintyOf(legs) {
   return (legs || []).some((l) => l.state !== "proposed") ? "real" : "idea";
 }
 
-/** Split legs into chapters, counting rides rather than listing them. */
-function toChapters(legs, nowMs, fid, depBy = {}) {
+/**
+ * Collapse stay name-variants to one leg. "Kimpton Aertson Hotel" and "Kimpton Aertson
+ * Hotel by IHG" are the same stay shown twice; a reader should see it once. Keeps the
+ * first occurrence (in the given order) per normalized hotel name.
+ */
+function dedupeStays(legs, normalize) {
+  if (!normalize) return legs;
+  const seen = new Set();
+  const out = [];
+  for (const l of legs) {
+    const t = String(l?.type || "").toLowerCase();
+    if (t !== "hotel" && t !== "airbnb") { out.push(l); continue; }
+    const key = normalize(l.property_name || l.title || "");
+    if (key && seen.has(key)) continue;   // a variant of a stay already shown
+    if (key) seen.add(key);
+    out.push(l);
+  }
+  return out;
+}
+
+/** Split legs into chapters, counting rides rather than listing them, dropping
+ *  placeholders, and collapsing stay name-variants. `normalize` (hygiene.normalizeProperty)
+ *  is optional; when given, duplicate stays fold to one. */
+function toChapters(legs, nowMs, fid, depBy = {}, normalize = null) {
   const chapters = { plan: [], prepare: [], in_motion: [], after: [] };
   const rides = { plan: 0, prepare: 0, in_motion: 0, after: 0 };
-  for (const l of legs || []) {
+  const deduped = dedupeStays(legs || [], normalize);
+  for (const l of deduped) {
     const ch = chapterOf(l, nowMs);
     if (isRide(l)) { rides[ch]++; continue; }
+    if (isPlaceholder(l)) continue;               // a geocode artifact, not an event
     chapters[ch].push({ ...l, display_name: legName(l, fid), depends_on: depBy[l.id] || [] });
   }
   return { chapters, rides };
 }
 
-module.exports = { chapterOf, isRide, legName, certaintyOf, toChapters, isCityLabel, tripIsPast, venueFrom };
+module.exports = { chapterOf, isRide, isPlaceholder, legName, certaintyOf, toChapters, dedupeStays, isCityLabel, tripIsPast, venueFrom };

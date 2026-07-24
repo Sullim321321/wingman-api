@@ -6751,7 +6751,7 @@ app.get("/trips/:id/dossier", async (req, res) => {
     // Chapters, rides and names come from document.js — the same rules Home reads.
     // Home showing a different answer to "is this happening now" than the Dossier
     // would be the trip-title bug again, wearing a new hat.
-    const { chapters, rides } = tripdoc.toChapters(legs, now, flightid, depBy);
+    const { chapters, rides } = tripdoc.toChapters(legs, now, flightid, depBy, hygiene.normalizeProperty);
 
     // "In motion" means a LEG is actually happening now — not that `now` falls inside
     // a naive first-to-last span. The old span read the 2012 flight as the start, so a
@@ -7533,7 +7533,7 @@ app.get("/today", async (req, res) => {
       }
     }
 
-    const { chapters, rides } = tripdoc.toChapters(legs, now, flightid, depBy);
+    const { chapters, rides } = tripdoc.toChapters(legs, now, flightid, depBy, hygiene.normalizeProperty);
 
     // Which trips are represented, so Home can offer the full document.
     const seen = new Map();
