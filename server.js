@@ -2655,6 +2655,7 @@ const holds = require("./holds");
 const stays = require("./stays");
 const flightbook = require("./flightbook");
 const concierge = require("./concierge");
+const regroup = require("./regroup");
 
 const MAX_STAY_NIGHTS = 30;
 const MAX_TRIP_DAYS   = 30;   // a single trip should not span longer than this
@@ -4639,8 +4640,40 @@ async function cleanupTrips(userEmail, { dryRun = true } = {}) {
 const SPLIT_GAP_DAYS = 5;   // > 5 days between legs ⇒ a different trip
 
 async function unmergeMegaTrips(userEmail, { dryRun = true } = {}) {
-  const report = { dryRun, legsDatesFixed: 0, tripsSplit: 0, tripsCreated: 0, legsOrphaned: 0, details: [] };
+  const report = { dryRun, legsDatesFixed: 0, tripsSplit: 0, tripsCreated: 0, legsOrphaned: 0, implausibleDatesFlagged: 0, details: [] };
   const DAY = 86400000;
+  const nowMs = Date.now();
+
+  // ── 0. Neutralise implausible DEPARTURE dates ────────────────────────────────
+  // A leg dated 2009 for a 2026 user (a mis-parsed year, a recycled Amtrak date) is the
+  // magnet that welds a 17-year "New York" span together. Bad END dates are handled
+  // below; this handles the departure itself. We don't delete — we move the leg into a
+  // "Needs review" bucket so it stops anchoring a phantom trip but is never lost.
+  const implausible = await sql`
+    SELECT tl.id, tl.departs_at, tl.property_name, tl.destination,
+           COALESCE(tl.destination_city, tl.destination, tl.property_name, '—') AS label
+    FROM trip_legs tl JOIN trips t ON t.id = tl.trip_id
+    WHERE t.user_email = ${userEmail}
+      AND tl.departs_at IS NOT NULL
+      AND t.title NOT IN ('Needs review', 'Reservations')
+  `;
+  const toFlag = implausible.filter((l) => !regroup.plausibleDate(l.departs_at, nowMs));
+  if (toFlag.length) {
+    let bucket = null;
+    for (const l of toFlag) {
+      const yr = new Date(l.departs_at).getUTCFullYear();
+      report.implausibleDatesFlagged++;
+      report.details.push(`leg #${l.id} "${l.label}" dated ${yr} is implausible — setting aside to "Needs review"`);
+      if (!dryRun) {
+        if (!bucket) {
+          const existing = await sql`SELECT id FROM trips WHERE user_email = ${userEmail} AND title = 'Needs review' LIMIT 1`;
+          bucket = existing.length ? existing[0]
+            : (await sql`INSERT INTO trips (user_email, title, source) VALUES (${userEmail}, 'Needs review', 'unmerge') RETURNING id`)[0];
+        }
+        await sql`UPDATE trip_legs SET trip_id = ${bucket.id} WHERE id = ${l.id}`;
+      }
+    }
+  }
 
   // ── 1. Neutralise the magnets ────────────────────────────────────────────────
   const bad = await sql`
@@ -6244,9 +6277,14 @@ ${tripsSummary}
           const tr = await sql`SELECT id FROM trips WHERE id = ${cmd.trip_id} AND user_email = ${email}`;
           if (tr.length) {
             const leg = cmd.leg;
+            // Date sanity: never store an implausible departure (a mis-parsed year, an
+            // epoch date). A garbage date pollutes grouping and renders as a phantom
+            // "Today". Drop it to null rather than persist the lie.
+            const depOk = leg.departs_at && regroup.plausibleDate(leg.departs_at);
+            const arrOk = leg.arrives_at && regroup.plausibleDate(leg.arrives_at);
             const ins = await sql`
               INSERT INTO trip_legs (trip_id, type, carrier, flight_number, origin, destination, departs_at, arrives_at, confirmation, property_name, cabin_class, seat, nights, guests)
-              VALUES (${cmd.trip_id}, ${leg.type||'flight'}, ${leg.carrier||null}, ${leg.flight_number||null}, ${leg.origin||null}, ${leg.destination||null}, ${leg.departs_at||null}, ${leg.arrives_at||null}, ${leg.confirmation||null}, ${leg.property_name||null}, ${leg.cabin_class||null}, ${leg.seat||null}, ${leg.nights||null}, ${leg.guests||null})
+              VALUES (${cmd.trip_id}, ${leg.type||'flight'}, ${leg.carrier||null}, ${leg.flight_number||null}, ${leg.origin||null}, ${leg.destination||null}, ${depOk ? leg.departs_at : null}, ${arrOk ? leg.arrives_at : null}, ${leg.confirmation||null}, ${leg.property_name||null}, ${leg.cabin_class||null}, ${leg.seat||null}, ${leg.nights||null}, ${leg.guests||null})
               RETURNING *
             `;
             writeResult = { action: 'add_leg', leg: ins[0] };
