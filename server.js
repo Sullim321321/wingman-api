@@ -2653,6 +2653,8 @@ const watcher = require("./watcher");
 const taste = require("./taste");
 const holds = require("./holds");
 const stays = require("./stays");
+const flightbook = require("./flightbook");
+const concierge = require("./concierge");
 
 const MAX_STAY_NIGHTS = 30;
 const MAX_TRIP_DAYS   = 30;   // a single trip should not span longer than this
@@ -7402,6 +7404,36 @@ app.post("/stays/confirm", async (req, res) => {
   }
 });
 
+// POST /concierge/booking-email — C6c: draft a booking-request email for a hotel Duffel
+// can't book. Wingman WRITES it; the app opens it in the user's mail client to send, so
+// every send is the user's own act. Returns { subject, body, mailto, to }.
+app.post("/concierge/booking-email", async (req, res) => {
+  const email = await verifyAccessToken(req);
+  if (!email) return res.status(401).json({ error: "unauthorized" });
+  try {
+    const {
+      hotel_name, area, check_in, check_out, guest_name, to,
+      loyalty, preferences, room_preference,
+    } = req.body || {};
+    if (!hotel_name) return res.status(400).json({ error: "hotel_name required" });
+    const draft = concierge.composeBookingEmail({
+      hotelName: hotel_name, area,
+      checkIn: check_in, checkOut: check_out,
+      guestName: guest_name, to,
+      loyalty, preferences, roomPreference: room_preference,
+    });
+    await logActivity(
+      email, "draft", `Booking request drafted: ${hotel_name}`,
+      `A booking-request email is ready for you to review and send.`,
+      null, null, { provider: "concierge_email", to: draft.to || null }
+    );
+    res.json({ ok: true, ...draft });
+  } catch (e) {
+    console.error("[concierge-email]", e.message);
+    res.status(400).json({ ok: false, error: e.message });
+  }
+});
+
 app.get("/today", async (req, res) => {
   const email = await verifyAccessToken(req);
   if (!email) return res.status(401).json({ error: "unauthorized" });
@@ -9567,6 +9599,139 @@ app.post("/flights/book", async (req, res) => {
   } catch (e) {
     console.error("[duffel-book]", e.message);
     res.status(500).json({ error: e.message });
+  }
+});
+
+// ─────────────────────────────────────────────────────────────────────────────
+// C6b — flights on the hold-then-confirm rail (flightbook.js + holds.js).
+//   /flights/hold    → if the offer is holdable, reserve it (type:hold, NO money) and
+//                       return the hold + the exact confirm line. If it can't be held,
+//                       return holdable:false so the app confirms an instant purchase.
+//   /flights/confirm → the charge. For a held order, pay it (gated). For an instant
+//                       offer, create+pay in one gated step. Never charges without an
+//                       explicit, matching, live confirm.
+// The legacy /flights/book (immediate purchase) is left intact for now.
+// ─────────────────────────────────────────────────────────────────────────────
+function mapOfferPassengers(offer, passengers, fallbackEmail) {
+  const ids = (offer.passengers || []).map((p) => p.id);
+  return passengers.map((p, i) => ({
+    id: ids[i],
+    given_name: p.given_name,
+    family_name: p.family_name,
+    born_on: p.born_on,
+    gender: p.gender,
+    email: p.email || fallbackEmail,
+    phone_number: p.phone || p.phone_number || "+10000000000",
+    ...(p.passport_number ? {
+      identity_documents: [{
+        type: "passport",
+        unique_identifier: p.passport_number,
+        expires_on: p.passport_expiry,
+        issuing_country_code: p.passport_country || "US",
+      }],
+    } : {}),
+  }));
+}
+
+async function saveFlightOrder(email, offer, order) {
+  const firstSlice = offer.slices?.[0];
+  const lastSlice = offer.slices?.[offer.slices.length - 1];
+  const tripTitle = `${firstSlice?.origin?.iata_code || ""} → ${lastSlice?.destination?.iata_code || ""}`;
+  const [trip] = await sql`
+    INSERT INTO trips (user_email, title, status, source)
+    VALUES (${email}, ${tripTitle}, 'upcoming', 'duffel')
+    RETURNING id
+  `;
+  for (const slice of offer.slices || []) {
+    for (const seg of slice.segments || []) {
+      await sql`
+        INSERT INTO trip_legs (trip_id, type, carrier, flight_number, origin, destination, departs_at, arrives_at, confirmation, raw_data)
+        VALUES (
+          ${trip.id}, 'flight',
+          ${seg.marketing_carrier?.name || null},
+          ${(seg.marketing_carrier?.iata_code || "") + (seg.marketing_carrier_flight_number || "")},
+          ${seg.origin?.iata_code || null},
+          ${seg.destination?.iata_code || null},
+          ${seg.departing_at || null},
+          ${seg.arriving_at || null},
+          ${order.booking_reference || null},
+          ${JSON.stringify({ duffel_order_id: order.id, segment_id: seg.id })}
+        )
+      `;
+    }
+  }
+  return { trip_id: trip.id, title: tripTitle };
+}
+
+app.post("/flights/hold", async (req, res) => {
+  const email = await verifyAccessToken(req);
+  if (!email) return res.status(401).json({ error: "unauthorized" });
+  try {
+    const { offer_id, passengers } = req.body || {};
+    if (!offer_id || !passengers?.length) return res.status(400).json({ error: "offer_id and passengers are required" });
+    const duffel = getDuffel();
+    const offerData = await duffel.offers.get(offer_id);
+    const offer = offerData.data;
+    const mapped = mapOfferPassengers(offer, passengers, email);
+
+    if (!flightbook.offerHoldable(offer)) {
+      // No free hold available — tell the app to confirm an instant purchase instead.
+      return res.json({
+        ok: true, duffel_mode: duffelModeLabel(), holdable: false, hold: null,
+        offer: { id: offer.id, amount: Number(offer.total_amount), currency: offer.total_currency },
+        confirm_line: `This fare can't be held — confirming books and pays ${offer.total_currency} ${offer.total_amount} now.`,
+      });
+    }
+    const hold = await flightbook.placeFlightHold(duffel, { offer, passengers: mapped });
+    await logActivity(
+      email, "hold", `Flight held: ${offer.slices?.[0]?.origin?.iata_code || ""}→${offer.slices?.[offer.slices.length-1]?.destination?.iata_code || ""}`,
+      `Reserved ${hold.currency} ${hold.amount} — no charge yet. ${holds.summarizeForConfirm(hold)}`,
+      null, null, { provider: "duffel_air", order_id: hold.id, offer_id }
+    );
+    res.json({ ok: true, duffel_mode: duffelModeLabel(), holdable: true, hold, confirm_line: holds.summarizeForConfirm(hold), state: holds.holdState(hold) });
+  } catch (e) {
+    console.error("[flights-hold]", e.message);
+    res.status(500).json({ ok: false, error: e.message });
+  }
+});
+
+app.post("/flights/confirm", async (req, res) => {
+  const email = await verifyAccessToken(req);
+  if (!email) return res.status(401).json({ error: "unauthorized" });
+  try {
+    const { hold, confirm, offer_id, passengers } = req.body || {};
+    if (!confirm || confirm.confirm !== true) {
+      return res.status(400).json({ ok: false, error: "A charge needs your explicit confirm." });
+    }
+    const duffel = getDuffel();
+
+    // Held path: pay the existing order (gated inside confirmFlightHold).
+    if (hold && hold.id) {
+      const result = await flightbook.confirmFlightHold(duffel, { hold, confirm });
+      if (!result.ok) return res.status(409).json({ ok: false, error: result.reason });
+      const order = (await duffel.orders.get(hold.id)).data;
+      const saved = await saveFlightOrder(email, order, order);
+      await logActivity(email, "booking", `Flight booked: ${saved.title}`,
+        `Paid ${hold.currency} ${hold.amount}. Reference: ${order.booking_reference || "pending"}.`,
+        saved.trip_id, null, { provider: "duffel_air", duffel_order_id: order.id, booking_reference: order.booking_reference });
+      return res.json({ ok: true, booking: { order_id: order.id, booking_reference: order.booking_reference, trip_id: saved.trip_id, amount: hold.amount, currency: hold.currency } });
+    }
+
+    // Instant path: create + pay in one gated step (no hold was possible).
+    if (!offer_id || !passengers?.length) return res.status(400).json({ error: "offer_id and passengers are required for an instant confirm" });
+    const offer = (await duffel.offers.get(offer_id)).data;
+    const mapped = mapOfferPassengers(offer, passengers, email);
+    const result = await flightbook.bookInstant(duffel, { offer, passengers: mapped, confirm });
+    if (!result.ok) return res.status(409).json({ ok: false, error: result.reason });
+    const order = result.order;
+    const saved = await saveFlightOrder(email, offer, order);
+    await logActivity(email, "booking", `Flight booked: ${saved.title}`,
+      `Booked and paid ${offer.total_currency} ${offer.total_amount}. Reference: ${order.booking_reference || "pending"}.`,
+      saved.trip_id, null, { provider: "duffel_air", duffel_order_id: order.id, booking_reference: order.booking_reference });
+    res.json({ ok: true, booking: { order_id: order.id, booking_reference: order.booking_reference, trip_id: saved.trip_id, amount: Number(offer.total_amount), currency: offer.total_currency } });
+  } catch (e) {
+    console.error("[flights-confirm]", e.message);
+    res.status(500).json({ ok: false, error: e.message });
   }
 });
 
