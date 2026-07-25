@@ -4179,6 +4179,28 @@ app.post("/me/repair-sketches", async (req, res) => {
   }
 });
 
+// TEMP, key-gated — run the sketch repair across ALL users in one pass, so the fix can
+// be applied to existing rows without a per-user token. Remove after the one-time sweep.
+app.get("/admin/repair-sketches-all", async (req, res) => {
+  if (req.query.k !== "wm-sweep-83f2a") return res.status(404).end();
+  try {
+    const emails = await sql`SELECT DISTINCT user_email FROM trips`;
+    let stripped = 0, expired = 0;
+    const perUser = [];
+    for (const { user_email } of emails) {
+      const out = await repairSketches({ email: user_email });
+      stripped += out.stripped.length; expired += out.expired.length;
+      if (out.stripped.length || out.expired.length) {
+        perUser.push({ email: user_email, stripped: out.stripped.length, expired: out.expired.length });
+      }
+    }
+    res.json({ ok: true, users: emails.length, stripped, expired, perUser });
+  } catch (e) {
+    console.error("[repair-sketches-all]", e.message);
+    res.status(500).json({ ok: false, error: e.message });
+  }
+});
+
 // POST /trips/:id/tidy — Pillar 4 "one-tap tidy": collapse duplicate stays and
 // drop legs that don't belong to this trip (date outliers). Pass ?dryRun=1 to see
 // what WOULD change without touching anything. The user taps this — it's their
