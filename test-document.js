@@ -84,6 +84,16 @@ t("a point-to-point ride collapses even with an address name or a confirmation",
   assert.strictEqual(doc.isRide({ type: "transfer", property_name: "500 Houston St", confirmation: "Z9" }), true);
 });
 
+t("an UNTYPED address-to-address route is still a ride (caught by shape)", () => {
+  // The importer didn't tag it "car" — but a route between two street addresses is a ride.
+  assert.strictEqual(doc.isRide({
+    type: "", origin: "2021 Broadway, Nashville, TN 37203, US",
+    destination: "250 Rep John Lewis Way S, Nashville, TN 37203, US",
+  }), true);
+  // A flight (IATA codes, has a carrier) is NOT a ride.
+  assert.strictEqual(doc.isRide({ type: "flight", origin: "BNA", destination: "JFK", carrier: "AA" }), false);
+});
+
 t("a hotel is never a ride", () => {
   assert.strictEqual(doc.isRide(kimpton), false);
 });

@@ -77,14 +77,27 @@ function venueFrom(leg) {
  */
 function isRide(leg) {
   const t = String(leg?.type || "").toLowerCase();
-  if (!["car", "transfer", "ride", "taxi"].includes(t)) return false;
-  // A multi-day car RENTAL is a real booking worth a card.
+  if (["flight", "hotel", "airbnb", "train", "ferry", "cruise"].includes(t)) return false;
+  // A multi-day car RENTAL or a scheduled carrier leg is a real booking, not a ride.
   if (leg.vehicle_class || Number(leg.nights) > 0) return false;
-  // Everything else point-to-point is an expense, not an appointment — and it collapses
-  // even when it carries a destination ADDRESS or a confirmation number. An Uber to
-  // "250 Rep John Lewis Way S" has both and is still a ride; a street address (starts
-  // with a digit) and the city are not venue names. Only a genuine name — "Seaplane
-  // transfer" — keeps a ride-type leg as its own card.
+  if (leg.carrier || leg.flight_number) return false;
+
+  const declared = ["car", "transfer", "ride", "taxi"].includes(t);
+
+  // The structural tell of a ride: a ROUTE between two street addresses. Appointments and
+  // hotels have a single location; a ride goes from A to B. This catches Uber/black-car
+  // legs the importer never tagged as "car" — the "250 Rep John Lewis Way S" cards — by
+  // their shape, not their (missing) type. An address has a number and a comma; an airport
+  // code (BNA) or a bare city does not.
+  const o = String(leg.origin || leg.pickup_location || "").trim();
+  const d = String(leg.destination || leg.dropoff_location || "").trim();
+  const addrLike = (s) => /\d/.test(s) && (s.includes(",") || /^\d+\s/.test(s));
+  const pointToPoint = !!o && !!d && (addrLike(o) || addrLike(d));
+
+  if (!declared && !pointToPoint) return false;
+
+  // A genuinely NAMED transfer ("Seaplane transfer") stays a card; a street address
+  // (starts with a digit) or the city is not a venue name.
   const name = String(leg.property_name || leg.title || "").trim();
   const named = !!name && !isCityLabel(leg) && !/^\d/.test(name);
   return !named;
