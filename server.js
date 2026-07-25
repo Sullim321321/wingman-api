@@ -2647,6 +2647,7 @@ const { inferTravelNeeds, groupTrips } = require("./infer");
 const geo = require("./geo");
 const { proposeItinerary } = require("./itinerary");
 const hygiene = require("./hygiene");
+const provenance = require("./provenance");
 const reconcile = require("./reconcile");
 const autonomy = require("./autonomy");
 const watcher = require("./watcher");
@@ -4142,6 +4143,42 @@ app.delete("/trips/:id", async (req, res) => {
 });
 
 // ---------------------------------------------------------------------------
+// ── Sketch hygiene (#98) — a suggestion must never become a fact ──────────────
+// Two repairs, both reversible: strip a booking's IDENTITY (confirmation, flight
+// number, seat, gate, terminal) from any proposed leg wearing it — the "most
+// dangerous row" the invariant warns about — and expire sketches past their date or
+// shelf life (state → 'expired', never deleted). Scope to one trip or the whole user.
+async function repairSketches({ email, tripId = null }) {
+  const legs = tripId
+    ? await sql`SELECT * FROM trip_legs WHERE trip_id = ${tripId}`
+    : await sql`SELECT tl.* FROM trip_legs tl JOIN trips t ON t.id = tl.trip_id WHERE t.user_email = ${email}`;
+  const { strip, expire } = provenance.auditLegs(legs, Date.now());
+  for (const { id } of strip) {
+    // Only the booking-identity columns that actually exist on trip_legs. A DATE stays.
+    await sql`UPDATE trip_legs SET confirmation = NULL, flight_number = NULL, seat = NULL, gate = NULL, terminal = NULL
+              WHERE id = ${id} AND state IN ('proposed','considered','held')`;
+  }
+  for (const { id } of expire) {
+    await sql`UPDATE trip_legs SET state = 'expired'
+              WHERE id = ${id} AND state IN ('proposed','considered','held')`;
+  }
+  return { stripped: strip, expired: expire.map((e) => e.id) };
+}
+
+// POST /me/repair-sketches — sweep every trip for the two failure modes above. A
+// one-tap "make the whole graph honest" the user (or the watcher) can run.
+app.post("/me/repair-sketches", async (req, res) => {
+  const email = await verifyAccessToken(req);
+  if (!email) return res.status(401).json({ error: "unauthorized" });
+  try {
+    const out = await repairSketches({ email });
+    res.json({ ok: true, stripped_count: out.stripped.length, expired_count: out.expired.length, ...out });
+  } catch (e) {
+    console.error("[repair-sketches]", e.message);
+    res.status(500).json({ ok: false, error: humanError(e) });
+  }
+});
+
 // POST /trips/:id/tidy — Pillar 4 "one-tap tidy": collapse duplicate stays and
 // drop legs that don't belong to this trip (date outliers). Pass ?dryRun=1 to see
 // what WOULD change without touching anything. The user taps this — it's their
@@ -4166,14 +4203,21 @@ app.post("/trips/:id/tidy", async (req, res) => {
     for (const l of stale) if (!byId.has(l.id)) byId.set(l.id, { leg: l, reason: "stale" });
     const toRemove = [...byId.values()];
 
+    // A suggestion must never wear a booking's clothes, and a sketch past its date is
+    // no longer a suggestion. Reversible repairs, reported alongside the removals.
+    const sketch = provenance.auditLegs(legs, Date.now());
+
     if (!dryRun) {
       for (const { leg } of toRemove) {
         await sql`DELETE FROM trip_legs WHERE id = ${leg.id} AND trip_id = ${req.params.id}`;
       }
+      await repairSketches({ email, tripId: req.params.id });
     }
     res.json({
       ok: true,
       dryRun,
+      sketches_stripped: sketch.strip,
+      sketches_expired: sketch.expire.map((e) => e.id),
       removed_count: toRemove.length,
       removed: toRemove.map(({ leg, reason }) => ({
         id: leg.id,
@@ -6785,12 +6829,13 @@ app.get("/trips/:id/dossier", async (req, res) => {
     const windowDays = Math.max(1, parseInt(wpref?.days, 10) || 30);
     const cutoff = now - windowDays * 86400000;
     const visibleLegs = legs.filter((l) => {
+      if (l.state === "expired") return false;              // an expired sketch is not shown
       if (l.state === "proposed") return true;              // future proposals always show
       const end = l.arrives_at || l.departs_at;             // a stay counts by its check-out
       if (!end) return true;                                // undated → can't judge, keep
       const ms = Date.parse(end);
       return Number.isNaN(ms) ? true : ms >= cutoff;        // within window or future
-    });
+    }).map(provenance.sanitize);                            // a sketch never wears booking clothes
 
     // Chapters, rides and names come from document.js — the same rules Home reads.
     // Home showing a different answer to "is this happening now" than the Dossier
@@ -7606,7 +7651,10 @@ app.get("/today", async (req, res) => {
       }
     }
 
-    const { chapters, rides } = tripdoc.toChapters(legs, now, flightid, depBy, hygiene.normalizeProperty);
+    // Same honesty guard as the Dossier: drop expired sketches, and never let a
+    // proposal render wearing a booking's identity.
+    const cleanLegs = legs.filter((l) => l.state !== "expired").map(provenance.sanitize);
+    const { chapters, rides } = tripdoc.toChapters(cleanLegs, now, flightid, depBy, hygiene.normalizeProperty);
 
     // Which trips are represented, so Home can offer the full document.
     const seen = new Map();
