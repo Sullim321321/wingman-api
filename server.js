@@ -8246,6 +8246,35 @@ app.post("/auth/refresh", authLimiter, async (req, res) => {
   }
 });
 
+// TEMP DIAGNOSTIC — remove after ride-collapse is confirmed. Key-gated; dumps the real
+// leg rows + live isRide verdict for one trip so we can see the actual data shape.
+app.get("/debug/dossier-legs", async (req, res) => {
+  if (req.query.k !== "wm-diag-83f2a") return res.status(404).end();
+  try {
+    const city = req.query.city || "Nashville";
+    const trips = await sql`
+      SELECT id, title, destination_city FROM trips
+      WHERE title ILIKE ${"%" + city + "%"} OR destination_city ILIKE ${"%" + city + "%"}
+      ORDER BY id DESC LIMIT 1`;
+    if (!trips.length) return res.json({ error: "no trip", city });
+    const tripId = trips[0].id;
+    const legs = await sql`SELECT * FROM trip_legs WHERE trip_id = ${tripId} ORDER BY departs_at NULLS LAST, id`;
+    const now = Date.now();
+    const out = legs.map((l) => ({
+      id: l.id, type: l.type, status: l.status,
+      property_name: l.property_name, destination_city: l.destination_city,
+      origin: l.origin, destination: l.destination,
+      pickup_location: l.pickup_location, dropoff_location: l.dropoff_location,
+      property_address: l.property_address, station_from: l.station_from, station_to: l.station_to,
+      carrier: l.carrier, flight_number: l.flight_number,
+      vehicle_class: l.vehicle_class, nights: l.nights,
+      isRide: tripdoc.isRide(l), isPlaceholder: tripdoc.isPlaceholder(l),
+      chapter: tripdoc.chapterOf(l, now), display_name: tripdoc.legName(l, flightid),
+    }));
+    res.json({ trip: trips[0], count: legs.length, would_collapse: out.filter((x) => x.isRide).length, legs: out });
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
 app.get("/health", (_req, res) => {
   // Live self-test: prove which document.js is actually running. If ride_probe.collapses
   // is false, the process is on OLD code no matter what the deploy log claims.
