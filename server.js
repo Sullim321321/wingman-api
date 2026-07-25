@@ -8246,7 +8246,19 @@ app.post("/auth/refresh", authLimiter, async (req, res) => {
   }
 });
 
-app.get("/health", (_req, res) => res.json({ ok: true, ts: Date.now(), version: "2.17.0" }));
+app.get("/health", (_req, res) => {
+  // Live self-test: prove which document.js is actually running. If ride_probe.collapses
+  // is false, the process is on OLD code no matter what the deploy log claims.
+  const probe = {
+    type: "car", carrier: "Uber", property_name: "250 Rep John Lewis Way S",
+    origin: "2021 Broadway, Nashville, TN 37203, US",
+    destination: "250 Rep John Lewis Way S, Nashville, TN 37203, US",
+  };
+  res.json({
+    ok: true, ts: Date.now(), version: "2.18.0-ridecollapse",
+    ride_probe: { collapses: tripdoc.isRide(probe) }, // expect true on new code
+  });
+});
 
 // GET /env-status — internal diagnostic (auth required, non-sensitive)
 // Shows which optional API integrations are configured without exposing key values
