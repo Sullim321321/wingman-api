@@ -2908,16 +2908,43 @@ async function retitleTripFromLegs(tripId) {
  * date window, the grouping magnet, the nights count, and the ROI maths.
  */
 function sanitizeLegDates(parsed, userEmail) {
-  if (!parsed || !parsed.departs_at || !parsed.arrives_at) return parsed;
-  if (!isImplausibleSpan(parsed.departs_at, parsed.arrives_at)) return parsed;
+  if (!parsed) return parsed;
 
-  console.warn(
-    `[grouping] implausible span for ${userEmail}: ${parsed.type || "leg"} ` +
-    `${parsed.departs_at} → ${parsed.arrives_at} — discarding end date (likely wrong year)`,
-  );
-  // Keep the start (almost always right); drop the end rather than invent one.
-  parsed.arrives_at = null;
-  parsed.nights = null;
+  // H2 — a hotel's NAME must be a hotel, not the city. When the parse only recovered the
+  // city, storing it as property_name manufactures a fake hotel called "Nashville" /
+  // "New York". Store null instead, so the view honestly reads "Stay in {city}" — and the
+  // lost-name stays stop being created at the source.
+  const t = String(parsed.type || "").toLowerCase();
+  if ((t === "hotel" || t === "airbnb") && parsed.property_name) {
+    const n = String(parsed.property_name).trim().toLowerCase();
+    const city = String(parsed.destination_city || parsed.destination || "").trim().toLowerCase();
+    if (city && n === city) {
+      console.warn(`[grouping] hotel name was just the city ("${parsed.property_name}") for ${userEmail} — nulling it`);
+      parsed.property_name = null;
+    }
+  }
+
+  // H1 — an implausible DEPARTURE date (a mis-parsed year like 2009) must never anchor a
+  // trip. Drop BOTH dates so the leg becomes dateless; grouping then parks it in
+  // "Needs review" instead of welding a phantom year onto a real trip.
+  if (parsed.departs_at && !regroup.plausibleDate(parsed.departs_at)) {
+    console.warn(`[grouping] implausible departure ${parsed.departs_at} for ${userEmail} — quarantining (dateless)`);
+    parsed.departs_at = null;
+    parsed.arrives_at = null;
+    parsed.nights = null;
+    return parsed;
+  }
+
+  // Existing guard — an implausible SPAN (a "266-night" stay from a bad end year). Keep
+  // the start (almost always right); drop the end rather than invent one.
+  if (parsed.departs_at && parsed.arrives_at && isImplausibleSpan(parsed.departs_at, parsed.arrives_at)) {
+    console.warn(
+      `[grouping] implausible span for ${userEmail}: ${parsed.type || "leg"} ` +
+      `${parsed.departs_at} → ${parsed.arrives_at} — discarding end date (likely wrong year)`,
+    );
+    parsed.arrives_at = null;
+    parsed.nights = null;
+  }
   return parsed;
 }
 
