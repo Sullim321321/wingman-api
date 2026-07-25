@@ -6748,10 +6748,26 @@ app.get("/trips/:id/dossier", async (req, res) => {
 
     const now = Date.now();
 
+    // ── VISIBILITY WINDOW ────────────────────────────────────────────────────
+    // Old travel informs the Curator's taste but shouldn't clutter the view. Legs whose
+    // date is older than the window are hidden here — never deleted, still read by the
+    // taste engine (which queries full history directly). Default 30 days; the user sets
+    // it via preferences.past_visibility_days ("keep past trips visible for X days").
+    const [wpref] = await sql`SELECT COALESCE(preferences->>'past_visibility_days','30') AS days FROM users WHERE email = ${email}`;
+    const windowDays = Math.max(1, parseInt(wpref?.days, 10) || 30);
+    const cutoff = now - windowDays * 86400000;
+    const visibleLegs = legs.filter((l) => {
+      if (l.state === "proposed") return true;              // future proposals always show
+      const end = l.arrives_at || l.departs_at;             // a stay counts by its check-out
+      if (!end) return true;                                // undated → can't judge, keep
+      const ms = Date.parse(end);
+      return Number.isNaN(ms) ? true : ms >= cutoff;        // within window or future
+    });
+
     // Chapters, rides and names come from document.js — the same rules Home reads.
     // Home showing a different answer to "is this happening now" than the Dossier
     // would be the trip-title bug again, wearing a new hat.
-    const { chapters, rides } = tripdoc.toChapters(legs, now, flightid, depBy, hygiene.normalizeProperty);
+    const { chapters, rides } = tripdoc.toChapters(visibleLegs, now, flightid, depBy, hygiene.normalizeProperty);
 
     // "In motion" means a LEG is actually happening now — not that `now` falls inside
     // a naive first-to-last span. The old span read the 2012 flight as the start, so a
@@ -7803,10 +7819,13 @@ app.get("/policy", auth, async (req, res) => {
         briefing_hour: prefs.briefing_hour ?? 7,
         briefing_min: prefs.briefing_min ?? 0,
         briefing_enabled: prefs.briefing_enabled !== false,
+        // How long a finished trip stays visible before it drops out of view (still fed
+        // to the Curator's taste). Default 30 days.
+        past_visibility_days: prefs.past_visibility_days ?? 30,
       },
     });
   } catch (e) {
-    res.json({ policy: { autonomy_mode: "always_ask", threshold: 500, payment_preference: "best_value", cabin_preference: "economy", notify_on_action: true, weather_alerts: true, price_alerts: true, quiet_hours: true, briefing_hour: 7, briefing_min: 0, briefing_enabled: true } });
+    res.json({ policy: { autonomy_mode: "always_ask", threshold: 500, payment_preference: "best_value", cabin_preference: "economy", notify_on_action: true, weather_alerts: true, price_alerts: true, quiet_hours: true, briefing_hour: 7, briefing_min: 0, briefing_enabled: true, past_visibility_days: 30 } });
   }
 });
 
