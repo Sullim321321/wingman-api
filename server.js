@@ -2656,6 +2656,7 @@ const stays = require("./stays");
 const flightbook = require("./flightbook");
 const concierge = require("./concierge");
 const regroup = require("./regroup");
+const gapsLib = require("./gaps");   // free-pocket detection (aliased; a local `gaps` array exists elsewhere)
 
 const MAX_STAY_NIGHTS = 30;
 const MAX_TRIP_DAYS   = 30;   // a single trip should not span longer than this
@@ -7522,6 +7523,35 @@ app.post("/concierge/booking-email", async (req, res) => {
   } catch (e) {
     console.error("[concierge-email]", e.message);
     res.status(400).json({ ok: false, error: e.message });
+  }
+});
+
+// GET /pockets?days=3 — the free windows between your commitments (Curator, Phase 3).
+// "Two hours to yourself until the 3pm." Reads every connected calendar, subtracts what
+// you're committed to within waking hours, and returns the pockets — future-only, never
+// over a meeting. The engine (gaps.findFreePockets) is pure and already tested.
+function offsetHoursFromISO(iso) {
+  if (!iso) return null;
+  const m = String(iso).match(/([+-])(\d{2}):?(\d{2})$/);
+  if (m) return (m[1] === "-" ? -1 : 1) * parseInt(m[2], 10);
+  if (/Z$/.test(String(iso))) return 0;
+  return null;
+}
+app.get("/pockets", async (req, res) => {
+  const email = await verifyAccessToken(req);
+  if (!email) return res.status(401).json({ error: "unauthorized" });
+  try {
+    const days = Math.min(parseInt(req.query.days || "3", 10) || 3, 7);
+    const { connected, events } = await readCommitments(email, days);
+    if (!connected) return res.json({ ok: true, connected: false, pockets: [] });
+    // Waking hours are LOCAL — derive the offset from a real commitment so 8am–10pm means
+    // 8am–10pm where you are, not in UTC.
+    const offsetH = events.map((e) => offsetHoursFromISO(e.start)).find((h) => h != null) ?? 0;
+    const pockets = gapsLib.findFreePockets(events, { horizonDays: days, minMinutes: 90, offsetH });
+    res.json({ ok: true, connected: true, pockets });
+  } catch (e) {
+    console.error("[pockets]", e.message);
+    res.status(500).json({ ok: false, error: humanError(e) });
   }
 });
 
