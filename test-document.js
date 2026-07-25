@@ -95,15 +95,26 @@ t("a city-only, route-less, booking-less leg is a placeholder", () => {
   assert.strictEqual(doc.isPlaceholder(kimpton), false);
 });
 
-t("stay name-variants dedupe to one when a normalizer is given", () => {
+t("a same-hotel same-day name-variant collapses to one (true duplicate)", () => {
   const norm = require("./hygiene").normalizeProperty;
   const legs = [
     { id: 1, type: "hotel", property_name: "Kimpton Aertson Hotel", departs_at: "2026-07-19T17:00:00Z" },
-    { id: 2, type: "hotel", property_name: "Kimpton Aertson Hotel by IHG", departs_at: "2026-07-21T17:00:00Z" },
+    { id: 2, type: "hotel", property_name: "Kimpton Aertson Hotel by IHG", departs_at: "2026-07-19T18:00:00Z" },
   ];
   const { chapters } = doc.toChapters(legs, NOW, null, {}, norm);
   const hotels = Object.values(chapters).flat().filter((l) => l.type === "hotel");
-  assert.strictEqual(hotels.length, 1, "the Kimpton should appear once");
+  assert.strictEqual(hotels.length, 1, "one stay imported twice should appear once");
+});
+
+t("separate reservations at the same hotel on different days BOTH survive", () => {
+  const norm = require("./hygiene").normalizeProperty;
+  const legs = [
+    { id: 1, type: "hotel", property_name: "Kimpton Aertson Hotel", departs_at: "2026-07-17T17:00:00Z" },
+    { id: 2, type: "hotel", property_name: "Kimpton Aertson Hotel", departs_at: "2026-07-21T17:00:00Z" },
+  ];
+  const { chapters } = doc.toChapters(legs, NOW, null, {}, norm);
+  const hotels = Object.values(chapters).flat().filter((l) => l.type === "hotel");
+  assert.strictEqual(hotels.length, 2, "distinct reservations are real nights, not dropped");
 });
 
 console.log(`\n${b}Today's page and the whole document agree${x}`);

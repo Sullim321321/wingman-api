@@ -155,8 +155,16 @@ function dedupeStays(legs, normalize) {
     const t = String(l?.type || "").toLowerCase();
     if (t !== "hotel" && t !== "airbnb") { out.push(l); continue; }
     const key = normalize(l.property_name || l.title || "");
-    if (key && seen.has(key)) continue;   // a variant of a stay already shown
-    if (key) seen.add(key);
+    if (!key) { out.push(l); continue; }
+    // Collapse only a TRUE duplicate: the same hotel with the same check-in DAY (e.g.
+    // "Kimpton Aertson Hotel" and "…by IHG" for one stay imported twice). Two separate
+    // reservations at the same hotel on different days are real, distinct nights — they
+    // must survive here and be merged into a span at the summary layer, never dropped.
+    const dep = Date.parse(l.departs_at || "");
+    const day = Number.isNaN(dep) ? "x" : Math.round(dep / 86400000);
+    const dupKey = `${key}|${day}`;
+    if (seen.has(dupKey)) continue;
+    seen.add(dupKey);
     out.push(l);
   }
   return out;
