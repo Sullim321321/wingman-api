@@ -93,18 +93,26 @@ function isRide(leg) {
 
   const declared = ["car", "transfer", "ride", "taxi"].includes(t);
 
-  // Otherwise, the structural tell of a ride: a ROUTE between two street addresses.
-  // Check every field the importer might have used for the endpoints.
-  const o = String(leg.origin || leg.pickup_location || leg.origin_address || "").trim();
-  const d = String(leg.destination || leg.dropoff_location || leg.destination_address || "").trim();
-  const addrLike = (s) => /\d/.test(s) && (s.includes(",") || /^\d+\s/.test(s));
-  const pointToPoint = !!o && !!d && (addrLike(o) || addrLike(d));
-
-  if (!declared && !pointToPoint) return false;
-
-  // A genuinely NAMED transfer ("Seaplane transfer") stays a card; the city is not a name.
+  // A genuinely NAMED thing ("Seaplane transfer", "Dinner at Husk") stays a card. The
+  // city is not a name, and an address is not a name. Decide this FIRST: if the leg has a
+  // real, human name, it is never a ride — whatever its route fields say.
   const named = !!name && !isCityLabel(leg) && !/^\d/.test(name);
-  return !named;
+  if (named) return false;
+
+  // No real name. The only question left is whether this is an address-to-somewhere ride.
+  // The surest signal: the SAME thing legName would print is an address. legName reaches
+  // for property_name, then venueFrom(location|address|destination). So check every field
+  // that could carry an endpoint — a ride's address can live in any one of them, and it
+  // does NOT take two: "→ 250 Rep John Lewis Way" with no stated origin is still a ride.
+  const addrLike = (s) => /\d/.test(String(s)) && (String(s).includes(",") || /^\d+\s/.test(String(s)));
+  const endpointFields = [
+    leg.origin, leg.pickup_location, leg.origin_address,
+    leg.destination, leg.dropoff_location, leg.destination_address,
+    leg.location, leg.address, leg.property_name, leg.title,
+  ];
+  const anyAddress = endpointFields.some((v) => addrLike(v));
+
+  return declared || anyAddress;
 }
 
 /**
