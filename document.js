@@ -78,27 +78,31 @@ function venueFrom(leg) {
 function isRide(leg) {
   const t = String(leg?.type || "").toLowerCase();
   if (["flight", "hotel", "airbnb", "train", "ferry", "cruise"].includes(t)) return false;
-  // A multi-day car RENTAL or a scheduled carrier leg is a real booking, not a ride.
+  // A multi-day car RENTAL is a real booking; a real flight has a flight number. Neither
+  // is a ground ride. (We do NOT exclude on `carrier` — an Uber/black-car leg legitimately
+  // carries a provider name, and excluding those is what left the ride cards on screen.)
   if (leg.vehicle_class || Number(leg.nights) > 0) return false;
-  if (leg.carrier || leg.flight_number) return false;
+  if (leg.flight_number) return false;
+
+  const name = String(leg.property_name || leg.title || "").trim();
+
+  // A leg whose very NAME is a street address ("250 Rep John Lewis Way S") is a ride to
+  // that address — collapse it whatever its type or route fields say. This is the surest
+  // catch for the address-titled cards.
+  if (/^\d+\s+\S/.test(name)) return true;
 
   const declared = ["car", "transfer", "ride", "taxi"].includes(t);
 
-  // The structural tell of a ride: a ROUTE between two street addresses. Appointments and
-  // hotels have a single location; a ride goes from A to B. This catches Uber/black-car
-  // legs the importer never tagged as "car" — the "250 Rep John Lewis Way S" cards — by
-  // their shape, not their (missing) type. An address has a number and a comma; an airport
-  // code (BNA) or a bare city does not.
-  const o = String(leg.origin || leg.pickup_location || "").trim();
-  const d = String(leg.destination || leg.dropoff_location || "").trim();
+  // Otherwise, the structural tell of a ride: a ROUTE between two street addresses.
+  // Check every field the importer might have used for the endpoints.
+  const o = String(leg.origin || leg.pickup_location || leg.origin_address || "").trim();
+  const d = String(leg.destination || leg.dropoff_location || leg.destination_address || "").trim();
   const addrLike = (s) => /\d/.test(s) && (s.includes(",") || /^\d+\s/.test(s));
   const pointToPoint = !!o && !!d && (addrLike(o) || addrLike(d));
 
   if (!declared && !pointToPoint) return false;
 
-  // A genuinely NAMED transfer ("Seaplane transfer") stays a card; a street address
-  // (starts with a digit) or the city is not a venue name.
-  const name = String(leg.property_name || leg.title || "").trim();
+  // A genuinely NAMED transfer ("Seaplane transfer") stays a card; the city is not a name.
   const named = !!name && !isCityLabel(leg) && !/^\d/.test(name);
   return !named;
 }
