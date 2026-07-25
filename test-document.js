@@ -98,6 +98,32 @@ t("a hotel is never a ride", () => {
   assert.strictEqual(doc.isRide(kimpton), false);
 });
 
+t("a rideshare with a vehicle_class TIER is still a ride (UberX is not a rental)", () => {
+  // The real Nashville bug: Uber stores the ride tier in vehicle_class, and the old
+  // rental guard excluded every tiered Uber, leaving a dozen cards on screen.
+  assert.strictEqual(doc.isRide({
+    type: "transfer", carrier: "Uber", vehicle_class: "UberX",
+    origin: "2021 Broadway, Nashville, TN 37203, US",
+    destination: "250 Rep John Lewis Way S, Nashville, TN 37203, US",
+  }), true);
+  assert.strictEqual(doc.isRide({ type: "transfer", carrier: "Lyft", vehicle_class: "Comfort", destination: "33 Peabody St, Nashville, TN 37210, US" }), true);
+  // A non-rideshare vehicle_class is still a rental → a card, not a ride.
+  assert.strictEqual(doc.isRide({ type: "car", carrier: "Hertz", vehicle_class: "SUV" }), false);
+});
+
+t("a stay whose property_name never imported names itself, not the city", () => {
+  // Leg 2113: a Kimpton stay with property_name null rendered as the bare 'Nashville'.
+  assert.strictEqual(doc.legName({
+    type: "hotel", property_name: null, carrier: "Kimpton Aertson Hotel",
+    property_address: "2021 Broadway, Nashville, Tennessee 37203", destination_city: "Nashville",
+  }), "Kimpton Aertson Hotel");
+  // A booking-agency carrier is not the hotel name → fall to the address, still not the city.
+  assert.strictEqual(doc.legName({
+    type: "hotel", property_name: null, carrier: "TrueBlue Travel",
+    property_address: "101 20th Avenue North, Nashville, TN 37203", destination_city: "Nashville",
+  }), "101 20th Avenue North");
+});
+
 t("a city-only, route-less, booking-less leg is a placeholder", () => {
   assert.strictEqual(doc.isPlaceholder({ type: "car", property_name: "Nashville", destination_city: "Nashville" }), true);
   assert.strictEqual(doc.isPlaceholder({ type: "flight", origin: "BNA", destination: "ORD" }), false);

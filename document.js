@@ -75,14 +75,27 @@ function venueFrom(leg) {
  * they didn't happen is its own lie, so they're counted, not deleted. The distinction
  * is a real NAME — and the city is not one.
  */
+// Rideshare providers store the ride TIER in vehicle_class ("UberX", "Comfort", "Black").
+// A rental agency stores a car CLASS there ("SUV", "Intermediate"). The tell isn't the
+// column — it's the carrier. So vehicle_class means "rental" only when the carrier is not
+// a rideshare. This is the bug that kept every tiered Uber on screen as a full card.
+const RIDESHARE = ["uber", "lyft", "bolt", "grab", "ola", "via", "curb", "careem", "didi", "gett", "cabify", "black car", "blacklane"];
+function isRideshareCarrier(leg) {
+  const c = String(leg?.carrier || "").toLowerCase();
+  return RIDESHARE.some((r) => c.includes(r));
+}
+
 function isRide(leg) {
   const t = String(leg?.type || "").toLowerCase();
   if (["flight", "hotel", "airbnb", "train", "ferry", "cruise"].includes(t)) return false;
   // A multi-day car RENTAL is a real booking; a real flight has a flight number. Neither
   // is a ground ride. (We do NOT exclude on `carrier` — an Uber/black-car leg legitimately
   // carries a provider name, and excluding those is what left the ride cards on screen.)
-  if (leg.vehicle_class || Number(leg.nights) > 0) return false;
+  if (Number(leg.nights) > 0) return false;
   if (leg.flight_number) return false;
+  // vehicle_class excludes a RENTAL, never a rideshare tier: an "UberX" is a ride, an
+  // "SUV" from Hertz is a booking. Only a non-rideshare vehicle_class means rental.
+  if (leg.vehicle_class && !isRideshareCarrier(leg)) return false;
 
   const name = String(leg.property_name || leg.title || "").trim();
 
@@ -139,6 +152,16 @@ function legName(leg, fid) {
   if (!leg) return "";
   if (leg.type === "flight" && fid) return fid.displayName(leg);
   if (leg.property_name && !isCityLabel(leg)) return leg.property_name;
+  // A stay whose property_name never imported must not fall to the bare city — that's the
+  // "Nashville" card. The hotel's real name often sits in `carrier` (a booking agency is
+  // the exception), and failing that its street address beats a city label.
+  const t = String(leg.type || "").toLowerCase();
+  if (t === "hotel" || t === "airbnb") {
+    const c = String(leg.carrier || "").trim();
+    if (c && !/\b(travel|expedia|booking|hotels\.com|priceline|trueblue|agoda|orbitz|kayak|trip\.com|hotwire)\b/i.test(c)) return c;
+    const viaAddr = venueFrom({ ...leg, destination: leg.property_address });
+    if (viaAddr) return viaAddr;
+  }
   // property_name is missing or just the city — reach for a specific place first.
   return venueFrom(leg) || leg.property_name || leg.destination_city || leg.destination || leg.type || "booking";
 }
