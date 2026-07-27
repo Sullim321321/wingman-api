@@ -110,6 +110,77 @@ const TOOLS = [{
   },
 }];
 
+// ── The ACT tool (Epic 3) ────────────────────────────────────────────────────
+// This is how "book it" / "re-route me" stops being talk and becomes a one-tap
+// authorisation. It does NOT book. It proposes a single, concrete action that the
+// app renders as a Confirm card wired to the EXISTING hold/book machinery and ledger.
+//
+// The rails are the same ones that govern the whole system:
+//   · A language model may never state a fare, a flight number, or a confirmation.
+//     Those come from Duffel or the inbox — from the world. The schema below has
+//     nowhere to put them, and normalizeAction() throws them away if smuggled in.
+//   · Nothing here spends money. The action is a proposal; the human taps to authorise;
+//     the confirm gate and ledger that already exist do the rest.
+//   · Call this ONLY when the user has clearly asked to EXECUTE — "book it", "re-route
+//     me", "change my hotel", "hold that". Never on a question, a musing, or planning.
+const ACT_TOOL = {
+  name: "act",
+  description:
+    "Propose ONE concrete action for the user to authorise with a single tap. Call this " +
+    "ONLY when the user has clearly asked you to EXECUTE something — 're-route me', " +
+    "'book it', 'change my hotel', 'hold that'. Never on a question or while still " +
+    "planning. This does NOT book anything: it hands the user a Confirm card wired to " +
+    "the real booking machinery. NEVER invent a fare, a flight number, or a confirmation " +
+    "— you don't have them; the booking flow does. Still reply in text alongside this.",
+  input_schema: {
+    type: "object",
+    properties: {
+      kind: {
+        type: "string",
+        enum: ["rebook_flight", "change_stay", "hold_flight", "hold_stay"],
+        description:
+          "rebook_flight = replace a booked flight (disruption / changed plan). " +
+          "change_stay = swap or move a hotel. hold_flight / hold_stay = place a " +
+          "refundable hold to lock a fare/rate while the user decides.",
+      },
+      leg_id: {
+        type: "number",
+        description:
+          "The id of the existing leg this acts on, if the user is pointing at one " +
+          "('my BNA→EWR flight', 'the Kimpton'). Omit for a brand-new booking.",
+      },
+      summary: {
+        type: "string",
+        description:
+          "One plain sentence naming exactly what tapping Authorise will start — in the " +
+          "user's terms, no fare, no flight number. 'Find a later BNA→EWR flight tonight " +
+          "and hold it' — not 'Book UA412 $214'.",
+      },
+      urgency: {
+        type: "string",
+        enum: ["now", "soon", "whenever"],
+        description: "How time-critical: 'now' for an active disruption, else 'soon'/'whenever'.",
+      },
+    },
+    required: ["kind", "summary"],
+  },
+};
+
+// A proposed action must be structurally incapable of asserting a booking, exactly like
+// a sketched leg. Keep only the fields the schema blesses; drop anything that would let
+// the model claim a fare/PNR it cannot have.
+function normalizeAction(a) {
+  if (!a || typeof a !== "object") return null;
+  const KIND = ["rebook_flight", "change_stay", "hold_flight", "hold_stay"];
+  const kind = KIND.includes(a.kind) ? a.kind : null;
+  if (!kind) return null;
+  const summary = typeof a.summary === "string" ? a.summary.trim() : "";
+  if (!summary) return null;
+  const legId = Number.isFinite(a.leg_id) ? a.leg_id : (parseInt(a.leg_id, 10) || null);
+  const urgency = ["now", "soon", "whenever"].includes(a.urgency) ? a.urgency : "soon";
+  return { kind, leg_id: legId, summary, urgency };
+}
+
 const SYSTEM = `You are Wingman's planner. You read one turn of a travel-planning conversation and record what it established.
 
 You are a WITNESS, not a designer. Record only what is actually there:
@@ -635,7 +706,15 @@ Every turn must ADVANCE the trip. After you record, do at least one of:
     settles the most other things.
 
 You are a chief of staff, not a stenographer. If your reply could be replaced by a
-checkmark, you have failed the turn.`;
+checkmark, you have failed the turn.
+
+ACT WHEN ASKED — DON'T JUST ADVISE.
+When the person clearly wants you to DO the thing — "re-route me", "book it", "change my
+hotel", "hold that" — call the "act" tool with the single concrete action, alongside your
+reply. That hands them a one-tap Confirm card wired to real booking; it does NOT book by
+itself, and you must never state a fare, a flight number, or a confirmation — you don't
+have them. Name what the tap will START, in their words. If they're only asking a question
+or still deciding, do NOT call "act" — advise first. One action per turn, the obvious one.`;
 
 async function converse({ message, known = [], history = [], findings = null, now = null, timezone = null }) {
   const gaps = coverage(known);
@@ -718,6 +797,7 @@ async function converse({ message, known = [], history = [], findings = null, no
     tools: [
       { type: "web_search_20250305", name: "web_search", max_uses: 3 },
       ...TOOLS,
+      ACT_TOOL,
     ],
     // auto, NOT forced: a turn can be pure conversation ("what does recovery-grade
     // mean?") and recording nothing is the correct answer to it.
@@ -751,6 +831,10 @@ async function converse({ message, known = [], history = [], findings = null, no
   let reply = res.content.filter((b) => b.type === "text").map((b) => b.text).join("").trim();
   const use = res.content.find((b) => b.type === "tool_use" && b.name === "record");
   const out = use?.input || {};
+
+  // Epic 3 · did this turn ask us to DO something? If so, carry the proposal out.
+  const actUse = res.content.find((b) => b.type === "tool_use" && b.name === "act");
+  const action = actUse ? normalizeAction(actUse.input) : null;
 
   const constraints = asArray(out.constraints).map(normalize);
 
@@ -807,6 +891,7 @@ async function converse({ message, known = [], history = [], findings = null, no
     intents: asArray(out.intents),
     constraints,
     shape: asArray(out.shape).map(stripShape),
+    action,
     gaps,
     usage: res.usage,
   };
@@ -815,5 +900,5 @@ async function converse({ message, known = [], history = [], findings = null, no
 module.exports = {
   readTurn, converse, commit, research, coverage,
   shapeTrip, titleFor, stripShape, FORBIDDEN_ON_A_PLAN,
-  normalize, asArray, NEEDS_LOOKUP, MODEL, RESEARCH_MODEL,
+  normalize, asArray, normalizeAction, ACT_TOOL, NEEDS_LOOKUP, MODEL, RESEARCH_MODEL,
 };

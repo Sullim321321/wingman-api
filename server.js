@@ -6806,7 +6806,9 @@ async function getFlightStatusFlightAware(flightIdent) {
     const terminal = flight.terminal_origin || null;
     const actualDep = flight.actual_out || flight.estimated_out || null;
     const scheduledDep = flight.scheduled_out || null;
-    return { status, delay, gate, terminal, actualDep, scheduledDep, source: "flightaware" };
+    // O2 · arrival estimate drives the leave-by recompute when a flight slips.
+    const estimatedArrival = flight.estimated_in || flight.actual_in || flight.scheduled_in || null;
+    return { status, delay, gate, terminal, actualDep, scheduledDep, estimatedArrival, source: "flightaware" };
   } catch (e) {
     lastFlightAwareReason = `network_error: ${e.message}`;
     console.error("[aeroapi]", e.message);
@@ -6849,9 +6851,10 @@ async function getFlightStatusAviationStack(flightIdent) {
     }
     const gate     = flight.departure?.gate || null;
     const terminal = flight.departure?.terminal || null;
+    const estimatedArrival = flight.arrival?.estimated || flight.arrival?.actual || flight.arrival?.scheduled || null;
     const actualDep    = flight.departure?.actual || flight.departure?.estimated || null;
     const scheduledDep = flight.departure?.scheduled || null;
-    return { status, delay, gate, terminal, actualDep, scheduledDep, source: "aviationstack" };
+    return { status, delay, gate, terminal, actualDep, scheduledDep, estimatedArrival, source: "aviationstack" };
   } catch (e) {
     console.error("[aviationstack]", e.message);
     return null;
@@ -8984,7 +8987,7 @@ async function pollDisruptions() {
     const cutoff = new Date(now.getTime() + 48 * 60 * 60 * 1000);
     const legs = await sql`
       SELECT tl.id, tl.trip_id, tl.carrier, tl.flight_number, tl.origin, tl.destination,
-             tl.departs_at, tl.status as prev_status,
+             tl.departs_at, tl.arrives_at, tl.status as prev_status,
              t.user_email, t.title as trip_title, t.mode as trip_mode
       FROM trip_legs tl
       JOIN trips t ON t.id = tl.trip_id
@@ -9037,6 +9040,22 @@ async function pollDisruptions() {
         activityBody = `Your ${leg.origin} → ${leg.destination} flight is delayed${delayStr}.${live.gate ? ` Gate ${live.gate}.` : ""}`;
         activityType = "delay";
         if (delayMins && delayMins >= 60) { triggerCascadeCheck(leg, "delayed", delayMins).catch(e => console.error("[cascade]", e.message)); }
+        // O2 · Re-run the leave-by. A slipped departure moves the landing, which moves
+        // the door time and the car. Shift arrives_at to the new estimate (or by the
+        // delay), then clear the arrival_plan dedup so the next pollArrivals() recomputes
+        // and re-pushes the updated "leave {airport} by …" against the new landing.
+        try {
+          let newArr = live.estimatedArrival ? new Date(live.estimatedArrival) : null;
+          if ((!newArr || isNaN(newArr)) && delayMins && leg.arrives_at) {
+            newArr = new Date(new Date(leg.arrives_at).getTime() + delayMins * 60000);
+          }
+          if (newArr && !isNaN(newArr) && leg.arrives_at &&
+              Math.abs(newArr.getTime() - new Date(leg.arrives_at).getTime()) > 5 * 60000) {
+            await sql`UPDATE trip_legs SET arrives_at = ${newArr.toISOString()} WHERE id = ${leg.id}`;
+            await sql`DELETE FROM activity_events WHERE leg_id = ${leg.id} AND type = 'arrival_plan' AND created_at > NOW() - INTERVAL '6 hours'`;
+            console.log(`[O2] ${ident} arrival → ${newArr.toISOString()}; leave-by will re-run`);
+          }
+        } catch (e) { console.error("[O2]", e.message); }
       } else if (newStatus === "On Time" && ["Delayed", "Watching"].includes(prevStatus)) {
         pushTitle = `✅ ${ident} Back on Time`;
         pushBody = `Your ${leg.origin} → ${leg.destination} flight is now showing on time.`;
@@ -9604,12 +9623,56 @@ async function pollArrivals() {
   }
 }
 
+// O4 · Check-in nudge. When the guest actually arrives (inbound flight landed, or a
+// drive-trip check-in is imminent), surface the hotel check-in — offering, never acting.
+// All follow-through (early check-in, ETA) is one tap away; nothing autonomous here.
+async function pollCheckins() {
+  console.log("[checkin] checking hotel check-ins...");
+  try {
+    const nowMs = Date.now();
+    const stays = await sql`
+      SELECT tl.id, tl.trip_id, tl.carrier, tl.destination, tl.departs_at, t.user_email
+      FROM trip_legs tl JOIN trips t ON t.id = tl.trip_id
+      WHERE tl.type = 'hotel' AND COALESCE(tl.state,'') <> 'proposed'
+        AND tl.departs_at IS NOT NULL
+        AND tl.departs_at BETWEEN ${new Date(nowMs - 12 * 3600000).toISOString()} AND ${new Date(nowMs + 12 * 3600000).toISOString()}`;
+    for (const stay of stays) {
+      // The trigger is arrival, not the clock: if the trip has flights, wait until the
+      // inbound has landed. Drive/other trips fire when check-in is imminent.
+      const flightsOnTrip = await sql`SELECT 1 FROM trip_legs WHERE trip_id = ${stay.trip_id} AND type = 'flight' AND COALESCE(state,'') <> 'proposed' LIMIT 1`;
+      if (flightsOnTrip.length) {
+        const landed = await sql`SELECT 1 FROM trip_legs WHERE trip_id = ${stay.trip_id} AND type = 'flight' AND status = 'Landed' AND COALESCE(state,'') <> 'proposed' LIMIT 1`;
+        if (!landed.length) continue; // still in transit — too early to nudge check-in
+      } else {
+        const ciMs = Date.parse(stay.departs_at);
+        if (!ciMs || ciMs - nowMs > 4 * 3600000 || nowMs - ciMs > 6 * 3600000) continue;
+      }
+      const dupe = await sql`SELECT 1 FROM activity_events WHERE leg_id = ${stay.id} AND type = 'checkin_nudge' AND created_at > NOW() - INTERVAL '12 hours' LIMIT 1`;
+      if (dupe.length) continue;
+      const hotel = stay.carrier || stay.destination || "your hotel";
+      const ci = new Date(stay.departs_at);
+      const ciClock = isNaN(ci) ? null : ci.toLocaleTimeString("en-US", { hour: "numeric", minute: "2-digit" });
+      await logActivity(stay.user_email, "checkin_nudge", `Check in at ${hotel}`,
+        `You're due in today${ciClock ? ` — check-in from ${ciClock}` : ""}. I can request early check-in or share your ETA — just say the word.`,
+        stay.trip_id, stay.id).catch(() => {});
+      await sendPushToUser(stay.user_email, `${hotel}${ciClock ? ` — check-in from ${ciClock}` : ""}`,
+        `You're due in today. Want me to request early check-in?`, { screen: "Home" }).catch(() => {});
+      console.log(`[checkin] nudged ${stay.user_email} — ${hotel}`);
+    }
+    console.log("[checkin] done");
+  } catch (e) {
+    console.error("[checkin] error:", e.message);
+  }
+}
+
 // Run poll on startup (after 30s delay to let server settle) and every 15 min
 setTimeout(() => {
   pollDisruptions();
   setInterval(pollDisruptions, 15 * 60 * 1000);
   pollArrivals();
   setInterval(pollArrivals, 10 * 60 * 1000);
+  pollCheckins();
+  setInterval(pollCheckins, 10 * 60 * 1000);
 }, 30 * 1000);
 
 // ---------------------------------------------------------------------------
@@ -15629,6 +15692,31 @@ app.post("/plan/message", conciergeLimiter, async (req, res) => {
              departs_at, state, raw_data
       FROM trip_legs WHERE trip_id = ${trip_id} ORDER BY id`;
 
+    // ── Epic 3 · carry an authorisable ACTION out to the app ───────────────────
+    // converse() may have proposed one concrete thing to DO. We resolve the leg it
+    // points at (so the app can prefill the existing FlightPicker / Stays confirm
+    // flow) and hand the app a route hint. Nothing is booked here — this is a
+    // proposal the user taps to authorise, through the confirm gate + ledger.
+    let action = null;
+    if (out.action) {
+      let ctx = null;
+      if (out.action.leg_id) {
+        const [lg] = await sql`
+          SELECT id, type, state, origin, destination, destination_city, property_name,
+                 departs_at, arrives_at, nights, carrier
+          FROM trip_legs WHERE id = ${out.action.leg_id} AND trip_id = ${trip_id}`;
+        if (lg) ctx = lg;
+      }
+      const isStay = out.action.kind === "change_stay" || out.action.kind === "hold_stay";
+      action = {
+        ...out.action,
+        trip_id,
+        route: isStay ? "Stays" : "FlightPicker",   // existing confirm-gated surfaces
+        mode: out.action.kind.startsWith("hold_") ? "hold" : "book",
+        context: ctx,                                // null for a brand-new booking
+      };
+    }
+
     res.json({
       trip_id,
       reply: out.reply,
@@ -15636,6 +15724,7 @@ app.post("/plan/message", conciergeLimiter, async (req, res) => {
       constraints: live,
       legs,
       shaped: shaped.legs,
+      action,
       added: wrote.written.map((w) => ({ id: w.id, rationale: w.rationale, hardness: w.hardness, status: w.status, scope: w.scope })),
       proposed: wrote.proposed.map((p) => ({ id: p.id, rationale: p.rationale, hardness: p.hardness })),
       kept: wrote.kept,
