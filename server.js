@@ -6213,10 +6213,19 @@ ${lines.join("\n")}
     const conciergeStatic = `You are Wingman — a world-class AI travel concierge and destination intelligence engine. You combine the knowledge of a seasoned luxury travel editor, a Michelin-starred restaurant scout, a hotel critic, and a local fixer in every city on earth. You have real-time access to the user's trips, live flight statuses, and weather disruption risk scores. You know this user's personal taste profile and editorial preferences — use them to give recommendations that feel like they came from a trusted friend with impeccable taste and deep local knowledge, not a generic algorithm.
 
 === YOUR LANE (read this first) ===
-In chat, you are the GUARDIAN and chief of staff: logistics and action. Lead with the
-things you can watch, decide, and DO — flight status and disruptions, rebooking, gates and
-connections, lounges, upgrades, when to leave, hotel and car changes, what needs the user's
-attention. That is where you go deep.
+You are the chief of staff for the journey she is IN right now — not a planner of the next
+trip. ANCHOR ON WHERE SHE IS THIS MOMENT (see "WHERE SHE IS RIGHT NOW" below): in the air,
+just landed, between meetings, checking in. If she opens with "what's the best way to get
+there" or "what does my day look like", she means TODAY, from where she's standing.
+
+Your job is FRICTIONLESS TRAVEL and its management — not just warning about disruption.
+Think one step ahead of her and remove friction before she hits it: the car from the
+airport, the leave-by for a time-sensitive meeting, bags, check-in, the tight connection,
+the reroute when something slips. When she asks "book it" or "re-route me", propose the
+concrete move and DO it within the rails — a pre-filled ride link, a rebooking option, a
+re-timed plan — never a real-money charge without an explicit confirm. Map the rest of her
+day when asked, name the two or three things most likely to derail it, and offer the fix.
+Lead with logistics and action; go deep there.
 
 TASTE lives in the Explore tab — the Curator handles restaurants, bars, things to do,
 neighbourhoods, and "what's good in {city}", filtered through the user's saved taste and
@@ -6367,12 +6376,56 @@ Rules:
 - If the trip_id or leg_id you need is not in the trips list above, tell the user you can't find it and ask them to check their Trips screen
 `;
 
+    // ── WHERE SHE IS RIGHT NOW + REST OF TODAY (B9) ─────────────────────────────
+    // The concierge anchors on the present journey, not a future trip. Compose her
+    // current position (in the air / just landed) and the rest of today's timeline
+    // (legs + in-person calendar meetings) so it can lead from the next friction point.
+    let journeyContext = "";
+    try {
+      const nowMs = new Date(nowISO).getTime();
+      const soonMs = nowMs + 16 * 3600000;
+      const clock = (v) => new Date(v).toLocaleString("en-US", { timeZone: tz || "UTC", hour: "numeric", minute: "2-digit" });
+      const flightsAll = rawLegs.filter((l) => l.type === "flight" && l.departs_at && l.state !== "expired");
+      const inAir = flightsAll.find((l) => { const d = new Date(l.departs_at).getTime(), a = new Date(l.arrives_at || l.departs_at).getTime(); return nowMs >= d && nowMs <= a; });
+      const justLanded = flightsAll
+        .filter((l) => { const a = new Date(l.arrives_at || l.departs_at).getTime(); return a <= nowMs && nowMs - a < 6 * 3600000; })
+        .sort((x, y) => new Date(y.arrives_at || y.departs_at) - new Date(x.arrives_at || x.departs_at))[0];
+      let position = null;
+      if (inAir) position = `In the air, ${inAir.origin || "?"} → ${inAir.destination || "?"}, landing around ${clock(inAir.arrives_at || inAir.departs_at)}.`;
+      else if (justLanded) position = `Just landed at ${justLanded.destination || "the airport"} (in around ${clock(justLanded.arrives_at || justLanded.departs_at)}).`;
+
+      const items = [];
+      for (const l of rawLegs) {
+        const t = new Date(l.departs_at || 0).getTime();
+        if (!t || t < nowMs || t > soonMs || l.state === "expired") continue;
+        const label = l.type === "flight" ? flightid.displayName(l) : (l.property_name || l.destination || l.type);
+        const route = l.origin && l.destination && l.type !== "hotel" ? ` (${l.origin} → ${l.destination})` : "";
+        items.push({ ms: t, text: `${clock(l.departs_at)} — ${label}${route}` });
+      }
+      try {
+        const { events } = await readCommitments(email, 1);
+        for (const e of events || []) {
+          if (e.nature !== "in_person" && e.nature !== "ambiguous") continue;
+          const t = new Date(e.start).getTime();
+          if (!t || t < nowMs || t > soonMs) continue;
+          items.push({ ms: t, text: `${clock(e.start)} — ${e.title || e.summary || "meeting"}${e.place || e.location ? ` @ ${e.place || e.location}` : ""}` });
+        }
+      } catch { /* calendar is a bonus; never block the concierge */ }
+      items.sort((a, b) => a.ms - b.ms);
+
+      if (position || items.length) {
+        journeyContext = `=== WHERE SHE IS RIGHT NOW ===\n${position || "Not mid-journey at the moment."}\n`
+          + (items.length ? `\nREST OF TODAY (soonest first):\n${items.map((i) => i.text).join("\n")}\n` : "")
+          + `\nThis is the CENTRE of your attention. Lead from her present position and the next friction point — not from a future trip.`;
+      }
+    } catch { /* journey context is best-effort */ }
+
     // Per-request context — changes every call, so it sits AFTER the cached prefix.
     const conciergeDynamic = `
 
 Today's date/time: ${today}
 User: ${firstName ? firstName + ' (' + email + ')' : email}
-${memorySection || ''}${instructionsSection}${tasteSection ? `=== USER'S TASTE PROFILE ===\n${tasteSection}\n` : ""}
+${journeyContext ? journeyContext + "\n" : ""}${memorySection || ''}${instructionsSection}${tasteSection ? `=== USER'S TASTE PROFILE ===\n${tasteSection}\n` : ""}
 ${loyaltySummary ? `=== USER'S LOYALTY ACCOUNTS ===\n${loyaltySummary}\n\nWhen recommending hotels, always factor in which programs the user has status with and suggest properties where their status will be recognized. When advising on flights, factor in their airline status and miles balance — suggest using miles for upgrades when the balance is high.\n` : ""}
 ${locationContext ? `=== USER'S CURRENT LOCATION ===\n${locationContext}\nUse this to give hyper-local recommendations. If the user asks "what should I do" or "where should I eat" without specifying a city, assume they mean right now, right here.\n` : ""}
 ${liveWeather ? `=== LIVE WEATHER AT USER'S LOCATION ===\nCurrently ${liveWeather.temp}\u00b0C (feels like ${liveWeather.feels}\u00b0C), ${liveWeather.desc}${liveWeather.windKph ? `, wind ${liveWeather.windKph} km/h` : ''}${liveWeather.humidity ? `, humidity ${liveWeather.humidity}%` : ''}.\nUse this when the user asks about weather, what to wear, or whether to go outside.\n` : ""}
