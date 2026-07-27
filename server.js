@@ -9549,10 +9549,67 @@ async function checkSeatPreferenceAlerts(legs) {
   }
 }
 
+// ── THE OPERATOR (Epic 2, O1) — proactive arrival nudge ─────────────────────
+// pollDisruptions watches DEPARTURES. This watches ARRIVALS: for a flight landing
+// soon (or just landed) with a next in-person meeting, it computes the leave-airport-by
+// (arrival.js + the calendar + real travel time) and, when that door time is within the
+// next 90 minutes, PUSHES it — "Leave EWR by 3:40 for your 4:30, want the car?" — instead
+// of waiting for the user to open the app. Deduped per leg (once / 6h) and money-safe:
+// the car is still a one-tap link, never an autonomous order.
+async function pollArrivals() {
+  console.log("[arrival] checking landings...");
+  try {
+    const nowMs = Date.now();
+    const legs = await sql`
+      SELECT tl.id, tl.trip_id, tl.destination, tl.arrives_at, t.user_email
+      FROM trip_legs tl JOIN trips t ON t.id = tl.trip_id
+      WHERE tl.type = 'flight' AND COALESCE(tl.state,'') <> 'proposed'
+        AND tl.arrives_at IS NOT NULL AND tl.status <> 'Cancelled'
+        AND tl.arrives_at BETWEEN ${new Date(nowMs - 60 * 60000).toISOString()} AND ${new Date(nowMs + 4 * 3600000).toISOString()}`;
+    for (const leg of legs) {
+      const airport = String(leg.destination || "").toUpperCase().replace(/[^A-Z]/g, "").slice(0, 3);
+      const coords = AIRPORT_COORDS[airport];
+      if (!coords) continue;
+      // Next in-person meeting after this landing.
+      let meeting = null;
+      try {
+        const { events } = await readCommitments(leg.user_email, 2);
+        const cand = (events || [])
+          .filter((e) => (e.nature === "in_person" || e.nature === "ambiguous") && new Date(e.start).getTime() > new Date(leg.arrives_at).getTime())
+          .sort((a, b) => new Date(a.start) - new Date(b.start));
+        if (cand[0]) meeting = { start: cand[0].start, title: cand[0].title || cand[0].summary || "your meeting", venue: cand[0].place || cand[0].location || null };
+      } catch { continue; }
+      if (!meeting || !meeting.venue) continue;
+      const tr = await travelTime(`${coords.lat},${coords.lng}`, meeting.venue, { arriveBy: meeting.start, mode: "driving" });
+      const travelMin = (tr && !tr.error && tr.seconds) ? Math.round(tr.seconds / 60) : null;
+      const plan = arrival.plan(leg.arrives_at, meeting, travelMin);
+      if (!plan.leave_airport_by) continue;
+      const leaveMs = Date.parse(plan.leave_airport_by);
+      // Nudge only when the door time is imminent (next 90 min) and not long past.
+      if (leaveMs - nowMs > 90 * 60000 || nowMs - leaveMs > 15 * 60000) continue;
+      // Once per leg per 6h.
+      const dupe = await sql`SELECT 1 FROM activity_events WHERE leg_id = ${leg.id} AND type = 'arrival_plan' AND created_at > NOW() - INTERVAL '6 hours' LIMIT 1`;
+      if (dupe.length) continue;
+      const leaveClock = new Date(leaveMs).toLocaleTimeString("en-US", { hour: "numeric", minute: "2-digit" });
+      const tight = plan.verdict === "wont_make_it" || plan.verdict === "tight";
+      await logActivity(leg.user_email, "arrival_plan", `Leave ${airport} by ${leaveClock}`,
+        `To make ${meeting.title}${travelMin ? ` — ${travelMin} min drive` : ""}. Tap for the car.`, leg.trip_id, leg.id).catch(() => {});
+      await sendPushToUser(leg.user_email, `Leave ${airport} by ${leaveClock}${tight ? " — it's tight" : ""}`,
+        `To make ${meeting.title}${travelMin ? ` (~${travelMin} min drive)` : ""}. Want the car?`, { screen: "Home" }).catch(() => {});
+      console.log(`[arrival] nudged ${leg.user_email} — leave ${airport} by ${leaveClock}`);
+    }
+    console.log("[arrival] done");
+  } catch (e) {
+    console.error("[arrival] error:", e.message);
+  }
+}
+
 // Run poll on startup (after 30s delay to let server settle) and every 15 min
 setTimeout(() => {
   pollDisruptions();
   setInterval(pollDisruptions, 15 * 60 * 1000);
+  pollArrivals();
+  setInterval(pollArrivals, 10 * 60 * 1000);
 }, 30 * 1000);
 
 // ---------------------------------------------------------------------------
