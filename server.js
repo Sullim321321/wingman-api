@@ -2648,6 +2648,7 @@ const geo = require("./geo");
 const { proposeItinerary } = require("./itinerary");
 const hygiene = require("./hygiene");
 const provenance = require("./provenance");
+const arrival = require("./arrival");
 const reconcile = require("./reconcile");
 const autonomy = require("./autonomy");
 const watcher = require("./watcher");
@@ -3749,6 +3750,92 @@ app.get("/uber/deeplink", async (req, res) => {
     res.json({ deepLink, url: deepLink, webFallback, airport, mode, coords });
   } catch (e) {
     res.status(500).json({ error: e.message });
+  }
+});
+
+// ---------------------------------------------------------------------------
+// GET /arrival — the Arrival Concierge spine. For the flight you're on (or the next
+// one), compose the day-of chain into one honest plan: when you land, your next
+// in-person meeting from the calendar, the drive from the airport, the latest you can
+// leave the curb, whether you make it — and a pre-filled ride deep link (airport →
+// venue). Every derived time is null when the fact behind it is missing; the plan
+// says `unknown` rather than guess. No autonomous spend: the ride is a link you tap.
+// ---------------------------------------------------------------------------
+app.get("/arrival", async (req, res) => {
+  const email = await verifyAccessToken(req);
+  if (!email) return res.status(401).json({ error: "unauthorized" });
+  try {
+    const now = Date.now();
+    // The flight you're on, or the soonest upcoming one still landing in the future.
+    const flights = await sql`
+      SELECT tl.* FROM trip_legs tl JOIN trips t ON t.id = tl.trip_id
+      WHERE t.user_email = ${email} AND tl.type = 'flight'
+        AND tl.arrives_at IS NOT NULL AND tl.state IS DISTINCT FROM 'expired'
+        AND tl.arrives_at > NOW() - INTERVAL '2 hours'
+      ORDER BY tl.departs_at ASC NULLS LAST LIMIT 6`;
+    const inAir = flights.find((f) => new Date(f.departs_at).getTime() <= now && now <= new Date(f.arrives_at).getTime());
+    const flight = inAir || flights[0];
+    if (!flight) return res.json({ active: false });
+
+    const airport = String(flight.destination || "").toUpperCase().replace(/[^A-Z]/g, "").slice(0, 3);
+    const coords = AIRPORT_COORDS[airport] || null;
+    const arrivesAt = flight.arrives_at;
+
+    // The next in-person meeting AFTER you land, from the calendar.
+    let meeting = null, calendarConnected = false;
+    try {
+      const { connected, events } = await readCommitments(email, 3);
+      calendarConnected = !!connected;
+      const cand = (events || [])
+        .filter((e) => e.nature === "in_person" || e.nature === "ambiguous")
+        .filter((e) => new Date(e.start).getTime() > new Date(arrivesAt).getTime())
+        .sort((a, b) => new Date(a.start) - new Date(b.start));
+      if (cand[0]) meeting = { start: cand[0].start, title: cand[0].title || cand[0].summary || "your meeting", venue: cand[0].place || cand[0].location || null };
+    } catch (e) { console.error("[arrival] calendar", e.message); }
+
+    // The drive from the airport to the venue. Honest when we can't route it.
+    let travelMin = null, travelInfo = null;
+    if (meeting && meeting.venue && coords) {
+      const t = await travelTime(`${coords.lat},${coords.lng}`, meeting.venue, { arriveBy: meeting.start, mode: "driving" });
+      if (t && !t.error && t.seconds) { travelMin = Math.round(t.seconds / 60); travelInfo = { text: t.text, mode: t.mode }; }
+    }
+
+    const p = arrival.plan(arrivesAt, meeting, travelMin, { deplaneMin: 20 });
+
+    // The ride: airport pickup → venue dropoff. A link, never an autonomous order.
+    let ride = null;
+    if (coords) {
+      const nick = encodeURIComponent(`${airport} Airport`);
+      const base = `action=setPickup&pickup[latitude]=${coords.lat}&pickup[longitude]=${coords.lng}&pickup[nickname]=${nick}`;
+      const drop = meeting && meeting.venue ? `&dropoff[addressString]=${encodeURIComponent(meeting.venue)}` : "";
+      ride = { deepLink: `uber://?${base}${drop}`, webFallback: `https://m.uber.com/ul/?${base}${drop}`, dropoff: meeting?.venue || null };
+    }
+
+    // Airport transit — LINKS, never fabricated numbers. There is no reliable live
+    // security-wait feed, so Wingman points you at the authoritative source (MyTSA)
+    // and the terminal map rather than asserting a wait it cannot measure.
+    const airportLinks = airport ? {
+      map: `https://www.google.com/maps/search/?api=1&query=${encodeURIComponent(airport + " airport terminal map")}`,
+      security: "https://www.tsa.gov/mobile",   // MyTSA — official wait-time source
+      security_note: "No live feed exists; check MyTSA for current waits.",
+    } : null;
+
+    res.json({
+      active: true,
+      flight: {
+        from: flight.origin || null, to: airport || null,
+        arrives_at: arrivesAt, gate: flight.gate || null, terminal: flight.terminal || null,
+        in_air: !!inAir,
+      },
+      calendar_connected: calendarConnected,
+      plan: p,
+      travel: travelInfo,
+      ride,
+      airport: airportLinks,
+    });
+  } catch (e) {
+    console.error("[arrival]", e.message);
+    res.status(500).json({ error: "arrival_failed", reason: humanError(e) });
   }
 });
 
