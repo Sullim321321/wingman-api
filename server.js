@@ -2649,6 +2649,7 @@ const { proposeItinerary } = require("./itinerary");
 const hygiene = require("./hygiene");
 const provenance = require("./provenance");
 const arrival = require("./arrival");
+const providers = require("./providers"); // Epic 4 · real-feed seam (ride/security/transit)
 const reconcile = require("./reconcile");
 const autonomy = require("./autonomy");
 const watcher = require("./watcher");
@@ -3802,22 +3803,27 @@ app.get("/arrival", async (req, res) => {
 
     const p = arrival.plan(arrivesAt, meeting, travelMin, { deplaneMin: 20 });
 
-    // The ride: airport pickup → venue dropoff. A link, never an autonomous order.
+    // The ride: airport pickup → venue dropoff. Resolved through the provider seam —
+    // a link (never an autonomous order), plus a real price/ETA estimate IF an Uber
+    // estimate token is ever configured. `ride.source` badges which one honestly.
     let ride = null;
     if (coords) {
-      const nick = encodeURIComponent(`${airport} Airport`);
-      const base = `action=setPickup&pickup[latitude]=${coords.lat}&pickup[longitude]=${coords.lng}&pickup[nickname]=${nick}`;
-      const drop = meeting && meeting.venue ? `&dropoff[addressString]=${encodeURIComponent(meeting.venue)}` : "";
-      ride = { deepLink: `uber://?${base}${drop}`, webFallback: `https://m.uber.com/ul/?${base}${drop}`, dropoff: meeting?.venue || null };
+      ride = await providers.rideOptions({
+        pickup: { lat: coords.lat, lng: coords.lng, label: `${airport} Airport` },
+        dropoff: meeting?.venue ? { address: meeting.venue } : null,
+      });
     }
 
-    // Airport transit — LINKS, never fabricated numbers. There is no reliable live
-    // security-wait feed, so Wingman points you at the authoritative source (MyTSA)
-    // and the terminal map rather than asserting a wait it cannot measure.
+    // Airport transit — through the same seam. There is no reliable live security-wait
+    // feed, so Wingman points at MyTSA and the terminal map rather than asserting a wait
+    // it cannot measure. Each carries a `source` the app can badge: link / live / none.
+    const sec = providers.securityInfo(airport);
+    const map = providers.terminalMap(airport);
     const airportLinks = airport ? {
-      map: `https://www.google.com/maps/search/?api=1&query=${encodeURIComponent(airport + " airport terminal map")}`,
-      security: "https://www.tsa.gov/mobile",   // MyTSA — official wait-time source
-      security_note: "No live feed exists; check MyTSA for current waits.",
+      map: map.link,
+      security: sec.link,
+      security_note: sec.note,
+      sources: { map: map.source, security: sec.source },
     } : null;
 
     res.json({
