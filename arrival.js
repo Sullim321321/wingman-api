@@ -94,4 +94,29 @@ function pickActiveFlight(flights, nowMs = Date.now()) {
   return list.find((f) => isArrivalActive(f, nowMs)) || null;
 }
 
-module.exports = { plan, isArrivalActive, pickActiveFlight, ACTIVE };
+// ── Operator timing (Roadmap v4, C1) — pure bits pulled out of the poll loops ──
+
+// O2 · the re-timed arrival after a delay. A slipped departure moves the landing, which
+// moves the door time and the car. Returns a NEW iso string when the landing shifted by
+// more than 5 minutes (worth re-pushing the leave-by); null when it didn't move enough or
+// we can't tell. Prefers the live estimate; falls back to the old arrival + the delay.
+function retimedArrival(currentArrivesAt, live = {}) {
+  const cur = ms(currentArrivesAt);
+  if (cur == null) return null;
+  let next = live.estimatedArrival ? ms(live.estimatedArrival) : null;
+  if (next == null && live.delayMinutes) next = cur + Math.round(live.delayMinutes) * MIN;
+  if (next == null || Number.isNaN(next)) return null;
+  if (Math.abs(next - cur) <= 5 * MIN) return null;      // not worth a re-push
+  return new Date(next).toISOString();
+}
+
+// The "leave {airport} by …" nudge fires only when the door time is imminent — within the
+// next 90 minutes and not more than 15 past. One window here so the poll and its tests
+// can't disagree about "imminent".
+const NUDGE = { leadMs: 90 * MIN, graceMs: 15 * MIN };
+function shouldNudgeLeaveBy(leaveByMs, nowMs = Date.now()) {
+  if (leaveByMs == null || Number.isNaN(leaveByMs)) return false;
+  return (leaveByMs - nowMs) <= NUDGE.leadMs && (nowMs - leaveByMs) <= NUDGE.graceMs;
+}
+
+module.exports = { plan, isArrivalActive, pickActiveFlight, ACTIVE, retimedArrival, shouldNudgeLeaveBy, NUDGE };

@@ -1,6 +1,6 @@
 // test-arrival.js — the arrival plan judges honestly, or says it can't.
 const assert = require("assert");
-const { plan, isArrivalActive, pickActiveFlight } = require("./arrival");
+const { plan, isArrivalActive, pickActiveFlight, retimedArrival, shouldNudgeLeaveBy } = require("./arrival");
 
 let pass = 0, fail = 0;
 const g = "\x1b[32m", r = "\x1b[31m", d = "\x1b[2m", x = "\x1b[0m";
@@ -75,6 +75,29 @@ t("pickActiveFlight: prefers the in-air leg over a later boarding one", () => {
 t("pickActiveFlight: returns null when nothing is active (all far out)", () => {
   assert.strictEqual(pickActiveFlight([fl(15*H, 18*H), fl(40*H, 43*H)], NOW), null);
 });
+
+// ── O2 re-time (delay shifts the landing → re-push the leave-by) ──
+const arrIso = "2026-07-28T15:00:00Z";
+t("O2: live estimate wins → returns the new arrival", () => {
+  assert.strictEqual(retimedArrival(arrIso, { estimatedArrival: "2026-07-28T15:40:00Z" }), "2026-07-28T15:40:00.000Z");
+});
+t("O2: no estimate, use delay minutes → old arrival + delay", () => {
+  assert.strictEqual(retimedArrival(arrIso, { delayMinutes: 50 }), "2026-07-28T15:50:00.000Z");
+});
+t("O2: shift ≤5 min → null (not worth re-pushing)", () => {
+  assert.strictEqual(retimedArrival(arrIso, { delayMinutes: 4 }), null);
+});
+t("O2: nothing to go on → null", () => {
+  assert.strictEqual(retimedArrival(arrIso, {}), null);
+  assert.strictEqual(retimedArrival(null, { delayMinutes: 60 }), null);
+});
+
+// ── leave-by nudge window (imminent = within next 90m, ≤15m past) ──
+t("nudge: door time 60 min out → yes", () => assert.strictEqual(shouldNudgeLeaveBy(NOW + 60*60000, NOW), true));
+t("nudge: door time 10 min past → yes (grace)", () => assert.strictEqual(shouldNudgeLeaveBy(NOW - 10*60000, NOW), true));
+t("nudge: door time 2h out → no (too early)", () => assert.strictEqual(shouldNudgeLeaveBy(NOW + 120*60000, NOW), false));
+t("nudge: door time 30 min past → no (missed)", () => assert.strictEqual(shouldNudgeLeaveBy(NOW - 30*60000, NOW), false));
+t("nudge: null → no", () => assert.strictEqual(shouldNudgeLeaveBy(null, NOW), false));
 
 console.log(`\n${d}──────────────────────────────────────────────────────────${x}`);
 console.log(`${fail === 0 ? g + "all " + pass + " held" : r + fail + " FAILED, " + pass + " held"}${x}\n`);

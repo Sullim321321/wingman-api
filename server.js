@@ -9102,15 +9102,11 @@ async function pollDisruptions() {
         // delay), then clear the arrival_plan dedup so the next pollArrivals() recomputes
         // and re-pushes the updated "leave {airport} by …" against the new landing.
         try {
-          let newArr = live.estimatedArrival ? new Date(live.estimatedArrival) : null;
-          if ((!newArr || isNaN(newArr)) && delayMins && leg.arrives_at) {
-            newArr = new Date(new Date(leg.arrives_at).getTime() + delayMins * 60000);
-          }
-          if (newArr && !isNaN(newArr) && leg.arrives_at &&
-              Math.abs(newArr.getTime() - new Date(leg.arrives_at).getTime()) > 5 * 60000) {
-            await sql`UPDATE trip_legs SET arrives_at = ${newArr.toISOString()} WHERE id = ${leg.id}`;
+          const reArr = arrival.retimedArrival(leg.arrives_at, { estimatedArrival: live.estimatedArrival, delayMinutes: delayMins });
+          if (reArr) {
+            await sql`UPDATE trip_legs SET arrives_at = ${reArr} WHERE id = ${leg.id}`;
             await sql`DELETE FROM activity_events WHERE leg_id = ${leg.id} AND type = 'arrival_plan' AND created_at > NOW() - INTERVAL '6 hours'`;
-            console.log(`[O2] ${ident} arrival → ${newArr.toISOString()}; leave-by will re-run`);
+            console.log(`[O2] ${ident} arrival → ${reArr}; leave-by will re-run`);
           }
         } catch (e) { console.error("[O2]", e.message); }
       } else if (newStatus === "On Time" && ["Delayed", "Watching"].includes(prevStatus)) {
@@ -9664,8 +9660,9 @@ async function pollArrivals() {
       const plan = arrival.plan(leg.arrives_at, meeting, travelMin);
       if (!plan.leave_airport_by) continue;
       const leaveMs = Date.parse(plan.leave_airport_by);
-      // Nudge only when the door time is imminent (next 90 min) and not long past.
-      if (leaveMs - nowMs > 90 * 60000 || nowMs - leaveMs > 15 * 60000) continue;
+      // Nudge only when the door time is imminent — the window lives in arrival.js so this
+      // and its tests can't disagree about what "imminent" means.
+      if (!arrival.shouldNudgeLeaveBy(leaveMs, nowMs)) continue;
       // Once per leg per 6h.
       const dupe = await sql`SELECT 1 FROM activity_events WHERE leg_id = ${leg.id} AND type = 'arrival_plan' AND created_at > NOW() - INTERVAL '6 hours' LIMIT 1`;
       if (dupe.length) continue;
