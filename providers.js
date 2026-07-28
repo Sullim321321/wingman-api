@@ -63,11 +63,29 @@ async function fetchUberEstimate(pickup, dropoff) {
 }
 
 // ── SECURITY WAIT ───────────────────────────────────────────────────────────────
-// No live feed exists in the registry. We point at MyTSA (the authoritative source)
-// and say so plainly. The drop-in slot activates the moment a feed is connectable.
-function securityInfo(airport) {
+// No live feed exists in the registry, and TSA has no public wait-time API. We point at
+// MyTSA (the authoritative source) and say so plainly.
+//
+// DROP-IN CONTRACT: set SECURITY_WAIT_URL to an endpoint that takes `?airport=XXX` and
+// returns JSON { wait_min: <number>, checkpoint?: <string> }. When it's set and answers,
+// we badge `source:"live"` with a real number; otherwise we fall back to the honest link.
+// Whoever wires a real provider only has to satisfy that four-field contract — no rewrite.
+async function securityInfo(airport) {
   if (!airport) return { source: "none", note: null };
-  // (Slot: if process.env.SECURITY_WAIT_PROVIDER → return { source: "live", wait_min } here.)
+  const url = process.env.SECURITY_WAIT_URL;
+  if (url) {
+    try {
+      const sep = url.includes("?") ? "&" : "?";
+      const r = await fetch(`${url}${sep}airport=${enc(airport)}`, { headers: { Accept: "application/json" } });
+      if (r.ok) {
+        const j = await r.json();
+        if (typeof j.wait_min === "number") {
+          return { source: "live", wait_min: Math.round(j.wait_min), checkpoint: j.checkpoint || null,
+                   link: "https://www.tsa.gov/mobile" };
+        }
+      }
+    } catch (_) { /* fall through to the honest link */ }
+  }
   return {
     source: "link",
     link: "https://www.tsa.gov/mobile",
@@ -76,8 +94,15 @@ function securityInfo(airport) {
 }
 
 // ── TERMINAL MAP ─────────────────────────────────────────────────────────────────
+// DROP-IN CONTRACT: set TERMINAL_MAP_URL to a template containing `{airport}` (e.g. an
+// interactive terminal-map provider). When set, we return that resolved URL as `live`;
+// otherwise a Google-maps search link, as today.
 function terminalMap(airport) {
   if (!airport) return { source: "none", link: null };
+  const tmpl = process.env.TERMINAL_MAP_URL;
+  if (tmpl && tmpl.includes("{airport}")) {
+    return { source: "live", link: tmpl.replace("{airport}", enc(airport)) };
+  }
   return {
     source: "link",
     link: `https://www.google.com/maps/search/?api=1&query=${enc(airport + " airport terminal map")}`,

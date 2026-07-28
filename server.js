@@ -3817,7 +3817,7 @@ app.get("/arrival", async (req, res) => {
     // Airport transit — through the same seam. There is no reliable live security-wait
     // feed, so Wingman points at MyTSA and the terminal map rather than asserting a wait
     // it cannot measure. Each carries a `source` the app can badge: link / live / none.
-    const sec = providers.securityInfo(airport);
+    const sec = await providers.securityInfo(airport);
     const map = providers.terminalMap(airport);
     const airportLinks = airport ? {
       map: map.link,
