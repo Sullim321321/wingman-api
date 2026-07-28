@@ -12373,6 +12373,20 @@ setInterval(async () => {
           const dRows = await sql`SELECT COUNT(*) AS c FROM decisions WHERE user_email = ${user.email} AND status = 'pending'`;
           pendingDecisions = parseInt(dRows[0]?.c || 0);
         } catch {}
+        // D3 · the retention hook a Guardian earns: what it actually HANDLED and PROTECTED
+        // this year — true and specific, from the ledger. Beats "N trips protected · where
+        // headed next?", which is a vanity count dressed as a nudge.
+        let guardianHandled = 0, guardianSaved = 0;
+        try {
+          const gRows = await sql`
+            SELECT COUNT(*) AS c, COALESCE(SUM((metadata->>'value_saved')::numeric), 0) AS saved
+            FROM activity_events
+            WHERE user_email = ${user.email}
+              AND created_at >= date_trunc('year', NOW())
+              AND (metadata->>'value_saved') IS NOT NULL`;
+          guardianHandled = parseInt(gRows[0]?.c || 0);
+          guardianSaved = Math.round(Number(gRows[0]?.saved || 0));
+        } catch {}
         let pushTitle, body;
         if (pendingDecisions > 0) {
           pushTitle = `${pendingDecisions} decision${pendingDecisions !== 1 ? 's' : ''} need you`;
@@ -12391,9 +12405,15 @@ setInterval(async () => {
             pushTitle = `Good morning${user.first_name ? `, ${user.first_name}` : ''} ✈`;
             body = `${next.origin} → ${next.destination} in ${days} days. I'm watching it.`;
           }
+        } else if (guardianHandled > 0) {
+          // Lead with what Wingman actually did — evidence, not a vanity count.
+          pushTitle = `Wingman's been working ✈`;
+          body = guardianSaved > 0
+            ? `This year I've handled ${guardianHandled} change${guardianHandled !== 1 ? 's' : ''} on your trips and protected about $${guardianSaved.toLocaleString()}. Add your next and I'll keep watch.`
+            : `This year I've handled ${guardianHandled} change${guardianHandled !== 1 ? 's' : ''} on your trips. Add your next and I'll keep watch.`;
         } else if (tripCount > 0) {
           pushTitle = `Good morning${user.first_name ? `, ${user.first_name}` : ''} ✈`;
-          body = `${tripCount} trip${tripCount !== 1 ? 's' : ''} protected this year. Where are you headed next?`;
+          body = `${tripCount} trip${tripCount !== 1 ? 's' : ''} on watch this year — I'll reach out the moment something needs you. Where next?`;
         } else {
           pushTitle = `Good morning${user.first_name ? `, ${user.first_name}` : ''} ✈`;
           body = `Add your first trip and Wingman will watch it around the clock — free.`;
