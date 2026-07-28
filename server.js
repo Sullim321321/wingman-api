@@ -14146,7 +14146,7 @@ app.get("/today-events", auth, async (req, res) => {
     endOfDay.setHours(23, 59, 59, 999);
 
     const rows = await sql`
-      SELECT metadata, message
+      SELECT metadata, title, body
       FROM activity_events
       WHERE user_email = ${req.user.email}
         AND type = 'calendar_signal'
@@ -14162,8 +14162,10 @@ app.get("/today-events", auth, async (req, res) => {
       const timeStr = startDate
         ? startDate.toLocaleTimeString("en-GB", { hour: "numeric", minute: "2-digit", hour12: true })
         : null;
+      // `activity_events` stores text in title/body — there is no `message` column, which
+      // is why this query threw on every load. Read the event name from title, then body.
       return {
-        title: r.message?.replace(/^Calendar:\s*/i, "").trim(),
+        title: (r.title || r.body || "").replace(/^Calendar:\s*/i, "").trim(),
         time: timeStr,
         location: meta.location || null,
       };
