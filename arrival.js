@@ -119,4 +119,15 @@ function shouldNudgeLeaveBy(leaveByMs, nowMs = Date.now()) {
   return (leaveByMs - nowMs) <= NUDGE.leadMs && (nowMs - leaveByMs) <= NUDGE.graceMs;
 }
 
-module.exports = { plan, isArrivalActive, pickActiveFlight, ACTIVE, retimedArrival, shouldNudgeLeaveBy, NUDGE };
+// O4 · the check-in nudge gate. The trigger is ARRIVAL, not the clock: on a trip with
+// flights, wait until the inbound has landed (don't nudge check-in mid-flight); on a
+// drive/other trip with no flight to key off, fire when check-in is imminent — within 4h
+// before, up to 6h after. Pure so the poll loop and its tests share one definition.
+const CHECKIN = { leadMs: 4 * 3600000, graceMs: 6 * 3600000 };
+function shouldNudgeCheckin({ hasFlights, inboundLanded, checkInMs, nowMs = Date.now() } = {}) {
+  if (hasFlights) return !!inboundLanded;
+  if (checkInMs == null || Number.isNaN(checkInMs)) return false;
+  return (checkInMs - nowMs) <= CHECKIN.leadMs && (nowMs - checkInMs) <= CHECKIN.graceMs;
+}
+
+module.exports = { plan, isArrivalActive, pickActiveFlight, ACTIVE, retimedArrival, shouldNudgeLeaveBy, NUDGE, shouldNudgeCheckin, CHECKIN };

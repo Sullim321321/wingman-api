@@ -1,6 +1,6 @@
 // test-arrival.js — the arrival plan judges honestly, or says it can't.
 const assert = require("assert");
-const { plan, isArrivalActive, pickActiveFlight, retimedArrival, shouldNudgeLeaveBy } = require("./arrival");
+const { plan, isArrivalActive, pickActiveFlight, retimedArrival, shouldNudgeLeaveBy, shouldNudgeCheckin } = require("./arrival");
 
 let pass = 0, fail = 0;
 const g = "\x1b[32m", r = "\x1b[31m", d = "\x1b[2m", x = "\x1b[0m";
@@ -98,6 +98,13 @@ t("nudge: door time 10 min past → yes (grace)", () => assert.strictEqual(shoul
 t("nudge: door time 2h out → no (too early)", () => assert.strictEqual(shouldNudgeLeaveBy(NOW + 120*60000, NOW), false));
 t("nudge: door time 30 min past → no (missed)", () => assert.strictEqual(shouldNudgeLeaveBy(NOW - 30*60000, NOW), false));
 t("nudge: null → no", () => assert.strictEqual(shouldNudgeLeaveBy(null, NOW), false));
+
+// ── O4 check-in nudge gate (trigger is arrival, not the clock) ──
+t("checkin: trip has flights + inbound landed → nudge", () => assert.strictEqual(shouldNudgeCheckin({ hasFlights: true, inboundLanded: true, checkInMs: NOW, nowMs: NOW }), true));
+t("checkin: trip has flights, still in the air → wait", () => assert.strictEqual(shouldNudgeCheckin({ hasFlights: true, inboundLanded: false, checkInMs: NOW, nowMs: NOW }), false));
+t("checkin: drive trip, check-in in 2h → nudge", () => assert.strictEqual(shouldNudgeCheckin({ hasFlights: false, checkInMs: NOW + 2*H, nowMs: NOW }), true));
+t("checkin: drive trip, check-in 8h out → too early", () => assert.strictEqual(shouldNudgeCheckin({ hasFlights: false, checkInMs: NOW + 8*H, nowMs: NOW }), false));
+t("checkin: drive trip, check-in 7h ago → too late", () => assert.strictEqual(shouldNudgeCheckin({ hasFlights: false, checkInMs: NOW - 7*H, nowMs: NOW }), false));
 
 console.log(`\n${d}──────────────────────────────────────────────────────────${x}`);
 console.log(`${fail === 0 ? g + "all " + pass + " held" : r + fail + " FAILED, " + pass + " held"}${x}\n`);

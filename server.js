@@ -6807,7 +6807,10 @@ async function getFlightStatusFlightAware(flightIdent) {
   if (!key) { lastFlightAwareReason = "no_api_key"; return null; }
   try {
     const r = await fetch(`${AEROAPI_BASE}/flights/${encodeURIComponent(flightIdent)}`, {
-      headers: { "x-apikey": key, "Accept": "application/json" }
+      headers: { "x-apikey": key, "Accept": "application/json" },
+      // B4 · bound the wait — this runs inside pollDisruptions, and a hanging flight API
+      // must not stall the whole watcher. Timeout → caught below → honest null.
+      signal: AbortSignal.timeout(8000),
     });
     if (!r.ok) {
       lastFlightAwareReason =
@@ -9699,13 +9702,14 @@ async function pollCheckins() {
       // The trigger is arrival, not the clock: if the trip has flights, wait until the
       // inbound has landed. Drive/other trips fire when check-in is imminent.
       const flightsOnTrip = await sql`SELECT 1 FROM trip_legs WHERE trip_id = ${stay.trip_id} AND type = 'flight' AND COALESCE(state,'') <> 'proposed' LIMIT 1`;
-      if (flightsOnTrip.length) {
+      const hasFlights = flightsOnTrip.length > 0;
+      let inboundLanded = false;
+      if (hasFlights) {
         const landed = await sql`SELECT 1 FROM trip_legs WHERE trip_id = ${stay.trip_id} AND type = 'flight' AND status = 'Landed' AND COALESCE(state,'') <> 'proposed' LIMIT 1`;
-        if (!landed.length) continue; // still in transit — too early to nudge check-in
-      } else {
-        const ciMs = Date.parse(stay.departs_at);
-        if (!ciMs || ciMs - nowMs > 4 * 3600000 || nowMs - ciMs > 6 * 3600000) continue;
+        inboundLanded = landed.length > 0;
       }
+      // The gate lives in arrival.js (pure + tested) — poll and tests can't disagree.
+      if (!arrival.shouldNudgeCheckin({ hasFlights, inboundLanded, checkInMs: Date.parse(stay.departs_at), nowMs })) continue;
       const dupe = await sql`SELECT 1 FROM activity_events WHERE leg_id = ${stay.id} AND type = 'checkin_nudge' AND created_at > NOW() - INTERVAL '12 hours' LIMIT 1`;
       if (dupe.length) continue;
       const hotel = stay.carrier || stay.destination || "your hotel";
