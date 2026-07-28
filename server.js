@@ -2653,6 +2653,7 @@ const { proposeItinerary } = require("./itinerary");
 const hygiene = require("./hygiene");
 const provenance = require("./provenance");
 const arrival = require("./arrival");
+const briefguard = require("./briefguard"); // C2 · shared "may this leg be briefed?" invariant
 const providers = require("./providers"); // Epic 4 · real-feed seam (ride/security/transit)
 const reconcile = require("./reconcile");
 const autonomy = require("./autonomy");
@@ -11065,7 +11066,7 @@ async function runPreDepartureCron() {
     for (const w of windows) {
       const legs = await sql`
         SELECT tl.id, tl.origin, tl.destination, tl.carrier, tl.flight_number, tl.departs_at,
-               t.user_email, t.id as trip_id
+               tl.type, tl.status, t.user_email, t.id as trip_id
         FROM trip_legs tl JOIN trips t ON t.id = tl.trip_id
         WHERE tl.type = 'flight'
           AND tl.departs_at >= ${w.from}::timestamptz
@@ -11078,6 +11079,10 @@ async function runPreDepartureCron() {
       `;
       for (const leg of legs) {
         try {
+          // C2 · shared invariant (mirrors the SQL WHERE above): a routeless or
+          // time-corrupt leg must never generate a "null → null" briefing. The SQL
+          // filters it and so does this — same predicate, tested in test-briefguard.
+          if (!briefguard.isBriefableLeg(leg)) continue;
           const already = await sql`SELECT id FROM departure_push_log WHERE user_email = ${leg.user_email} AND leg_id = ${leg.id} AND push_type = ${w.type}`;
           if (already.length > 0) continue;
           const route = `${leg.origin} → ${leg.destination}`;
