@@ -8534,6 +8534,40 @@ app.get("/health", (_req, res) => {
   res.json({ ok: true, ts: now, version: "2.19.0", pollersHealthy, pollers });
 });
 
+// D1 · Activation funnel (Roadmap v4). The "aha" for a Guardian product is the moment
+// Wingman CATCHES something for you — the first disruption decision it surfaces. This is
+// computed from data we already keep (no new event pipeline), so it works retroactively
+// and means something the day there's more than one account. Read-only; admin-gated when
+// ADMIN_EMAILS is set, otherwise any authed user (single-tenant dev).
+app.get("/metrics/activation", async (req, res) => {
+  const email = await verifyAccessToken(req);
+  if (!email) return res.status(401).json({ error: "unauthorized" });
+  const admins = (process.env.ADMIN_EMAILS || "").split(",").map((s) => s.trim().toLowerCase()).filter(Boolean);
+  if (admins.length && !admins.includes(email.toLowerCase())) return res.status(403).json({ error: "forbidden" });
+  try {
+    const n = async (q) => (await q)[0]?.n ?? 0;
+    const signed_up          = await n(sql`SELECT COUNT(*)::int n FROM users`);
+    const with_trip          = await n(sql`SELECT COUNT(DISTINCT user_email)::int n FROM trips`);
+    const connected_calendar = await n(sql`SELECT COUNT(DISTINCT user_email)::int n FROM activity_events WHERE type = 'calendar_signal'`);
+    const watchable          = await n(sql`SELECT COUNT(DISTINCT t.user_email)::int n FROM trip_legs tl JOIN trips t ON t.id = tl.trip_id WHERE tl.type = 'flight' AND COALESCE(tl.state,'') <> 'proposed'`);
+    const aha_caught         = await n(sql`SELECT COUNT(DISTINCT user_email)::int n FROM decisions`);
+    const actioned           = await n(sql`SELECT COUNT(DISTINCT user_email)::int n FROM decisions WHERE status <> 'pending'`);
+    const pct = (a, b) => (b ? Math.round((a / b) * 1000) / 10 : 0);
+    const engaged = Math.max(with_trip, connected_calendar);
+    res.json({
+      aha: "first disruption decision surfaced — Wingman caught something for you",
+      funnel: {
+        signed_up,
+        engaged:          { count: engaged, with_trip, connected_calendar, pct_of_signups: pct(engaged, signed_up) },
+        watchable_flight: { count: watchable, pct_of_signups: pct(watchable, signed_up) },
+        aha_caught:       { count: aha_caught, pct_of_watchable: pct(aha_caught, watchable) },
+        actioned:         { count: actioned, pct_of_caught: pct(actioned, aha_caught) },
+      },
+      generated_at: new Date().toISOString(),
+    });
+  } catch (e) { console.error("[metrics/activation]", e.message); res.status(500).json({ error: e.message }); }
+});
+
 // GET /env-status — internal diagnostic (auth required, non-sensitive)
 // Shows which optional API integrations are configured without exposing key values
 app.get("/env-status", auth, (_req, res) => {
