@@ -1401,6 +1401,10 @@ app.get("/activity", async (req, res) => {
         -- Home as three identical lines — the assistant reporting on its own filing.
         -- A signal is something that changed in the WORLD and might need you.
         AND ae.type NOT IN ('sketch_expired', 'import', 'scan', 'cleanup', 'retitle')
+        -- Defensive: never surface a malformed "null → null" row. The source is now
+        -- guarded, but this hides any already written before the fix.
+        AND ae.title NOT LIKE '%null → null%'
+        AND COALESCE(ae.body, '') NOT LIKE '%null → null%'
       ORDER BY ae.created_at DESC
       LIMIT ${limit}
     `;
@@ -3774,9 +3778,23 @@ app.get("/arrival", async (req, res) => {
         AND tl.arrives_at IS NOT NULL AND tl.state IS DISTINCT FROM 'expired'
         AND tl.arrives_at > NOW() - INTERVAL '2 hours'
       ORDER BY tl.departs_at ASC NULLS LAST LIMIT 6`;
-    const inAir = flights.find((f) => new Date(f.departs_at).getTime() <= now && now <= new Date(f.arrives_at).getTime());
-    const flight = inAir || flights[0];
-    if (!flight) return res.json({ active: false });
+    // The arrival surface is a DAY-OF surface — it must not light up for a flight that's
+    // 15 hours out. Active only when the flight is genuinely happening: in the air, just
+    // landed, or inside the head-to-the-airport window. A malformed leg (arrives before
+    // it departs) is never active — that's the "Land 1:34 before Depart 3:40" bug.
+    const active = flights.find((f) => {
+      const dep = f.departs_at ? new Date(f.departs_at).getTime() : null;
+      const arr = new Date(f.arrives_at).getTime();
+      if (dep != null && arr <= dep) return false;                   // malformed leg — ignore
+      if (dep != null && dep <= now && now <= arr) return true;      // in the air
+      if (arr < now && now - arr <= 2 * 3600000) return true;        // landed within 2h
+      if (dep != null && dep > now && dep - now <= 4 * 3600000) return true; // heading to airport
+      return false;
+    });
+    if (!active) return res.json({ active: false });
+    const flight = active;
+    const inAir = flight.departs_at &&
+      new Date(flight.departs_at).getTime() <= now && now <= new Date(flight.arrives_at).getTime();
 
     const airport = String(flight.destination || "").toUpperCase().replace(/[^A-Z]/g, "").slice(0, 3);
     const coords = AIRPORT_COORDS[airport] || null;
@@ -3787,8 +3805,13 @@ app.get("/arrival", async (req, res) => {
     try {
       const { connected, events } = await readCommitments(email, 3);
       calendarConnected = !!connected;
+      // A flight is not a meeting. The calendar carries the departure leg as an event, and
+      // without this guard the "next meeting" becomes the flight itself — "Order a car to
+      // Flight to Chicago (B6 405)". Exclude anything that reads as travel.
+      const isTravelEvent = (e) => /\bflight\b|→|->/i.test(`${e.title || e.summary || ""}`);
       const cand = (events || [])
         .filter((e) => e.nature === "in_person" || e.nature === "ambiguous")
+        .filter((e) => !isTravelEvent(e))
         .filter((e) => new Date(e.start).getTime() > new Date(arrivesAt).getTime())
         .sort((a, b) => new Date(a.start) - new Date(b.start));
       if (cand[0]) meeting = { start: cand[0].start, title: cand[0].title || cand[0].summary || "your meeting", venue: cand[0].place || cand[0].location || null };
@@ -4552,6 +4575,15 @@ async function getPlacesGrounding(userMessage, location) {
   }
 }
 
+// OpenWeather returns raw phrases like "heavy intensity rain" / "light intensity shower
+// rain". Drop the "intensity" filler and sentence-case it → "Heavy rain". One helper,
+// used at every place we surface a description, so the UI never shows the raw API string.
+function cleanWeatherDesc(s) {
+  if (!s) return s;
+  const t = String(s).replace(/\bintensity\b/gi, " ").replace(/\s+/g, " ").trim();
+  return t ? t.charAt(0).toUpperCase() + t.slice(1) : t;
+}
+
 // ── OpenWeatherMap — live current weather for user's location ─────────────────────────────────────────────────────
 async function getLiveWeather(location) {
   const apiKey = process.env.OPENWEATHER_API_KEY;
@@ -4565,7 +4597,7 @@ async function getLiveWeather(location) {
     const d = await resp.json();
     const temp = Math.round(d.main?.temp);
     const feels = Math.round(d.main?.feels_like);
-    const desc = d.weather?.[0]?.description || 'clear';
+    const desc = cleanWeatherDesc(d.weather?.[0]?.description) || 'Clear';
     const humidity = d.main?.humidity;
     const windKph = d.wind?.speed ? Math.round(d.wind.speed * 3.6) : null;
     // OWM d.name returns sub-neighbourhoods for dense cities (e.g. "Hammersmith" not "London").
@@ -9599,8 +9631,9 @@ async function pollArrivals() {
       let meeting = null;
       try {
         const { events } = await readCommitments(leg.user_email, 2);
+        const isTravelEvent = (e) => /\bflight\b|→|->/i.test(`${e.title || e.summary || ""}`);
         const cand = (events || [])
-          .filter((e) => (e.nature === "in_person" || e.nature === "ambiguous") && new Date(e.start).getTime() > new Date(leg.arrives_at).getTime())
+          .filter((e) => (e.nature === "in_person" || e.nature === "ambiguous") && !isTravelEvent(e) && new Date(e.start).getTime() > new Date(leg.arrives_at).getTime())
           .sort((a, b) => new Date(a.start) - new Date(b.start));
         if (cand[0]) meeting = { start: cand[0].start, title: cand[0].title || cand[0].summary || "your meeting", venue: cand[0].place || cand[0].location || null };
       } catch { continue; }
@@ -10957,6 +10990,10 @@ async function runPreDepartureCron() {
           AND tl.departs_at >= ${w.from}::timestamptz
           AND tl.departs_at <= ${w.to}::timestamptz
           AND tl.status NOT IN ('cancelled','landed')
+          -- A leg with no route is malformed; it must never generate a "null → null"
+          -- briefing. No origin+destination, no briefing.
+          AND tl.origin IS NOT NULL AND tl.origin <> ''
+          AND tl.destination IS NOT NULL AND tl.destination <> ''
       `;
       for (const leg of legs) {
         try {
@@ -13567,7 +13604,7 @@ app.get("/me/home-state", async (req, res) => {
             weatherData = {
               temp: Math.round(wd.main?.temp),
               feels_like: Math.round(wd.main?.feels_like),
-              description: wd.weather?.[0]?.description,
+              description: cleanWeatherDesc(wd.weather?.[0]?.description),
               icon: wd.weather?.[0]?.main,
               city: wd.name,
             };
