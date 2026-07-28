@@ -3778,21 +3778,12 @@ app.get("/arrival", async (req, res) => {
         AND tl.arrives_at IS NOT NULL AND tl.state IS DISTINCT FROM 'expired'
         AND tl.arrives_at > NOW() - INTERVAL '2 hours'
       ORDER BY tl.departs_at ASC NULLS LAST LIMIT 6`;
-    // The arrival surface is a DAY-OF surface — it must not light up for a flight that's
-    // 15 hours out. Active only when the flight is genuinely happening: in the air, just
-    // landed, or inside the head-to-the-airport window. A malformed leg (arrives before
-    // it departs) is never active — that's the "Land 1:34 before Depart 3:40" bug.
-    const active = flights.find((f) => {
-      const dep = f.departs_at ? new Date(f.departs_at).getTime() : null;
-      const arr = new Date(f.arrives_at).getTime();
-      if (dep != null && arr <= dep) return false;                   // malformed leg — ignore
-      if (dep != null && dep <= now && now <= arr) return true;      // in the air
-      if (arr < now && now - arr <= 2 * 3600000) return true;        // landed within 2h
-      if (dep != null && dep > now && dep - now <= 4 * 3600000) return true; // heading to airport
-      return false;
-    });
-    if (!active) return res.json({ active: false });
-    const flight = active;
+    // The arrival surface is a DAY-OF surface — it must not light up for a flight 15h out.
+    // The active-window judgement now lives in arrival.js (pure + unit-tested), so this
+    // endpoint and the tests can't drift apart. A malformed leg (arrives before it departs)
+    // is never active — that was the "Land 1:34 before Depart 3:40" bug.
+    const flight = arrival.pickActiveFlight(flights, now);
+    if (!flight) return res.json({ active: false });
     const inAir = flight.departs_at &&
       new Date(flight.departs_at).getTime() <= now && now <= new Date(flight.arrives_at).getTime();
 
@@ -8510,7 +8501,35 @@ app.post("/auth/refresh", authLimiter, async (req, res) => {
   }
 });
 
-app.get("/health", (_req, res) => res.json({ ok: true, ts: Date.now(), version: "2.18.0" }));
+// B3 · Poll heartbeats. A background watcher that silently dies looks exactly like a
+// calm world — no disruptions, no nudges, nothing wrong. That's the failure that hid for
+// months. So each loop stamps its last run here, and /health reports a stalled poller
+// instead of a reassuring 200. `stale` = hasn't run in 2.5× its interval (one missed
+// cycle plus slack).
+const POLL_INTERVALS = { disruptions: 15 * 60000, arrivals: 10 * 60000, checkins: 10 * 60000 };
+const pollHealth = {};
+function beat(name, error) {
+  const h = pollHealth[name] || (pollHealth[name] = { runs: 0, errors: 0 });
+  h.lastRun = Date.now();
+  h.runs++;
+  if (error) { h.errors++; h.lastError = String(error && error.message || error); h.lastErrorAt = Date.now(); }
+  else { h.lastOk = Date.now(); }
+}
+
+app.get("/health", (_req, res) => {
+  const now = Date.now();
+  const pollers = {};
+  let pollersHealthy = true;
+  for (const [name, iv] of Object.entries(POLL_INTERVALS)) {
+    const h = pollHealth[name];
+    const stale = !h || !h.lastRun || (now - h.lastRun) > iv * 2.5;
+    if (stale) pollersHealthy = false;
+    pollers[name] = h
+      ? { runs: h.runs, errors: h.errors, ageMs: now - h.lastRun, lastError: h.lastError || null, stale }
+      : { neverRan: true, stale: true };
+  }
+  res.json({ ok: true, ts: now, version: "2.19.0", pollersHealthy, pollers });
+});
 
 // GET /env-status — internal diagnostic (auth required, non-sensitive)
 // Shows which optional API integrations are configured without exposing key values
@@ -9186,8 +9205,10 @@ async function pollDisruptions() {
     // Run once per poll for upcoming legs (not just on status change)
     await checkSeatPreferenceAlerts(legs);
     console.log("[poll] done");
+    beat("disruptions");
   } catch (e) {
     console.error("[poll] error:", e.message);
+    beat("disruptions", e);
   }
 }
 
@@ -9657,8 +9678,10 @@ async function pollArrivals() {
       console.log(`[arrival] nudged ${leg.user_email} — leave ${airport} by ${leaveClock}`);
     }
     console.log("[arrival] done");
+    beat("arrivals");
   } catch (e) {
     console.error("[arrival] error:", e.message);
+    beat("arrivals", e);
   }
 }
 
@@ -9699,8 +9722,10 @@ async function pollCheckins() {
       console.log(`[checkin] nudged ${stay.user_email} — ${hotel}`);
     }
     console.log("[checkin] done");
+    beat("checkins");
   } catch (e) {
     console.error("[checkin] error:", e.message);
+    beat("checkins", e);
   }
 }
 

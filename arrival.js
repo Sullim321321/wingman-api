@@ -60,4 +60,38 @@ function plan(arrival, meeting, travelMin, opts = {}) {
   return out;
 }
 
-module.exports = { plan };
+// ── The active window (Roadmap v4, C) ────────────────────────────────────────
+// The arrival surface must not light up for a flight 15 hours out — the exact bug that
+// shipped. A flight is "active" only when it's genuinely happening: in the air, just
+// landed, or inside the head-to-the-airport window. A malformed leg (arrives before it
+// departs) is never active. Pure so the gate is unit-tested, not eyeballed on a device.
+const ACTIVE = {
+  boardingMs:   4 * 3600000,  // heading to the airport
+  justLandedMs: 2 * 3600000,  // arrived recently
+};
+
+function isArrivalActive(flight, nowMs = Date.now()) {
+  if (!flight) return false;
+  const dep = flight.departs_at ? ms(flight.departs_at) : null;
+  const arr = ms(flight.arrives_at);
+  if (arr == null) return false;                         // no landing → nothing to plan
+  if (dep != null && arr <= dep) return false;           // malformed leg — never active
+  if (dep != null && dep <= nowMs && nowMs <= arr) return true;         // in the air
+  if (arr < nowMs && nowMs - arr <= ACTIVE.justLandedMs) return true;   // landed <2h ago
+  if (dep != null && dep > nowMs && dep - nowMs <= ACTIVE.boardingMs) return true; // boarding
+  return false;
+}
+
+// From a set of flights (ordered soonest-departure first), the one to surface — the
+// in-air leg if any, else the first that's active. Null when none qualify.
+function pickActiveFlight(flights, nowMs = Date.now()) {
+  const list = Array.isArray(flights) ? flights : [];
+  const inAir = list.find((f) => {
+    const dep = f.departs_at ? ms(f.departs_at) : null, arr = ms(f.arrives_at);
+    return dep != null && arr != null && arr > dep && dep <= nowMs && nowMs <= arr;
+  });
+  if (inAir) return inAir;
+  return list.find((f) => isArrivalActive(f, nowMs)) || null;
+}
+
+module.exports = { plan, isArrivalActive, pickActiveFlight, ACTIVE };

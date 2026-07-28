@@ -1,6 +1,6 @@
 // test-arrival.js — the arrival plan judges honestly, or says it can't.
 const assert = require("assert");
-const { plan } = require("./arrival");
+const { plan, isArrivalActive, pickActiveFlight } = require("./arrival");
 
 let pass = 0, fail = 0;
 const g = "\x1b[32m", r = "\x1b[31m", d = "\x1b[2m", x = "\x1b[0m";
@@ -53,6 +53,27 @@ t("no arrival → unknown, nothing derived", () => {
   const p = plan(null, meetSoon, 30);
   assert.strictEqual(p.verdict, "unknown");
   assert.strictEqual(p.ready_to_leave_at, null);
+});
+
+// ── active window (Roadmap v4, C) — the gate that stops the 15h-early card ──
+const NOW = Date.parse("2026-07-28T12:00:00Z"), H = 3600000;
+const fl = (depOff, arrOff) => ({ type: "flight",
+  departs_at: new Date(NOW + depOff).toISOString(),
+  arrives_at: arrOff == null ? null : new Date(NOW + arrOff).toISOString() });
+
+t("active: in the air (departed, not yet landed)", () => assert.strictEqual(isArrivalActive(fl(-1*H, 2*H), NOW), true));
+t("active: landed 90 min ago (<2h)", () => assert.strictEqual(isArrivalActive(fl(-4*H, -1.5*H), NOW), true));
+t("active: boarding window, departs in 3h (<4h)", () => assert.strictEqual(isArrivalActive(fl(3*H, 6*H), NOW), true));
+t("NOT active: departs in 15h — the exact bug", () => assert.strictEqual(isArrivalActive(fl(15*H, 18*H), NOW), false));
+t("NOT active: landed 5h ago (>2h)", () => assert.strictEqual(isArrivalActive(fl(-8*H, -5*H), NOW), false));
+t("NOT active: malformed leg (arrives before it departs)", () => assert.strictEqual(isArrivalActive(fl(5*H, 2*H), NOW), false));
+t("NOT active: no arrival time", () => assert.strictEqual(isArrivalActive(fl(2*H, null), NOW), false));
+t("pickActiveFlight: prefers the in-air leg over a later boarding one", () => {
+  const picked = pickActiveFlight([fl(-1*H, 2*H), fl(3*H, 6*H)], NOW);
+  assert.strictEqual(picked.departs_at, new Date(NOW - 1*H).toISOString());
+});
+t("pickActiveFlight: returns null when nothing is active (all far out)", () => {
+  assert.strictEqual(pickActiveFlight([fl(15*H, 18*H), fl(40*H, 43*H)], NOW), null);
 });
 
 console.log(`\n${d}──────────────────────────────────────────────────────────${x}`);
