@@ -8568,6 +8568,27 @@ app.get("/metrics/activation", async (req, res) => {
   } catch (e) { console.error("[metrics/activation]", e.message); res.status(500).json({ error: e.message }); }
 });
 
+// E4 · Per-trip expense metadata (purpose + project/cost code) for reimbursement exports.
+// Stored in trips.metadata.expense so the CSV/PDF can carry the fields finance needs.
+app.get("/trips/:id/expense-meta", auth, async (req, res) => {
+  try {
+    const [t] = await sql`SELECT metadata FROM trips WHERE id = ${req.params.id} AND user_email = ${req.user.email}`;
+    if (!t) return res.status(404).json({ error: "not_found" });
+    res.json({ expense: (t.metadata && t.metadata.expense) || { purpose: null, project_code: null } });
+  } catch (e) { console.error("[expense-meta:get]", e.message); res.status(500).json({ error: e.message }); }
+});
+app.patch("/trips/:id/expense-meta", auth, async (req, res) => {
+  try {
+    const purpose = req.body?.purpose != null ? String(req.body.purpose).slice(0, 200) : null;
+    const project_code = req.body?.project_code != null ? String(req.body.project_code).slice(0, 80) : null;
+    const [t] = await sql`SELECT metadata FROM trips WHERE id = ${req.params.id} AND user_email = ${req.user.email}`;
+    if (!t) return res.status(404).json({ error: "not_found" });
+    const meta = { ...(t.metadata || {}), expense: { purpose, project_code } };
+    await sql`UPDATE trips SET metadata = ${JSON.stringify(meta)}::jsonb, updated_at = NOW() WHERE id = ${req.params.id} AND user_email = ${req.user.email}`;
+    res.json({ ok: true, expense: meta.expense });
+  } catch (e) { console.error("[expense-meta:patch]", e.message); res.status(500).json({ error: e.message }); }
+});
+
 // GET /env-status — internal diagnostic (auth required, non-sensitive)
 // Shows which optional API integrations are configured without exposing key values
 app.get("/env-status", auth, (_req, res) => {
