@@ -705,6 +705,17 @@ Every turn must ADVANCE the trip. After you record, do at least one of:
   · ASK THE ONE QUESTION THAT UNBLOCKS THE MOST. Not four questions. The one whose answer
     settles the most other things.
 
+YOU ALREADY KNOW WHERE SHE IS. The context block tells you her current city and her home
+base. NEVER ask "where's here", her home airport, or what city she's starting from — you
+have them, and asking makes you look like you weren't listening. Read them and use them.
+
+PROPOSE, DON'T INTERROGATE. When the ask is open-ended — "surprise me", "somewhere warm",
+"a weekend away" — do NOT reply with a list of questions. Lead with TWO OR THREE concrete
+options that fit what you already know: her city, her home base, the season, her taste, a
+free weekend on her calendar. Each gets a one-line why. THEN, only if you truly still need
+it, ask the single most important question. A private travel office opens with "here's what
+I'd do," never with a form.
+
 You are a chief of staff, not a stenographer. If your reply could be replaced by a
 checkmark, you have failed the turn.
 
@@ -716,7 +727,7 @@ itself, and you must never state a fare, a flight number, or a confirmation — 
 have them. Name what the tap will START, in their words. If they're only asking a question
 or still deciding, do NOT call "act" — advise first. One action per turn, the obvious one.`;
 
-async function converse({ message, known = [], history = [], findings = null, now = null, timezone = null }) {
+async function converse({ message, known = [], history = [], findings = null, now = null, timezone = null, place = null }) {
   const gaps = coverage(known);
   const knownList = known.length
     ? known.map((c) => `- [${c.hardness}${c.scope ? "/@" + c.scope : ""}] ${c.rationale}`).join("\n")
@@ -777,12 +788,22 @@ async function converse({ message, known = [], history = [], findings = null, no
     `- When you record a date constraint, use the ISO date from this table, and state ` +
     `the weekday from this table. If those two disagree, you have made an error.`;
 
+  // WHERE SHE STANDS — so the planner never asks "where's here". Injected after the
+  // cached prefix (it changes per user/turn). Home base + current city come from the app
+  // and the graph; the planner must treat these as known, not questions to ask.
+  const placeCtx = place && (place.city || place.homeBase)
+    ? `\n\n=== WHERE SHE STANDS (already known — never ask for these) ===\n` +
+      [place.city ? `Right now she is in ${place.city}.` : null,
+       place.homeBase ? `Her home base is ${place.homeBase}.` : null].filter(Boolean).join(" ") +
+      `\nWhen she says "here" or "from here", this is what she means.`
+    : "";
+
   const res = await anthropic.messages.create({
     model: MODEL,
     max_tokens: 2000,
     system: [
       { type: "text", text: CONVERSE_SYSTEM + "\n\n" + SYSTEM, cache_control: { type: "ephemeral" } },
-      { type: "text", text: dated },
+      { type: "text", text: dated + placeCtx },
     ],
     // ── Give it a real way to look things up ───────────────────────────────────
     // Research used to be gated by a REGEX I wrote in advance — NEEDS_LOOKUP. Which

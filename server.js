@@ -15669,7 +15669,7 @@ app.post("/plan/message", conciergeLimiter, async (req, res) => {
 
   // `now` and `timezone` come from the PHONE. Render runs in UTC, and a planner that
   // reads its clock from the datacentre will tell you the 16th isn't a Thursday.
-  const { message: raw, tripId, history = [], now = null, timezone = null } = req.body || {};
+  const { message: raw, tripId, history = [], now = null, timezone = null, city = null } = req.body || {};
   if (!raw) return res.status(400).json({ error: "message required" });
   const message = scrubPII(raw);
 
@@ -15693,7 +15693,27 @@ app.post("/plan/message", conciergeLimiter, async (req, res) => {
     // I wrote in advance happens to match. The regex missed "LANY Sept 26 to Oct 17",
     // no search ran, and the model announced it had the tour dates anyway. A filter
     // that decides what needs checking can only ever check what its author imagined.
-    const out = await planner.converse({ message, known, history, now, timezone });
+    // Present context so the planner never asks "where's here". The app sends the city it
+    // already shows on Home; home base comes from the user's saved preferences. Current
+    // city falls back to the most recent non-proposed leg's city when the app didn't send one.
+    let place = null;
+    try {
+      const [u] = await sql`SELECT preferences FROM users WHERE email = ${email}`;
+      const prefs = u?.preferences || {};
+      const homeBase = prefs.home_base || (Array.isArray(prefs.home_bases) && prefs.home_bases[0]) || null;
+      let curCity = city;
+      if (!curCity) {
+        const [lg] = await sql`
+          SELECT destination_city FROM trip_legs tl JOIN trips t ON t.id = tl.trip_id
+          WHERE t.user_email = ${email} AND tl.destination_city IS NOT NULL
+            AND COALESCE(tl.state,'') <> 'proposed'
+          ORDER BY tl.departs_at DESC NULLS LAST LIMIT 1`;
+        curCity = lg?.destination_city || null;
+      }
+      if (curCity || homeBase) place = { city: curCity, homeBase };
+    } catch (e) { console.error("[plan/place]", e.message); }
+
+    const out = await planner.converse({ message, known, history, now, timezone, place });
     const wrote = await planner.commit(sql, {
       user_email: email, trip_id, proposals: out, known,
     });
