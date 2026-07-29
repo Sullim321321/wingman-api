@@ -8626,13 +8626,14 @@ app.get("/metrics/activation", async (req, res) => {
 app.get("/metrics/rail", async (req, res) => {
   const email = await verifyAccessToken(req);
   if (!email) return res.status(401).json({ error: "unauthorized" });
-  const admins = (process.env.ADMIN_EMAILS || "").split(",").map((s) => s.trim().toLowerCase()).filter(Boolean);
-  if (admins.length && !admins.includes(email.toLowerCase())) return res.status(403).json({ error: "forbidden" });
+  // This is the USER's own rail-readiness readout (shown in Settings), not a global
+  // admin metric — scope it to their trips and don't gate it, so it always renders.
   try {
     const legs = await sql`
       SELECT tl.type, tl.carrier, tl.origin, tl.destination, tl.station_from, tl.station_to,
              tl.departs_at, tl.arrives_at
-      FROM trip_legs tl WHERE tl.type = 'train' AND COALESCE(tl.state,'') <> 'proposed'`;
+      FROM trip_legs tl JOIN trips t ON t.id = tl.trip_id
+      WHERE t.user_email = ${email} AND tl.type = 'train' AND COALESCE(tl.state,'') <> 'proposed'`;
     const now = Date.now();
     const upcoming = legs.filter((l) => { const t = Date.parse(l.departs_at); return Number.isFinite(t) && t > now; });
     const watchable = upcoming.filter((l) => transport.isWatchable(l));
