@@ -123,7 +123,90 @@ function displayName(leg = {}) {
   return route || null;
 }
 
+// ─────────────────────────────────────────────────────────────────────────────
+// Which live-status network a rail leg belongs to. This decides who we ask about a
+// delay — and, honestly, whether we can ask at all. UK National Rail has a wired
+// feed (Darwin); Amtrak's slot exists but only answers if a feed is configured.
+// An unrecognised operator returns null: we watch nothing rather than guess.
+// ─────────────────────────────────────────────────────────────────────────────
+const AMTRAK_KEYWORDS = ["amtrak", "acela"];
+const UK_OPERATORS = [
+  "lner", "avanti", "scotrail", "gwr", "great western", "southern", "southeastern",
+  "thameslink", "northern", "transpennine", "crosscountry", "cross country",
+  "greater anglia", "c2c", "chiltern", "east midlands", "merseyrail", "south western",
+  "southwestern", "trainline", "national rail", "elizabeth line", "gatwick express",
+  "grand central", "hull trains", "lumo", "heathrow express", "caledonian sleeper",
+];
+
+function networkOf(leg) {
+  if (modeOf(leg) !== "rail") return null;
+  const hay = `${leg?.carrier || ""} ${leg?.operator || ""}`.toLowerCase();
+  if (AMTRAK_KEYWORDS.some((k) => hay.includes(k))) return "amtrak";
+  if (UK_OPERATORS.some((k) => hay.includes(k))) return "uk_nr";
+  return null;
+}
+
+/**
+ * Turn a live rail-status reading into the message + decision the disruption poll
+ * should act on — the rail sibling of the flight branch, spoken in rail vocab
+ * (platform, station, train). Pure: given the leg, the live reading, and the prior
+ * status, it returns what to say and whether to cascade; it performs nothing.
+ *   returns null when there's nothing to act on (no reading, or unchanged status).
+ *   shape: { newStatus, push:{title,body}|null, activity:{title,body,type},
+ *            cascade:{kind,delayMins}|null, reTimeArrival:bool }
+ */
+function railNarrative(leg, live, prevStatus) {
+  if (!live || !live.status) return null;
+  const newStatus = live.status;
+  const prev = prevStatus || "Scheduled";
+  if (newStatus === prev) return null;
+  const name = displayName(leg) || "Your train";
+  const { from, to } = endpointsOf(leg);
+  const route = from && to ? `${from} → ${to}` : (to || "your route");
+  const plat = live.platform ? ` Platform ${live.platform}.` : "";
+
+  if (newStatus === "Cancelled") {
+    return {
+      newStatus,
+      push: { title: `${name} is cancelled`, body: `${route} cancelled. I'm already looking at alternatives — tap to replan.` },
+      activity: { title: `${name} cancelled`, body: `Your ${route} train was cancelled. Wingman is finding alternatives.`, type: "disruption" },
+      cascade: { kind: "cancelled", delayMins: 0 },
+      reTimeArrival: false,
+    };
+  }
+  if (newStatus === "Delayed") {
+    const dm = Number.isFinite(live.delayMins) ? live.delayMins : null;
+    const ds = dm ? ` by ${dm}m` : "";
+    return {
+      newStatus,
+      push: { title: `${name} is delayed${ds}`, body: `${route} delayed${ds}.${plat}` },
+      activity: { title: `${name} delayed${ds}`, body: `Your ${route} train is delayed${ds}.${plat}`, type: "delay" },
+      cascade: dm && dm >= 60 ? { kind: "delayed", delayMins: dm } : null,
+      reTimeArrival: true,
+    };
+  }
+  if (newStatus === "On Time" && ["Delayed", "Watching"].includes(prev)) {
+    return {
+      newStatus,
+      push: { title: `✅ ${name} back on time`, body: `Your ${route} train is now showing on time.` },
+      activity: { title: `${name} back on time`, body: `Your ${route} train recovered to on-time.`, type: "recovery" },
+      cascade: null,
+      reTimeArrival: false,
+    };
+  }
+  // A reading we don't turn into a push (e.g. "No services", "Unknown"): log only,
+  // never fabricate reassurance.
+  return {
+    newStatus,
+    push: null,
+    activity: { title: `${name} status: ${newStatus}`, body: route, type: "status" },
+    cascade: null,
+    reTimeArrival: false,
+  };
+}
+
 module.exports = {
-  MODE_OF_TYPE, WATCHABLE_MODES, VOCAB,
+  MODE_OF_TYPE, WATCHABLE_MODES, VOCAB, AMTRAK_KEYWORDS, UK_OPERATORS,
   modeOf, isTransportLeg, endpointsOf, hasEndpoints, isWatchable, vocab, displayName,
+  networkOf, railNarrative,
 };

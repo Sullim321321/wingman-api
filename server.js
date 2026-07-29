@@ -2654,6 +2654,11 @@ const hygiene = require("./hygiene");
 const provenance = require("./provenance");
 const arrival = require("./arrival");
 const briefguard = require("./briefguard"); // C2 · shared "may this leg be briefed?" invariant
+const transport = require("./transport"); // rail vertical · mode/vocab/network/narrative
+// RAIL_SPINE · gates the multi-modal (train) watch path. Default OFF: ship dark,
+// flip on (env RAIL_SPINE=1) once the real-data readout at /metrics/rail looks right.
+const RAIL_SPINE = ["1", "true", "yes", "on"].includes(String(process.env.RAIL_SPINE || "").toLowerCase());
+const RAIL_TYPES = RAIL_SPINE ? ["flight", "train"] : ["flight"];
 const providers = require("./providers"); // Epic 4 · real-feed seam (ride/security/transit)
 const reconcile = require("./reconcile");
 const autonomy = require("./autonomy");
@@ -8569,6 +8574,45 @@ app.get("/metrics/activation", async (req, res) => {
   } catch (e) { console.error("[metrics/activation]", e.message); res.status(500).json({ error: e.message }); }
 });
 
+// GET /metrics/rail — the plain-English readout for the rail vertical. Answers the
+// one question that decides whether the train watcher has anything to do: of the
+// train legs we have, how many are watch-ready, and on which networks? Uses the SAME
+// transport helpers the spine uses, so the number here is exactly what will be watched.
+app.get("/metrics/rail", async (req, res) => {
+  const email = await verifyAccessToken(req);
+  if (!email) return res.status(401).json({ error: "unauthorized" });
+  const admins = (process.env.ADMIN_EMAILS || "").split(",").map((s) => s.trim().toLowerCase()).filter(Boolean);
+  if (admins.length && !admins.includes(email.toLowerCase())) return res.status(403).json({ error: "forbidden" });
+  try {
+    const legs = await sql`
+      SELECT tl.type, tl.carrier, tl.origin, tl.destination, tl.station_from, tl.station_to,
+             tl.departs_at, tl.arrives_at
+      FROM trip_legs tl WHERE tl.type = 'train' AND COALESCE(tl.state,'') <> 'proposed'`;
+    const now = Date.now();
+    const upcoming = legs.filter((l) => { const t = Date.parse(l.departs_at); return Number.isFinite(t) && t > now; });
+    const watchable = upcoming.filter((l) => transport.isWatchable(l));
+    const byNetwork = { uk_nr: 0, amtrak: 0, unrecognised: 0 };
+    for (const l of watchable) { const nw = transport.networkOf(l); byNetwork[nw || "unrecognised"]++; }
+    const live = { uk_nr: true, amtrak: !!process.env.AMTRAK_STATUS_URL };
+    const summary =
+      `You have ${legs.length} train leg${legs.length === 1 ? "" : "s"} on file, ${upcoming.length} still upcoming. ` +
+      `${watchable.length} ${watchable.length === 1 ? "is" : "are"} watch-ready ` +
+      `(${byNetwork.uk_nr} UK — live now; ${byNetwork.amtrak} Amtrak — ${live.amtrak ? "live" : "needs a feed"}; ` +
+      `${byNetwork.unrecognised} on networks I can't watch yet). ` +
+      `RAIL_SPINE is ${RAIL_SPINE ? "ON" : "OFF"}.`;
+    res.json({
+      rail_spine_enabled: RAIL_SPINE,
+      train_legs_total: legs.length,
+      upcoming: upcoming.length,
+      watch_ready: watchable.length,
+      by_network: byNetwork,
+      live_feed: live,
+      summary,
+      generated_at: new Date().toISOString(),
+    });
+  } catch (e) { console.error("[metrics/rail]", e.message); res.status(500).json({ error: e.message }); }
+});
+
 // E4 · Per-trip expense metadata (purpose + project/cost code) for reimbursement exports.
 // Stored in trips.metadata.expense so the CSV/PDF can carry the fields finance needs.
 app.get("/trips/:id/expense-meta", auth, async (req, res) => {
@@ -8733,6 +8777,38 @@ async function getTrainStatus(stationFrom, stationTo, departsAt) {
     console.error("[train-status]", e.message);
     return { status: "Unknown", error: e.message };
   }
+}
+
+// railStatus(leg) — the per-network dispatcher behind the Epic F seam. It decides
+// WHO to ask about a train, and answers honestly when the answer is "I can't".
+//   • UK National Rail  → Darwin/Huxley (live, built above)
+//   • Amtrak            → only if AMTRAK_STATUS_URL is configured; otherwise a
+//                         truthful "unknown" — NEVER a fabricated "On Time".
+//   • anything else     → unknown, unwatched.
+// Returns the same shape getTrainStatus does, so railNarrative can consume either.
+async function railStatus(leg) {
+  const network = transport.networkOf(leg);
+  const { from, to } = transport.endpointsOf(leg);
+  if (network === "uk_nr") {
+    return await getTrainStatus(from, to, leg.departs_at);
+  }
+  if (network === "amtrak") {
+    const base = process.env.AMTRAK_STATUS_URL;
+    if (!base) return { status: "Unknown", error: "No live Amtrak feed connected", network };
+    try {
+      const url = `${base}${base.includes("?") ? "&" : "?"}from=${encodeURIComponent(from || "")}&to=${encodeURIComponent(to || "")}&departs_at=${encodeURIComponent(leg.departs_at || "")}`;
+      const r = await fetch(url, { signal: AbortSignal.timeout(8000) });
+      if (!r.ok) return { status: "Unknown", error: `Amtrak feed returned ${r.status}`, network };
+      const data = await r.json();
+      // Trust only an explicit, recognised status; never infer "On Time" from silence.
+      const s = String(data.status || "").toLowerCase();
+      const status = s.includes("cancel") ? "Cancelled" : s.includes("delay") ? "Delayed" : s.includes("on time") ? "On Time" : "Unknown";
+      return { status, delayMins: Number.isFinite(data.delayMins) ? data.delayMins : null, platform: data.platform || null, network };
+    } catch (e) {
+      return { status: "Unknown", error: e.message, network };
+    }
+  }
+  return { status: "Unknown", error: "Unrecognised rail network — not watched", network: null };
 }
 
 // GET /trains/status?from=EDB&to=KGX&departs_at=2026-07-03T09:30:00Z
@@ -9102,26 +9178,51 @@ async function pollDisruptions() {
     const now = new Date();
     const cutoff = new Date(now.getTime() + 48 * 60 * 60 * 1000);
     const legs = await sql`
-      SELECT tl.id, tl.trip_id, tl.carrier, tl.flight_number, tl.origin, tl.destination,
-             tl.departs_at, tl.arrives_at, tl.status as prev_status,
+      SELECT tl.id, tl.trip_id, tl.type, tl.carrier, tl.flight_number, tl.origin, tl.destination,
+             tl.station_from, tl.station_to, tl.departs_at, tl.arrives_at, tl.status as prev_status,
              t.user_email, t.title as trip_title, t.mode as trip_mode
       FROM trip_legs tl
       JOIN trips t ON t.id = tl.trip_id
-      WHERE tl.type = 'flight'
+      WHERE tl.type = ANY(${RAIL_TYPES})
         -- A SUGGESTION IS NOT A FLIGHT. Wingman proposed the Smoky Mountains. The
         -- proposal was stored correctly, with state = proposed, and then every path
         -- that consumes flights ignored that column. So a leg she never agreed to
         -- became TODAY - YOUR FLIGHT, got a 24-hour departure briefing pushed to her
         -- phone, and was watched for delays. The graph knew. Nothing downstream asked.
         AND COALESCE(tl.state,'') <> 'proposed'
-        AND tl.flight_number IS NOT NULL
+        -- Flights need an identifier to look up; trains are keyed by station+time.
+        AND (tl.type <> 'flight' OR tl.flight_number IS NOT NULL)
         AND tl.departs_at IS NOT NULL
         AND tl.departs_at BETWEEN ${now.toISOString()} AND ${cutoff.toISOString()}
         AND tl.status NOT IN ('Cancelled', 'Landed')
     `;
-    console.log(`[poll] checking ${legs.length} upcoming flight legs`);
+    console.log(`[poll] checking ${legs.length} upcoming legs (modes: ${RAIL_TYPES.join("+")})`);
 
     for (const leg of legs) {
+      // ── Rail branch (RAIL_SPINE): watch trains via the network dispatcher, speak
+      // in rail vocab, and route disruptions into the SAME cascade + leave-by re-time.
+      if (leg.type === "train") {
+        if (!transport.isWatchable(leg)) continue; // routeless/time-corrupt → stay silent
+        const rlive = await railStatus(leg);
+        const n = transport.railNarrative(leg, rlive, leg.prev_status || "Scheduled");
+        if (!n) continue; // no reading, or nothing changed
+        console.log(`[poll:rail] ${transport.displayName(leg)}: ${leg.prev_status || "Scheduled"} -> ${n.newStatus}`);
+        await sql`UPDATE trip_legs SET status = ${n.newStatus} WHERE id = ${leg.id}`;
+        if (n.push) await sendPushToUser(leg.user_email, n.push.title, n.push.body, { route: "Concierge", tripId: String(leg.trip_id), legId: String(leg.id) });
+        await logActivity(leg.user_email, n.activity.type, n.activity.title, n.activity.body, leg.trip_id, leg.id);
+        if (n.cascade) triggerCascadeCheck(leg, n.cascade.kind, n.cascade.delayMins).catch((e) => console.error("[cascade:rail]", e.message));
+        if (n.reTimeArrival) {
+          try {
+            const reArr = arrival.retimedArrival(leg.arrives_at, { delayMinutes: Number.isFinite(rlive.delayMins) ? rlive.delayMins : null });
+            if (reArr) {
+              await sql`UPDATE trip_legs SET arrives_at = ${reArr} WHERE id = ${leg.id}`;
+              await sql`DELETE FROM activity_events WHERE leg_id = ${leg.id} AND type = 'arrival_plan' AND created_at > NOW() - INTERVAL '6 hours'`;
+            }
+          } catch (e) { console.error("[O2:rail]", e.message); }
+        }
+        continue;
+      }
+
       const ident = flightid.apiKey(leg);
       const live = await getFlightStatus(ident);
       if (!live || !live.status) continue;
@@ -11060,36 +11161,52 @@ async function runPreDepartureCron() {
   try {
     const now = Date.now();
     const windows = [
-      { type: "24h", from: new Date(now + 23.5 * 3600000).toISOString(), to: new Date(now + 25 * 3600000).toISOString(), title: (r, fl) => `${fl} departs in 24 hours`, body: (r) => `Your Wingman briefing for ${r} is ready — weather, TSA wait times, and lounge access.`, prefill: (r) => `Briefing for my ${r} flight tomorrow` },
-      { type: "3h",  from: new Date(now + 2.75 * 3600000).toISOString(), to: new Date(now + 4 * 3600000).toISOString(), title: (r, fl) => `${fl} — 3 hours to departure`, body: () => `Time to head to the airport. Tap for your live gate, TSA wait, and Uber ETA.`, prefill: (r) => `Live status for my ${r} flight departing in 3 hours` },
+      { type: "24h", from: new Date(now + 23.5 * 3600000).toISOString(), to: new Date(now + 25 * 3600000).toISOString() },
+      { type: "3h",  from: new Date(now + 2.75 * 3600000).toISOString(), to: new Date(now + 4 * 3600000).toISOString() },
     ];
+    // Mode-aware briefing copy — a train's brief talks platform/station, not gate/TSA.
+    const copyFor = (w, mode, route, name) => {
+      const air = {
+        "24h": { title: `${name} departs in 24 hours`, body: `Your Wingman briefing for ${route} is ready — weather, TSA wait times, and lounge access.`, prefill: `Briefing for my ${route} flight tomorrow` },
+        "3h":  { title: `${name} — 3 hours to departure`, body: `Time to head to the airport. Tap for your live gate, TSA wait, and Uber ETA.`, prefill: `Live status for my ${route} flight departing in 3 hours` },
+      };
+      const rail = {
+        "24h": { title: `${name} departs in 24 hours`, body: `Your Wingman briefing for ${route} is ready — platform, timings, and connections.`, prefill: `Briefing for my ${route} train tomorrow` },
+        "3h":  { title: `${name} — 3 hours to departure`, body: `Time to head to the station. Tap for your live platform and timings.`, prefill: `Live status for my ${route} train departing in 3 hours` },
+      };
+      return (mode === "rail" ? rail : air)[w.type];
+    };
     for (const w of windows) {
       const legs = await sql`
-        SELECT tl.id, tl.origin, tl.destination, tl.carrier, tl.flight_number, tl.departs_at,
+        SELECT tl.id, tl.origin, tl.destination, tl.station_from, tl.station_to,
+               tl.carrier, tl.flight_number, tl.departs_at,
                tl.type, tl.status, t.user_email, t.id as trip_id
         FROM trip_legs tl JOIN trips t ON t.id = tl.trip_id
-        WHERE tl.type = 'flight'
+        WHERE tl.type = ANY(${RAIL_TYPES})
           AND tl.departs_at >= ${w.from}::timestamptz
           AND tl.departs_at <= ${w.to}::timestamptz
           AND tl.status NOT IN ('cancelled','landed')
           -- A leg with no route is malformed; it must never generate a "null → null"
-          -- briefing. No origin+destination, no briefing.
-          AND tl.origin IS NOT NULL AND tl.origin <> ''
-          AND tl.destination IS NOT NULL AND tl.destination <> ''
+          -- briefing. Accept either endpoint pair (air origin/dest, rail stations).
+          AND COALESCE(NULLIF(TRIM(tl.origin),''), NULLIF(TRIM(tl.station_from),'')) IS NOT NULL
+          AND COALESCE(NULLIF(TRIM(tl.destination),''), NULLIF(TRIM(tl.station_to),'')) IS NOT NULL
       `;
       for (const leg of legs) {
         try {
-          // C2 · shared invariant (mirrors the SQL WHERE above): a routeless or
-          // time-corrupt leg must never generate a "null → null" briefing. The SQL
-          // filters it and so does this — same predicate, tested in test-briefguard.
-          if (!briefguard.isBriefableLeg(leg)) continue;
+          // Shared invariant: a routeless or time-corrupt leg is never briefed. Flights
+          // use briefguard; trains use the mode-aware transport.isWatchable (stations + time).
+          const ok = leg.type === "train" ? transport.isWatchable(leg) : briefguard.isBriefableLeg(leg);
+          if (!ok) continue;
           const already = await sql`SELECT id FROM departure_push_log WHERE user_email = ${leg.user_email} AND leg_id = ${leg.id} AND push_type = ${w.type}`;
           if (already.length > 0) continue;
-          const route = `${leg.origin} → ${leg.destination}`;
-          const fl = leg.carrier && leg.flight_number ? flightid.displayName(leg) : route;
-          await sendPushToUser(leg.user_email, w.title(route, fl), w.body(route), { route: "Concierge", tripId: String(leg.trip_id), legId: String(leg.id), prefill: w.prefill(route) });
+          const mode = transport.modeOf(leg) || "air";
+          const ends = transport.endpointsOf(leg);
+          const route = ends.from && ends.to ? `${ends.from} → ${ends.to}` : `${leg.origin || ""} → ${leg.destination || ""}`;
+          const name = transport.displayName(leg) || route;
+          const c = copyFor(w, mode, route, name);
+          await sendPushToUser(leg.user_email, c.title, c.body, { route: "Concierge", tripId: String(leg.trip_id), legId: String(leg.id), prefill: c.prefill });
           await sql`INSERT INTO departure_push_log (user_email, leg_id, push_type) VALUES (${leg.user_email}, ${leg.id}, ${w.type}) ON CONFLICT DO NOTHING`;
-          await logActivity(leg.user_email, "pre_departure_push", `${w.type} briefing sent for ${fl}`, `Departure briefing push sent for ${route}.`, leg.trip_id, leg.id);
+          await logActivity(leg.user_email, "pre_departure_push", `${w.type} briefing sent for ${name}`, `Departure briefing push sent for ${route}.`, leg.trip_id, leg.id);
         } catch (e) { console.error(`[pre-dep ${w.type}]`, e.message); }
       }
     }
