@@ -5582,6 +5582,46 @@ app.post("/admin/expire-sketches", async (req, res) => {
   }
 });
 
+// R6 · One-time backfill for rail-leg endpoints. New imports write station_from/
+// station_to, but older train rows may carry their endpoints in origin/destination
+// (or only one pair may be set). isWatchable/endpointsOf resolve either pair, but
+// normalizing BOTH makes the watcher and every UI robust on legacy data — a train can
+// only be watched if it names where it starts and ends. Dry-run by default;
+// ?apply=true to write. Admin-gated when ADMIN_EMAILS is set.
+app.post("/admin/backfill-rail-endpoints", async (req, res) => {
+  const email = await verifyAccessToken(req);
+  if (!email) return res.status(401).json({ error: "unauthorized" });
+  const admins = (process.env.ADMIN_EMAILS || "").split(",").map((s) => s.trim().toLowerCase()).filter(Boolean);
+  if (admins.length && !admins.includes(email.toLowerCase())) return res.status(403).json({ error: "forbidden" });
+  const dryRun = req.query.apply !== "true";
+  const ne = (v) => v != null && String(v).trim() !== "";
+  try {
+    const legs = await sql`
+      SELECT id, trip_id, origin, destination, station_from, station_to
+      FROM trip_legs WHERE type = 'train'`;
+    const fixed = [];
+    for (const l of legs) {
+      // Resolve each end from whichever field has it; then mirror into the other pair.
+      const from = ne(l.station_from) ? l.station_from : (ne(l.origin) ? l.origin : null);
+      const to   = ne(l.station_to)   ? l.station_to   : (ne(l.destination) ? l.destination : null);
+      const origin      = ne(l.origin)      ? l.origin      : from;
+      const destination = ne(l.destination) ? l.destination : to;
+      const changed = from !== l.station_from || to !== l.station_to || origin !== l.origin || destination !== l.destination;
+      if (!changed) continue;
+      fixed.push({ id: l.id, from, to });
+      if (!dryRun) {
+        await sql`UPDATE trip_legs
+          SET station_from = ${from}, station_to = ${to}, origin = ${origin}, destination = ${destination}
+          WHERE id = ${l.id}`;
+      }
+    }
+    res.json({ ok: true, dryRun, train_legs: legs.length, fixed: fixed.length, details: fixed.slice(0, 50) });
+  } catch (e) {
+    console.error("[backfill-rail-endpoints]", e.message);
+    res.status(500).json({ ok: false, error: e.message });
+  }
+});
+
 // POST /admin/unmerge-trips — split trips that swallowed unrelated travel.
 // Dry-run by default. Add ?apply=true to actually write.
 app.post("/admin/unmerge-trips", async (req, res) => {
@@ -8888,7 +8928,10 @@ async function ensureTripEdges(tripId) {
     ORDER BY departs_at`;
 
   for (const a of legs) {
-    if (a.type !== "flight" || !a.arrives_at) continue;
+    // The cascade SOURCE — the leg that, if disrupted, threatens what's downstream.
+    // With RAIL_SPINE on this includes trains, so a cancelled train propagates to the
+    // hotel/meeting that hangs off its arrival, exactly as a flight does.
+    if (!RAIL_TYPES.includes(a.type) || !a.arrives_at) continue;
     const landed = new Date(a.arrives_at);
     for (const b of legs) {
       if (b.id === a.id) continue;
