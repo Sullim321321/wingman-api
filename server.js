@@ -2655,6 +2655,11 @@ const provenance = require("./provenance");
 const arrival = require("./arrival");
 const briefguard = require("./briefguard"); // C2 · shared "may this leg be briefed?" invariant
 const transport = require("./transport"); // rail vertical · mode/vocab/network/narrative
+const amtrak = require("./amtrak"); // rail vertical · Amtrak live status via Amtraker feed
+// Amtrak live status is ON by default via the community Amtraker feed; set AMTRAK_FEED=off
+// to disable, or AMTRAK_STATUS_URL to point at a custom feed instead.
+const AMTRAK_LIVE = String(process.env.AMTRAK_FEED || "").toLowerCase() !== "off";
+const AMTRAKER_BASE = process.env.AMTRAKER_URL || "https://api.amtraker.com/v3/trains";
 // RAIL_SPINE · gates the multi-modal (train) watch path. Default OFF: ship dark,
 // flip on (env RAIL_SPINE=1) once the real-data readout at /metrics/rail looks right.
 const RAIL_SPINE = ["1", "true", "yes", "on"].includes(String(process.env.RAIL_SPINE || "").toLowerCase());
@@ -8593,7 +8598,7 @@ app.get("/metrics/rail", async (req, res) => {
     const watchable = upcoming.filter((l) => transport.isWatchable(l));
     const byNetwork = { uk_nr: 0, amtrak: 0, unrecognised: 0 };
     for (const l of watchable) { const nw = transport.networkOf(l); byNetwork[nw || "unrecognised"]++; }
-    const live = { uk_nr: true, amtrak: !!process.env.AMTRAK_STATUS_URL };
+    const live = { uk_nr: true, amtrak: AMTRAK_LIVE || !!process.env.AMTRAK_STATUS_URL };
     const summary =
       `You have ${legs.length} train leg${legs.length === 1 ? "" : "s"} on file, ${upcoming.length} still upcoming. ` +
       `${watchable.length} ${watchable.length === 1 ? "is" : "are"} watch-ready ` +
@@ -8793,17 +8798,28 @@ async function railStatus(leg) {
     return await getTrainStatus(from, to, leg.departs_at);
   }
   if (network === "amtrak") {
-    const base = process.env.AMTRAK_STATUS_URL;
-    if (!base) return { status: "Unknown", error: "No live Amtrak feed connected", network };
+    // A custom feed (AMTRAK_STATUS_URL) wins if configured; otherwise the community
+    // Amtraker feed, parsed by the pure amtrak adapter. Silence → honest Unknown.
+    const trainNum = amtrak.onlyDigits(leg.flight_number);
+    const amLeg = { trainNum, from, departsAt: leg.departs_at };
     try {
-      const url = `${base}${base.includes("?") ? "&" : "?"}from=${encodeURIComponent(from || "")}&to=${encodeURIComponent(to || "")}&departs_at=${encodeURIComponent(leg.departs_at || "")}`;
+      if (process.env.AMTRAK_STATUS_URL) {
+        const base = process.env.AMTRAK_STATUS_URL;
+        const url = `${base}${base.includes("?") ? "&" : "?"}from=${encodeURIComponent(from || "")}&to=${encodeURIComponent(to || "")}&departs_at=${encodeURIComponent(leg.departs_at || "")}`;
+        const r = await fetch(url, { signal: AbortSignal.timeout(8000) });
+        if (!r.ok) return { status: "Unknown", error: `Amtrak feed returned ${r.status}`, network };
+        const data = await r.json();
+        const s = String(data.status || "").toLowerCase();
+        const status = s.includes("cancel") ? "Cancelled" : s.includes("delay") ? "Delayed" : s.includes("on time") ? "On Time" : "Unknown";
+        return { status, delayMins: Number.isFinite(data.delayMins) ? data.delayMins : null, platform: data.platform || null, network };
+      }
+      if (!AMTRAK_LIVE) return { status: "Unknown", error: "Amtrak feed disabled", network };
+      // Amtraker: fetch by train number (small) when we have it, else the full board.
+      const url = trainNum ? `${AMTRAKER_BASE}/${encodeURIComponent(trainNum)}` : AMTRAKER_BASE;
       const r = await fetch(url, { signal: AbortSignal.timeout(8000) });
-      if (!r.ok) return { status: "Unknown", error: `Amtrak feed returned ${r.status}`, network };
+      if (!r.ok) return { status: "Unknown", error: `Amtraker returned ${r.status}`, network };
       const data = await r.json();
-      // Trust only an explicit, recognised status; never infer "On Time" from silence.
-      const s = String(data.status || "").toLowerCase();
-      const status = s.includes("cancel") ? "Cancelled" : s.includes("delay") ? "Delayed" : s.includes("on time") ? "On Time" : "Unknown";
-      return { status, delayMins: Number.isFinite(data.delayMins) ? data.delayMins : null, platform: data.platform || null, network };
+      return amtrak.toStatusResult(data, amLeg);
     } catch (e) {
       return { status: "Unknown", error: e.message, network };
     }
