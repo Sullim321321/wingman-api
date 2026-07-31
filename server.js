@@ -5639,6 +5639,52 @@ app.post("/admin/backfill-rail-endpoints", async (req, res) => {
   }
 });
 
+// POST /admin/backfill-flight-tz — repair the timezone bug on EXISTING flight legs.
+// Old flights were stored as naive local time cast to UTC (4h+ early). This reinterprets
+// each stored instant as the airport's wall clock and writes the true UTC. Scoped to the
+// caller's own legs. DRY-RUN by default — lists every proposed change so it can be eyeballed
+// before writing; ?apply=true commits. Idempotent: it skips legs already marked tz_fixed
+// (so post-fix imports and re-runs are never shifted again) and only touches known airports.
+app.post("/admin/backfill-flight-tz", async (req, res) => {
+  const email = await verifyAccessToken(req);
+  if (!email) return res.status(401).json({ error: "unauthorized" });
+  const dryRun = req.query.apply !== "true";
+  try {
+    const legs = await sql`
+      SELECT tl.id, tl.carrier, tl.flight_number, tl.origin, tl.destination,
+             tl.departs_at, tl.arrives_at, tl.raw_data, t.title
+      FROM trip_legs tl JOIN trips t ON t.id = tl.trip_id
+      WHERE t.user_email = ${email} AND tl.type = 'flight'
+      ORDER BY tl.departs_at ASC NULLS LAST`;
+    const changes = [];
+    for (const l of legs) {
+      if (l.raw_data && l.raw_data.tz_fixed) continue; // already corrected — never re-shift
+      const dep = l.departs_at ? flighttz.correctNaiveInstant(l.departs_at, l.origin) : { converted: false, iso: l.departs_at };
+      const arr = l.arrives_at ? flighttz.correctNaiveInstant(l.arrives_at, l.destination) : { converted: false, iso: l.arrives_at };
+      if (!dep.converted && !arr.converted) continue; // unknown airports / nothing to do
+      changes.push({
+        id: l.id, trip: l.title,
+        flight: `${l.carrier || ""} ${l.flight_number || ""}`.trim() || `${l.origin || "?"}→${l.destination || "?"}`,
+        route: `${l.origin || "?"} → ${l.destination || "?"}`,
+        departs: { from: l.departs_at, to: dep.iso, shifted: dep.converted },
+        arrives: { from: l.arrives_at, to: arr.iso, shifted: arr.converted },
+      });
+      if (!dryRun) {
+        await sql`
+          UPDATE trip_legs
+          SET departs_at = ${dep.iso}::timestamptz,
+              arrives_at = ${arr.iso}::timestamptz,
+              raw_data = jsonb_set(COALESCE(raw_data, '{}'::jsonb), '{tz_fixed}', 'true')
+          WHERE id = ${l.id}`;
+      }
+    }
+    res.json({ ok: true, dryRun, flight_legs: legs.length, would_change: changes.length, changes });
+  } catch (e) {
+    console.error("[backfill-flight-tz]", e.message);
+    res.status(500).json({ ok: false, error: e.message });
+  }
+});
+
 // POST /admin/unmerge-trips — split trips that swallowed unrelated travel.
 // Dry-run by default. Add ?apply=true to actually write.
 app.post("/admin/unmerge-trips", async (req, res) => {

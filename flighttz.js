@@ -95,4 +95,26 @@ function toUTC(localISO, iata) {
   return { iso: new Date(naiveAsUTC - offset).toISOString(), converted: true, reason: "converted", tz };
 }
 
-module.exports = { AIRPORT_TZ, IANA_OF, toUTC, tzOffsetMs, hasExplicitZone };
+const pad = (n) => String(n).padStart(2, "0");
+
+/**
+ * Repair a leg that was ALREADY stored wrong: a naive local time cast to timestamptz
+ * on a UTC server became an instant whose UTC wall-clock IS the intended local time
+ * (7:29 PM Newark → stored as 19:29Z). This reads those UTC wall-clock fields and
+ * reinterprets them as the airport's local time, yielding the true instant.
+ *   • known airport   → corrected UTC, converted:true
+ *   • unknown airport → unchanged, converted:false (never guessed)
+ * Idempotence is the CALLER's job (only run on un-migrated rows) — reapplying would
+ * shift again, so the backfill guards with a marker + a created-before cutoff.
+ */
+function correctNaiveInstant(storedISO, iata) {
+  const raw = storedISO == null ? "" : String(storedISO).trim();
+  if (!raw) return { iso: storedISO, converted: false, reason: "empty" };
+  const d = new Date(raw);
+  if (Number.isNaN(d.getTime())) return { iso: storedISO, converted: false, reason: "unparseable" };
+  if (!IANA_OF(iata)) return { iso: storedISO, converted: false, reason: "unknown_airport" };
+  const naive = `${d.getUTCFullYear()}-${pad(d.getUTCMonth() + 1)}-${pad(d.getUTCDate())}T${pad(d.getUTCHours())}:${pad(d.getUTCMinutes())}:${pad(d.getUTCSeconds())}`;
+  return toUTC(naive, iata);
+}
+
+module.exports = { AIRPORT_TZ, IANA_OF, toUTC, correctNaiveInstant, tzOffsetMs, hasExplicitZone };

@@ -1,6 +1,6 @@
 // test-flighttz.js — a naive flight time is a wall clock at the airport, converted to true UTC.
 const assert = require("assert");
-const { toUTC, IANA_OF, hasExplicitZone } = require("./flighttz");
+const { toUTC, IANA_OF, hasExplicitZone, correctNaiveInstant } = require("./flighttz");
 
 let pass = 0, fail = 0;
 const g = "\x1b[32m", r = "\x1b[31m", d = "\x1b[2m", x = "\x1b[0m";
@@ -69,6 +69,23 @@ t("hasExplicitZone: detects Z and ±offset, not naive", () => {
   assert.strictEqual(hasExplicitZone("2026-07-30T10:00:00+09:00"), true);
   assert.strictEqual(hasExplicitZone("2026-07-30T19:29:00"), false);
 });
+
+// ── correctNaiveInstant (the backfill repair for already-stored wrong rows) ──
+t("repair: EWR stored 19:29Z (naive EDT) → 23:29Z", () => {
+  assert.strictEqual(correctNaiveInstant("2026-07-30T19:29:00.000Z", "EWR").iso, "2026-07-30T23:29:00.000Z");
+});
+t("repair: PIT stored 21:06Z → 2026-07-31T01:06Z", () => {
+  assert.strictEqual(correctNaiveInstant("2026-07-30T21:06:00.000Z", "PIT").iso, "2026-07-31T01:06:00.000Z");
+});
+t("repair: LAX stored 09:00Z (naive PDT) → 16:00Z", () => {
+  assert.strictEqual(correctNaiveInstant("2026-07-30T09:00:00.000Z", "LAX").iso, "2026-07-30T16:00:00.000Z");
+});
+t("repair: unknown airport → unchanged (never guessed)", () => {
+  const r = correctNaiveInstant("2026-07-30T19:29:00.000Z", "ZZZ");
+  assert.strictEqual(r.converted, false);
+  assert.strictEqual(r.iso, "2026-07-30T19:29:00.000Z");
+});
+t("repair: null → unchanged", () => assert.strictEqual(correctNaiveInstant(null, "EWR").converted, false));
 
 console.log(`\n${d}──────────────────────────────────────────────────────────${x}`);
 console.log(`${fail === 0 ? g + "all " + pass + " held" : r + fail + " FAILED, " + pass + " held"}${x}\n`);
