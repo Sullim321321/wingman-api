@@ -5674,7 +5674,7 @@ app.post("/admin/backfill-flight-tz", async (req, res) => {
           UPDATE trip_legs
           SET departs_at = ${dep.iso}::timestamptz,
               arrives_at = ${arr.iso}::timestamptz,
-              raw_data = jsonb_set(COALESCE(raw_data, '{}'::jsonb), '{tz_fixed}', 'true')
+              raw_data = jsonb_set(COALESCE(raw_data, '{}'::jsonb), '{tz_fixed}', 'true'::jsonb)
           WHERE id = ${l.id}`;
       }
     }
