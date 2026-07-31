@@ -2656,6 +2656,7 @@ const arrival = require("./arrival");
 const briefguard = require("./briefguard"); // C2 · shared "may this leg be briefed?" invariant
 const transport = require("./transport"); // rail vertical · mode/vocab/network/narrative
 const amtrak = require("./amtrak"); // rail vertical · Amtrak live status via Amtraker feed
+const flighttz = require("./flighttz"); // flight times are wall-clock at the airport → true UTC
 // Amtrak live status is ON by default via the community Amtraker feed; set AMTRAK_FEED=off
 // to disable, or AMTRAK_STATUS_URL to point at a custom feed instead.
 const AMTRAK_LIVE = String(process.env.AMTRAK_FEED || "").toLowerCase() !== "off";
@@ -2940,6 +2941,22 @@ function sanitizeLegDates(parsed, userEmail) {
     if (city && n === city) {
       console.warn(`[grouping] hotel name was just the city ("${parsed.property_name}") for ${userEmail} — nulling it`);
       parsed.property_name = null;
+    }
+  }
+
+  // TIMEZONE — a flight time in the email is the WALL clock at the airport ("7:29 PM"
+  // means 7:29 PM in Newark). The parser emits it naive; stored as-is it's read as UTC
+  // and the whole day-of state runs hours early. Convert to true UTC using the origin
+  // (departure) and destination (arrival) airport zones. Only naive values for KNOWN
+  // airports are touched; already-zoned times and unknown/city origins are left alone.
+  if (t === "flight") {
+    if (parsed.departs_at) {
+      const c = flighttz.toUTC(parsed.departs_at, parsed.origin);
+      if (c.converted) parsed.departs_at = c.iso;
+    }
+    if (parsed.arrives_at) {
+      const c = flighttz.toUTC(parsed.arrives_at, parsed.destination);
+      if (c.converted) parsed.arrives_at = c.iso;
     }
   }
 
