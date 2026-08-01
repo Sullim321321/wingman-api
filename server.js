@@ -15638,6 +15638,13 @@ Return ONLY the JSON, no other text. If no booking data found, return { "trip_ti
       RETURNING id
     `;
     for (const leg of parsed.legs) {
+      // Store flight times as TRUE UTC (same airport-wall-clock fix as the email path)
+      // so a screenshot-imported flight isn't hours early.
+      let dep = leg.departs_at || null, arr = leg.arrives_at || null;
+      if (String(leg.type || "").toLowerCase() === "flight") {
+        if (dep) { const c = flighttz.toUTC(dep, leg.origin); if (c.converted) dep = c.iso; }
+        if (arr) { const c = flighttz.toUTC(arr, leg.destination); if (c.converted) arr = c.iso; }
+      }
       await sql`
         INSERT INTO trip_legs (trip_id, type, carrier, flight_number, origin, destination, departs_at, arrives_at, confirmation)
         VALUES (
@@ -15647,8 +15654,8 @@ Return ONLY the JSON, no other text. If no booking data found, return { "trip_ti
           ${leg.flight_number ? leg.flight_number.slice(0, 20) : null},
           ${leg.origin ? leg.origin.slice(0, 100) : null},
           ${leg.destination ? leg.destination.slice(0, 100) : null},
-          ${leg.departs_at || null},
-          ${leg.arrives_at || null},
+          ${dep},
+          ${arr},
           ${leg.confirmation ? leg.confirmation.slice(0, 50) : null}
         )
       `;
