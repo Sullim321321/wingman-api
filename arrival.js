@@ -65,9 +65,13 @@ function plan(arrival, meeting, travelMin, opts = {}) {
 // shipped. A flight is "active" only when it's genuinely happening: in the air, just
 // landed, or inside the head-to-the-airport window. A malformed leg (arrives before it
 // departs) is never active. Pure so the gate is unit-tested, not eyeballed on a device.
+// Keep in sync with the app's timewindows.js WINDOWS (separate CJS/ESM files, one intent):
+//   boardingMs MUST match WINDOWS.boardingMs (4h) — same "head to the airport" window.
+//   justLandedMs is DELIBERATELY 2h here (how long the arrival/car surface stays live
+//   after landing) and is NOT the app's 48h post-trip debrief window — different purpose.
 const ACTIVE = {
-  boardingMs:   4 * 3600000,  // heading to the airport
-  justLandedMs: 2 * 3600000,  // arrived recently
+  boardingMs:   4 * 3600000,  // heading to the airport — matches app WINDOWS.boardingMs
+  justLandedMs: 2 * 3600000,  // arrival surface stays live 2h post-landing (surface-local)
 };
 
 function isArrivalActive(flight, nowMs = Date.now()) {
