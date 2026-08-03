@@ -5702,6 +5702,33 @@ app.post("/admin/unmerge-trips", async (req, res) => {
   }
 });
 
+// POST /trips/tidy — USER-facing whole-account tidy. Splits mega-trips that swallowed
+// unrelated travel (the same engine as /admin/unmerge-trips, but authed as the signed-in
+// user instead of requiring an admin token) and re-homes loose reservations. This is the
+// only user-reachable path to the splitter — without it, a mega-trip that already exists
+// can never self-heal. Dry-run by default; the app calls it with ?apply=true.
+app.post("/trips/tidy", async (req, res) => {
+  const email = await verifyAccessToken(req);
+  if (!email) return res.status(401).json({ error: "unauthorized" });
+  try {
+    const dryRun = req.query.apply !== "true";
+    const split = await unmergeMegaTrips(email, { dryRun });
+    const loose = await cleanupLooseTrips(email, { dryRun });
+    res.json({
+      ok: true,
+      dryRun,
+      trips_split: split.tripsSplit || 0,
+      trips_created: split.tripsCreated || 0,
+      legs_to_review: split.legsOrphaned || 0,
+      reservations_rehomed: (loose.reservationsReassigned || 0) + (split.reservationsRehomed || 0),
+      details: [...(split.details || []), ...(loose.details || [])],
+    });
+  } catch (e) {
+    console.error("[trips/tidy]", e.message);
+    res.status(500).json({ ok: false, error: e.message });
+  }
+});
+
 // Re-home dining/activity reservations that were imported as their own "trips":
 // move each into the real trip it happened during, then delete the loose trips
 // (orphan reservations with no surrounding trip are junk and get removed).
