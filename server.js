@@ -8015,10 +8015,15 @@ app.get("/pockets", async (req, res) => {
     const offsetH = !Number.isNaN(tzq)
       ? tzq
       : (events.map((e) => offsetHoursFromISO(e.start)).find((h) => h != null) ?? 0);
-    // dayStart 7 / dayEnd 22 = awake 7am–10pm; sleep (10pm–7am) is never offered as free time.
-    // `events` already includes remote/virtual meetings, so a Zoom block is correctly busy.
+    // Waking window is user-configurable (Settings); defaults 7am–10pm. Sleep is never
+    // offered as free time. `events` already includes remote/virtual meetings, so a Zoom
+    // block is correctly busy.
+    const prefRows = await sql`SELECT preferences FROM users WHERE email = ${email}`;
+    const pf = prefRows[0]?.preferences || {};
+    const dayStart = Number.isFinite(pf.wake_start) ? pf.wake_start : 7;
+    const dayEnd = Number.isFinite(pf.wake_end) ? pf.wake_end : 22;
     const pockets = gapsLib.findFreePockets(events, {
-      horizonDays: days, minMinutes: 90, offsetH, dayStart: 7, dayEnd: 22,
+      horizonDays: days, minMinutes: 90, offsetH, dayStart, dayEnd,
     });
     res.json({ ok: true, connected: true, pockets });
   } catch (e) {
@@ -8354,6 +8359,10 @@ app.get("/policy", auth, async (req, res) => {
         // How long a finished trip stays visible before it drops out of view (still fed
         // to the Curator's taste). Default 30 days.
         past_visibility_days: prefs.past_visibility_days ?? 30,
+        // Waking window (local hours) — free-time pockets are only offered inside it; sleep
+        // is never suggested to fill. Defaults 7am–10pm.
+        wake_start: prefs.wake_start ?? 7,
+        wake_end: prefs.wake_end ?? 22,
       },
     });
   } catch (e) {
