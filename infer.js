@@ -85,7 +85,11 @@ function inferTravelNeeds(commitments, opts = {}) {
     if (c.nature === "ambiguous") {
       // Both a link and a place — could be a flight, could be a dial-in. Never a
       // silent booking. (Your Texas Rangers / Dallas meeting.)
-      if (hasCoords(geo) && near(geo, current, radius)) continue; // local anyway
+      // But only ask if the "place" is a REAL location that resolved to coordinates.
+      // A stray name in the location field ("Preston DeLong") is not a city to fly to,
+      // so a clearly-virtual meeting shouldn't generate an unanswerable travel nag.
+      if (!hasCoords(geo)) continue;                // no real place → treat as virtual, no ask
+      if (near(geo, current, radius)) continue;     // local anyway
       ask(`"${driver.title}" has both a video link and a place${geo && geo.city ? ` (${geo.city})` : ""}.`,
           `Are you attending "${driver.title}"${geo && geo.city ? ` in ${geo.city}` : ""} in person, or remotely?`);
       continue;
