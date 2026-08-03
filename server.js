@@ -8007,10 +8007,19 @@ app.get("/pockets", async (req, res) => {
     const days = Math.min(parseInt(req.query.days || "3", 10) || 3, 7);
     const { connected, events } = await readCommitments(email, days);
     if (!connected) return res.json({ ok: true, connected: false, pockets: [] });
-    // Waking hours are LOCAL — derive the offset from a real commitment so 8am–10pm means
-    // 8am–10pm where you are, not in UTC.
-    const offsetH = events.map((e) => offsetHoursFromISO(e.start)).find((h) => h != null) ?? 0;
-    const pockets = gapsLib.findFreePockets(events, { horizonDays: days, minMinutes: 90, offsetH });
+    // Waking hours are LOCAL — so 7am–10pm means where you ARE, not UTC. Prefer the device's
+    // real offset (query), because deriving it from a commitment fails on a free day with no
+    // events — which is exactly when you'd want pockets, and is what put "4:00 AM" blocks on
+    // the screen (UTC waking hours displayed in Eastern). Fall back to event-derived, then 0.
+    const tzq = parseFloat(req.query.tz_offset);
+    const offsetH = !Number.isNaN(tzq)
+      ? tzq
+      : (events.map((e) => offsetHoursFromISO(e.start)).find((h) => h != null) ?? 0);
+    // dayStart 7 / dayEnd 22 = awake 7am–10pm; sleep (10pm–7am) is never offered as free time.
+    // `events` already includes remote/virtual meetings, so a Zoom block is correctly busy.
+    const pockets = gapsLib.findFreePockets(events, {
+      horizonDays: days, minMinutes: 90, offsetH, dayStart: 7, dayEnd: 22,
+    });
     res.json({ ok: true, connected: true, pockets });
   } catch (e) {
     console.error("[pockets]", e.message);
