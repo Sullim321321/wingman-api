@@ -7656,6 +7656,8 @@ app.get("/curate", async (req, res) => {
   const email = await verifyAccessToken(req);
   if (!email) return res.status(401).json({ error: "unauthorized" });
   const city = String(req.query.city || "").trim();
+  const region = String(req.query.region || "").trim();   // optional "State, Country" from the caller
+  const place = region ? `${city}, ${region}` : city;
   if (!city) return res.status(400).json({ error: "city required" });
   try {
     const brief = await buildTasteBrief(email);
@@ -7665,7 +7667,15 @@ app.get("/curate", async (req, res) => {
     }
     const prompt = `You are Wingman's Curator for a discerning, frequent business traveler. Curate ONLY from their taste brief — never generic "top-rated" filler.
 Taste brief (JSON): ${JSON.stringify(brief)}
-City: ${city}
+Place: ${place}
+
+CRITICAL — resolve the Place correctly. Interpret it as ONE specific real locality. Many US
+towns share a name with a country or foreign region: "Mount Lebanon" is a suburb of
+Pittsburgh, Pennsylvania, USA — NOT the country Lebanon; "Lebanon" is likely Lebanon, NH or
+OH, not Beirut. If a name is ambiguous, prefer the locality matching any region/country given,
+and default to the US locality when no region is given. NEVER return a recommendation in a
+different city, region, or country than the Place — recommending somewhere across the world
+from the traveler is a hard failure. If you cannot confidently place it, return empty arrays.
 
 Return STRICT JSON only, no prose, exactly this shape:
 {
