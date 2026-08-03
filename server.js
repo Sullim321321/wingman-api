@@ -679,6 +679,9 @@ async function bootstrapDB() {
     await sql`ALTER TABLE trips ADD COLUMN IF NOT EXISTS raw_email_id TEXT`;
     await sql`ALTER TABLE trips ADD COLUMN IF NOT EXISTS updated_at TIMESTAMPTZ DEFAULT NOW()`;
     await sql`ALTER TABLE trips ADD COLUMN IF NOT EXISTS metadata JSONB DEFAULT '{}'::jsonb`;
+    // Companion / multi-traveler (Slice 2): a leg may name a subset of the trip's travelers.
+    // Empty [] = shared (everyone). Travelers themselves live in trips.metadata.travelers.
+    await sql`ALTER TABLE trip_legs ADD COLUMN IF NOT EXISTS traveler_ids JSONB DEFAULT '[]'::jsonb`;
     await sql`ALTER TABLE trips ADD COLUMN IF NOT EXISTS companions_count INTEGER DEFAULT 1`;
     await sql`ALTER TABLE trips ADD COLUMN IF NOT EXISTS companion_names JSONB DEFAULT '[]'`;
     await sql`ALTER TABLE trips ADD COLUMN IF NOT EXISTS event_legs JSONB DEFAULT '[]'`;
@@ -2675,6 +2678,7 @@ const stays = require("./stays");
 const flightbook = require("./flightbook");
 const concierge = require("./concierge");
 const regroup = require("./regroup");
+const companions = require("./companions");
 const gapsLib = require("./gaps");   // free-pocket detection (aliased; a local `gaps` array exists elsewhere)
 
 const MAX_STAY_NIGHTS = 30;
@@ -8771,6 +8775,52 @@ app.patch("/trips/:id/expense-meta", auth, async (req, res) => {
     await sql`UPDATE trips SET metadata = ${JSON.stringify(meta)}::jsonb, updated_at = NOW() WHERE id = ${req.params.id} AND user_email = ${req.user.email}`;
     res.json({ ok: true, expense: meta.expense });
   } catch (e) { console.error("[expense-meta:patch]", e.message); res.status(500).json({ error: e.message }); }
+});
+
+// ─── Companion / multi-traveler (Slice 2) ────────────────────────────────────
+// Travelers live in trips.metadata.travelers; per-leg assignment in trip_legs.traveler_ids
+// (empty = shared). All three endpoints are owner-gated by the trips.user_email match — a
+// companion is data ON your trip, not another account with access to it.
+
+// GET /trips/:id/travelers — the roster + each traveler's personal itinerary within the trip.
+app.get("/trips/:id/travelers", auth, async (req, res) => {
+  try {
+    const [t] = await sql`SELECT metadata FROM trips WHERE id = ${req.params.id} AND user_email = ${req.user.email}`;
+    if (!t) return res.status(404).json({ error: "not_found" });
+    const travelers = companions.normalizeTravelers((t.metadata && t.metadata.travelers) || []);
+    const legs = await sql`
+      SELECT id, type, carrier, flight_number, property_name, origin, destination, departs_at, traveler_ids
+      FROM trip_legs WHERE trip_id = ${req.params.id} ORDER BY departs_at NULLS LAST, id`;
+    res.json({ travelers, itinerary: companions.perTravelerItinerary(travelers, legs) });
+  } catch (e) { console.error("[travelers:get]", e.message); res.status(500).json({ error: e.message }); }
+});
+
+// PUT /trips/:id/travelers — set the roster. Body: { travelers: [{ id|email, name, role }] }.
+app.put("/trips/:id/travelers", auth, async (req, res) => {
+  try {
+    const [t] = await sql`SELECT metadata FROM trips WHERE id = ${req.params.id} AND user_email = ${req.user.email}`;
+    if (!t) return res.status(404).json({ error: "not_found" });
+    const travelers = companions.normalizeTravelers(req.body?.travelers || []).slice(0, 12); // sane cap
+    const meta = { ...(t.metadata || {}), travelers };
+    await sql`UPDATE trips SET metadata = ${JSON.stringify(meta)}::jsonb, updated_at = NOW() WHERE id = ${req.params.id} AND user_email = ${req.user.email}`;
+    res.json({ ok: true, travelers });
+  } catch (e) { console.error("[travelers:put]", e.message); res.status(500).json({ error: e.message }); }
+});
+
+// PATCH /trips/legs/:legId/travelers — assign a leg to a subset (or [] for shared). Unknown
+// ids are rejected, never invented; the response reports any that were dropped.
+app.patch("/trips/legs/:legId/travelers", auth, async (req, res) => {
+  try {
+    const [leg] = await sql`
+      SELECT tl.id, tl.trip_id, t.metadata
+      FROM trip_legs tl JOIN trips t ON t.id = tl.trip_id
+      WHERE tl.id = ${req.params.legId} AND t.user_email = ${req.user.email}`;
+    if (!leg) return res.status(404).json({ error: "not_found" });
+    const travelers = companions.normalizeTravelers((leg.metadata && leg.metadata.travelers) || []);
+    const { valid, unknown } = companions.validateAssignment(req.body?.traveler_ids || [], travelers);
+    await sql`UPDATE trip_legs SET traveler_ids = ${JSON.stringify(valid)}::jsonb WHERE id = ${req.params.legId}`;
+    res.json({ ok: true, traveler_ids: valid, rejected: unknown });
+  } catch (e) { console.error("[leg-travelers:patch]", e.message); res.status(500).json({ error: e.message }); }
 });
 
 // GET /env-status — internal diagnostic (auth required, non-sensitive)
