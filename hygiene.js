@@ -83,6 +83,48 @@ function dedupeStays(legs) {
 }
 
 /**
+ * Canonical flight identity. Two rows are the SAME flight only when they share a real
+ * identifier: the same flight number on the same day, or (number missing) the same
+ * carrier + exact route on the same day. Deliberately conservative — two DIFFERENT
+ * flights to the same city (AA 4611 JFK→PIT vs UA 3403 EWR→PIT) get different keys and
+ * are NEVER merged. That's a genuine choice for the traveler, not a duplicate to delete.
+ */
+function flightKey(l) {
+  const day = dayOf(l && l.departs_at);
+  if (day == null) return null;                                   // undated → don't guess
+  const num = String((l && l.flight_number) || "").toUpperCase().replace(/\s+/g, "");
+  if (num) return `n|${num}|${day}`;                              // strongest signal
+  const carrier = String((l && l.carrier) || "").toLowerCase().replace(/\s+/g, "");
+  const o = String((l && l.origin) || "").toUpperCase().trim();
+  const d = String((l && l.destination) || "").toUpperCase().trim();
+  if (carrier && o && d) return `r|${carrier}|${o}|${d}|${day}`;  // carrier + route + day
+  return null;                                                    // too little → keep
+}
+
+/**
+ * Collapse exact-duplicate flights (same flight, imported twice). Returns { kept, removed }.
+ * Non-flight legs and flights we can't positively identify pass through untouched.
+ */
+function dedupeFlights(legs) {
+  const groups = new Map();
+  const passthrough = [];
+  for (const l of legs || []) {
+    if (String((l && l.type) || "").toLowerCase() !== "flight") { passthrough.push(l); continue; }
+    const key = flightKey(l);
+    if (!key) { passthrough.push(l); continue; }
+    if (!groups.has(key)) groups.set(key, []);
+    groups.get(key).push(l);
+  }
+  const kept = [...passthrough], removed = [];
+  for (const [, group] of groups) {
+    group.sort((a, b) => legScore(b) - legScore(a) || (a.id || 0) - (b.id || 0));
+    kept.push(group[0]);
+    for (const loser of group.slice(1)) removed.push(loser);
+  }
+  return { kept, removed };
+}
+
+/**
  * Flag legs whose date sits far outside the trip's real cluster. Uses the MEDIAN of
  * dated legs as the anchor; anything more than `maxDays` from it is stale. Undated
  * legs are never stale (nothing to judge). With too few dated legs to form a cluster
@@ -96,4 +138,4 @@ function staleLegs(legs, { maxDays = 30 } = {}) {
   return dated.filter((l) => Math.abs(dayOf(l.departs_at) - median) > maxDays);
 }
 
-module.exports = { normalizeProperty, dedupeStays, staleLegs, legScore };
+module.exports = { normalizeProperty, dedupeStays, dedupeFlights, flightKey, staleLegs, legScore };

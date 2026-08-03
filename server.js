@@ -4353,12 +4353,13 @@ app.post("/trips/:id/tidy", async (req, res) => {
 
     const legs = await sql`SELECT * FROM trip_legs WHERE trip_id = ${req.params.id}`;
     const { removed: dupes } = hygiene.dedupeStays(legs);
+    const { removed: dupeFlights } = hygiene.dedupeFlights(legs);
     const stale = hygiene.staleLegs(legs);
 
-    // Union by id, tagging the reason (a leg can be both; duplicate wins the label).
-    const dupeIds = new Set(dupes.map((l) => l.id));
+    // Union by id, tagging the reason (a leg can be several; duplicate wins the label).
     const byId = new Map();
     for (const l of dupes) byId.set(l.id, { leg: l, reason: "duplicate" });
+    for (const l of dupeFlights) if (!byId.has(l.id)) byId.set(l.id, { leg: l, reason: "duplicate" });
     for (const l of stale) if (!byId.has(l.id)) byId.set(l.id, { leg: l, reason: "stale" });
     const toRemove = [...byId.values()];
 
@@ -15710,6 +15711,80 @@ Return ONLY the JSON, no other text. If no booking data found, return { "trip_ti
   } catch (e) {
     console.error("[pdf-ocr]", e.message);
     res.status(500).json({ error: e.message });
+  }
+});
+
+// ── B1 · Client error sink ──────────────────────────────────────────────────
+// The next "the tab is blank" should arrive as a stack trace, not a screenshot. The
+// app's ErrorBoundary and a global JS-error handler POST here. Auth is best-effort — an
+// error can happen before sign-in — so we attach the email when a valid token is present
+// but never reject an unauthenticated report. Reporting must never itself 500 loudly.
+let _clientErrTableReady = false;
+async function ensureClientErrorsTable() {
+  if (_clientErrTableReady) return;
+  await sql`
+    CREATE TABLE IF NOT EXISTS client_errors (
+      id BIGSERIAL PRIMARY KEY,
+      user_email TEXT,
+      message TEXT,
+      stack TEXT,
+      screen TEXT,
+      context TEXT,
+      app_version TEXT,
+      platform TEXT,
+      fatal BOOLEAN DEFAULT FALSE,
+      created_at TIMESTAMPTZ DEFAULT now()
+    )
+  `;
+  _clientErrTableReady = true;
+}
+
+app.post("/client-error", async (req, res) => {
+  try {
+    await ensureClientErrorsTable();
+    let email = null;
+    try { email = await verifyAccessToken(req); } catch { /* unauthed error still worth logging */ }
+    const b = req.body || {};
+    const clamp = (v, n) => (v == null ? null : String(v).slice(0, n));
+    await sql`
+      INSERT INTO client_errors (user_email, message, stack, screen, context, app_version, platform, fatal)
+      VALUES (
+        ${email},
+        ${clamp(b.message, 500)},
+        ${clamp(b.stack, 6000)},
+        ${clamp(b.screen, 120)},
+        ${clamp(b.context, 2000)},
+        ${clamp(b.app_version, 40)},
+        ${clamp(b.platform, 20)},
+        ${!!b.fatal}
+      )
+    `;
+    console.warn(`[client-error]${b.fatal ? " FATAL" : ""} ${email || "anon"} @${b.screen || "?"}: ${clamp(b.message, 200)}`);
+    res.json({ ok: true });
+  } catch (e) {
+    console.error("[client-error] sink failed:", e.message);
+    res.status(200).json({ ok: false });  // never surface the sink's own failure
+  }
+});
+
+// GET /admin/client-errors — recent client crashes for the signed-in user (own + pre-auth
+// anonymous reports from their device). Scoped to the requester so it never leaks another
+// user's data.
+app.get("/admin/client-errors", async (req, res) => {
+  const email = await verifyAccessToken(req);
+  if (!email) return res.status(401).json({ error: "unauthorized" });
+  try {
+    await ensureClientErrorsTable();
+    const limit = Math.min(parseInt(req.query.limit || "100", 10) || 100, 500);
+    const rows = await sql`
+      SELECT id, user_email, message, screen, context, app_version, platform, fatal, created_at
+      FROM client_errors
+      WHERE user_email = ${email} OR user_email IS NULL
+      ORDER BY id DESC LIMIT ${limit}
+    `;
+    res.json({ ok: true, count: rows.length, errors: rows });
+  } catch (e) {
+    res.status(500).json({ ok: false, error: e.message });
   }
 });
 
