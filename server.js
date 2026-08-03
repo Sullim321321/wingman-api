@@ -8791,7 +8791,17 @@ app.get("/trips/:id/travelers", auth, async (req, res) => {
     const legs = await sql`
       SELECT id, type, carrier, flight_number, property_name, origin, destination, departs_at, traveler_ids
       FROM trip_legs WHERE trip_id = ${req.params.id} ORDER BY departs_at NULLS LAST, id`;
-    res.json({ travelers, itinerary: companions.perTravelerItinerary(travelers, legs) });
+    const label = (l) => {
+      const t = String(l.type || "").toLowerCase();
+      if (t === "flight" || t === "train") return [l.carrier, l.flight_number].filter(Boolean).join(" ").trim() || (l.origin && l.destination ? `${l.origin}→${l.destination}` : "Flight");
+      if (t === "hotel" || t === "airbnb") return l.property_name || l.destination || "Stay";
+      return l.property_name || l.destination || (t ? t[0].toUpperCase() + t.slice(1) : "Item");
+    };
+    res.json({
+      travelers,
+      itinerary: companions.perTravelerItinerary(travelers, legs),
+      legs: legs.map((l) => ({ id: l.id, type: l.type, label: label(l), departs_at: l.departs_at, traveler_ids: Array.isArray(l.traveler_ids) ? l.traveler_ids : [] })),
+    });
   } catch (e) { console.error("[travelers:get]", e.message); res.status(500).json({ error: e.message }); }
 });
 
