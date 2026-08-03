@@ -90,8 +90,11 @@ function inferTravelNeeds(commitments, opts = {}) {
       // so a clearly-virtual meeting shouldn't generate an unanswerable travel nag.
       if (!hasCoords(geo)) continue;                // no real place → treat as virtual, no ask
       if (near(geo, current, radius)) continue;     // local anyway
-      ask(`"${driver.title}" has both a video link and a place${geo && geo.city ? ` (${geo.city})` : ""}.`,
-          `Are you attending "${driver.title}"${geo && geo.city ? ` in ${geo.city}` : ""} in person, or remotely?`);
+      // reason_code "attend_mode" tells the client to render In-person / Remote buttons
+      // so the ask is answerable — and the answer persists so it never nags again.
+      needs.push({ ...base, kind: "ask", reason_code: "attend_mode",
+        reason: `"${driver.title}" has both a video link and a place${geo && geo.city ? ` (${geo.city})` : ""}.`,
+        question: `Are you attending "${driver.title}"${geo && geo.city ? ` in ${geo.city}` : ""} in person, or remotely?` });
       continue;
     }
 

@@ -682,6 +682,15 @@ async function bootstrapDB() {
     // Companion / multi-traveler (Slice 2): a leg may name a subset of the trip's travelers.
     // Empty [] = shared (everyone). Travelers themselves live in trips.metadata.travelers.
     await sql`ALTER TABLE trip_legs ADD COLUMN IF NOT EXISTS traveler_ids JSONB DEFAULT '[]'::jsonb`;
+    // Answerable asks: the user's resolution of an ambiguous meeting ("in person" / "remote")
+    // so the same ask never nags twice. Keyed by a stable meeting key.
+    await sql`CREATE TABLE IF NOT EXISTS meeting_resolutions (
+      user_email TEXT NOT NULL,
+      meeting_key TEXT NOT NULL,
+      resolution TEXT NOT NULL,
+      created_at TIMESTAMPTZ DEFAULT now(),
+      UNIQUE (user_email, meeting_key)
+    )`;
     await sql`ALTER TABLE trips ADD COLUMN IF NOT EXISTS companions_count INTEGER DEFAULT 1`;
     await sql`ALTER TABLE trips ADD COLUMN IF NOT EXISTS companion_names JSONB DEFAULT '[]'`;
     await sql`ALTER TABLE trips ADD COLUMN IF NOT EXISTS event_legs JSONB DEFAULT '[]'`;
@@ -2679,6 +2688,16 @@ const flightbook = require("./flightbook");
 const concierge = require("./concierge");
 const regroup = require("./regroup");
 const companions = require("./companions");
+
+// A stable key for a meeting so a user's "in person / remote" answer sticks across reads.
+// Prefer the calendar event id; fall back to title+start (both come from the driver).
+function meetingKey(driver) {
+  if (!driver) return null;
+  if (driver.calendar_id) return `cal:${driver.calendar_id}`;
+  const t = String(driver.title || "").trim().toLowerCase();
+  const s = String(driver.start || "").trim();
+  return t || s ? `ts:${t}|${s}` : null;
+}
 const gapsLib = require("./gaps");   // free-pocket detection (aliased; a local `gaps` array exists elsewhere)
 
 const MAX_STAY_NIGHTS = 30;
@@ -7469,16 +7488,47 @@ app.get("/calendar/travel", async (req, res) => {
 
     // Fill in each proposed trip with a skeleton — fly-in/out targets, nights, hotel.
     const trips = grouped.trips.map((t) => ({ ...t, itinerary: proposeItinerary(t, { current, hotelOf }) }));
+
+    // Answerable asks: attach a stable resolve key to each single-driver ask, and drop
+    // any the user has already answered so it never nags again.
+    const resolvedRows = await sql`SELECT meeting_key FROM meeting_resolutions WHERE user_email = ${email}`;
+    const resolved = new Set(resolvedRows.map((r) => r.meeting_key));
+    const withKeys = [...recAsks, ...grouped.asks].map((a) =>
+      a.driver ? { ...a, resolve_key: meetingKey(a.driver) } : a);
+    const asks = withKeys.filter((a) => !(a.resolve_key && resolved.has(a.resolve_key)));
+
     res.json({
       ok: true, connected: true, readable: anyReadable,
       from: current ? { input: fromText, city: current.city, source: current.source } : null,
       accounts,
       trips,
-      asks: [...recAsks, ...grouped.asks],
+      asks,
     });
   } catch (e) {
     console.error("[calendar/travel]", e.message);
     res.status(500).json({ ok: false, error: humanError(e) });
+  }
+});
+
+// POST /calendar/meeting/resolve { key, resolution } — record the user's answer to an
+// ambiguous meeting ("in_person" / "remote"), so the ask is answered once and never
+// nags again. The /calendar/travel read filters out anything with a stored resolution.
+app.post("/calendar/meeting/resolve", async (req, res) => {
+  const email = await verifyAccessToken(req);
+  if (!email) return res.status(401).json({ error: "unauthorized" });
+  try {
+    const key = String(req.body?.key || "").slice(0, 300);
+    const resolution = ["in_person", "remote"].includes(req.body?.resolution) ? req.body.resolution : "remote";
+    if (!key) return res.status(400).json({ error: "key required" });
+    await sql`
+      INSERT INTO meeting_resolutions (user_email, meeting_key, resolution)
+      VALUES (${email}, ${key}, ${resolution})
+      ON CONFLICT (user_email, meeting_key) DO UPDATE SET resolution = EXCLUDED.resolution, created_at = NOW()
+    `;
+    res.json({ ok: true, key, resolution });
+  } catch (e) {
+    console.error("[meeting/resolve]", e.message);
+    res.status(500).json({ error: e.message });
   }
 });
 
