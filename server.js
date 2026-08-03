@@ -15570,6 +15570,43 @@ app.delete("/integrations/travelperk", auth, async (req, res) => {
 const multer = require("multer");
 const pdfOcrUpload = multer({ storage: multer.memoryStorage(), limits: { fileSize: 10 * 1024 * 1024 } }); // 10MB
 
+// Save a set of imported legs as a new trip. Shared by the direct import path and the
+// preview→confirm path so the timezone fix and column-clamping live in exactly one place.
+async function saveImportedTrip(userEmail, tripTitle, legs, source) {
+  const [newTrip] = await sql`
+    INSERT INTO trips (user_email, title, status, source)
+    VALUES (${userEmail}, ${String(tripTitle).slice(0, 200)}, 'upcoming', ${source})
+    RETURNING id
+  `;
+  let created = 0;
+  for (const leg of legs || []) {
+    if (!leg) continue;
+    // Store flight times as TRUE UTC (airport-wall-clock fix) so an imported flight
+    // isn't hours early.
+    let dep = leg.departs_at || null, arr = leg.arrives_at || null;
+    if (String(leg.type || "").toLowerCase() === "flight") {
+      if (dep) { const c = flighttz.toUTC(dep, leg.origin); if (c.converted) dep = c.iso; }
+      if (arr) { const c = flighttz.toUTC(arr, leg.destination); if (c.converted) arr = c.iso; }
+    }
+    await sql`
+      INSERT INTO trip_legs (trip_id, type, carrier, flight_number, origin, destination, departs_at, arrives_at, confirmation)
+      VALUES (
+        ${newTrip.id},
+        ${(leg.type || "other").slice(0, 50)},
+        ${leg.carrier ? String(leg.carrier).slice(0, 100) : null},
+        ${leg.flight_number ? String(leg.flight_number).slice(0, 20) : null},
+        ${leg.origin ? String(leg.origin).slice(0, 100) : null},
+        ${leg.destination ? String(leg.destination).slice(0, 100) : null},
+        ${dep},
+        ${arr},
+        ${leg.confirmation ? String(leg.confirmation).slice(0, 50) : null}
+      )
+    `;
+    created++;
+  }
+  return { trip_id: newTrip.id, legs_created: created };
+}
+
 app.post("/trips/import/pdf-ocr", auth, pdfOcrUpload.single("pdf"), async (req, res) => {
   if (!req.file) return res.status(400).json({ error: "No PDF file uploaded" });
   if (!req.file.mimetype.includes("pdf") && !req.file.mimetype.includes("image")) {
@@ -15631,39 +15668,39 @@ Return ONLY the JSON, no other text. If no booking data found, return { "trip_ti
       return res.status(422).json({ error: "No booking data found in this PDF", parsed });
     }
 
-    // Save to DB
-    const [newTrip] = await sql`
-      INSERT INTO trips (user_email, title, status, source)
-      VALUES (${req.email}, ${parsed.trip_title.slice(0, 200)}, 'upcoming', 'pdf_ocr')
-      RETURNING id
-    `;
-    for (const leg of parsed.legs) {
-      // Store flight times as TRUE UTC (same airport-wall-clock fix as the email path)
-      // so a screenshot-imported flight isn't hours early.
-      let dep = leg.departs_at || null, arr = leg.arrives_at || null;
-      if (String(leg.type || "").toLowerCase() === "flight") {
-        if (dep) { const c = flighttz.toUTC(dep, leg.origin); if (c.converted) dep = c.iso; }
-        if (arr) { const c = flighttz.toUTC(arr, leg.destination); if (c.converted) arr = c.iso; }
-      }
-      await sql`
-        INSERT INTO trip_legs (trip_id, type, carrier, flight_number, origin, destination, departs_at, arrives_at, confirmation)
-        VALUES (
-          ${newTrip.id},
-          ${(leg.type || "other").slice(0, 50)},
-          ${leg.carrier ? leg.carrier.slice(0, 100) : null},
-          ${leg.flight_number ? leg.flight_number.slice(0, 20) : null},
-          ${leg.origin ? leg.origin.slice(0, 100) : null},
-          ${leg.destination ? leg.destination.slice(0, 100) : null},
-          ${dep},
-          ${arr},
-          ${leg.confirmation ? leg.confirmation.slice(0, 50) : null}
-        )
-      `;
+    // PREVIEW MODE: return what vision extracted WITHOUT saving, so the user can catch
+    // a misread (the SLC-vs-PIT class of error) before it becomes a phantom trip. The
+    // app renders these legs for review, then POSTs the confirmed set to
+    // /trips/import/confirm. Honesty rule: nothing enters the record unreviewed.
+    const wantPreview = String(req.body?.preview || "") === "true" || req.query.preview === "true";
+    if (wantPreview) {
+      return res.json({ preview: true, trip_title: parsed.trip_title, legs: parsed.legs });
     }
 
-    res.json({ ok: true, trip_id: newTrip.id, trip_title: parsed.trip_title, legs_created: parsed.legs.length });
+    // Direct save (legacy path / no-preview clients).
+    const saved = await saveImportedTrip(req.email, parsed.trip_title, parsed.legs, "pdf_ocr");
+    res.json({ ok: true, trip_id: saved.trip_id, trip_title: parsed.trip_title, legs_created: saved.legs_created });
   } catch (e) {
     console.error("[pdf-ocr]", e.message);
+    res.status(500).json({ error: e.message });
+  }
+});
+
+// POST /trips/import/confirm — save the user-reviewed legs from an import preview.
+// Body: { trip_title, legs: [...], source }. The legs are the (possibly edited) set the
+// user approved on the preview screen; we save them exactly, applying the flight-time
+// timezone fix so an imported flight isn't stored hours early.
+app.post("/trips/import/confirm", auth, async (req, res) => {
+  try {
+    const { trip_title, legs, source } = req.body || {};
+    if (!trip_title || !Array.isArray(legs) || legs.length === 0) {
+      return res.status(400).json({ error: "trip_title and a non-empty legs array are required" });
+    }
+    const src = source === "screenshot" ? "screenshot" : "pdf_ocr";
+    const saved = await saveImportedTrip(req.email, trip_title, legs, src);
+    res.json({ ok: true, trip_id: saved.trip_id, trip_title, legs_created: saved.legs_created });
+  } catch (e) {
+    console.error("[import/confirm]", e.message);
     res.status(500).json({ error: e.message });
   }
 });
