@@ -1270,6 +1270,7 @@ app.post("/auth/sms/request", async (req, res) => {
         method: "POST",
         headers: { "Content-Type": "application/x-www-form-urlencoded", "Authorization": "Basic " + Buffer.from(accountSid + ":" + authToken).toString("base64") },
         body: body.toString(),
+        signal: AbortSignal.timeout(10000),   // K2: a hung SMS API must not stall sign-in
       });
       if (!r.ok) throw new Error("Twilio error: " + (await r.text()));
     } else {
@@ -4085,7 +4086,7 @@ app.post("/inbound/email", async (req, res) => {
       ];
       for (const url of urls) {
         try {
-          const r = await fetch(url, { headers: { Authorization: `Bearer ${readKey}` } });
+          const r = await fetch(url, { headers: { Authorization: `Bearer ${readKey}` }, signal: AbortSignal.timeout(10000) });
           const body = await r.text();
           if (r.ok) {
             let full = {};
@@ -4495,7 +4496,7 @@ async function travelTime(origin, destination, { arriveBy = null, mode = "transi
     if (arriveBy && mode === "transit") p.set("arrival_time", String(Math.floor(new Date(arriveBy).getTime() / 1000)));
     else if (mode === "driving") p.set("departure_time", String(Math.floor(Date.now() / 1000)));
 
-    const r = await fetch(`https://maps.googleapis.com/maps/api/directions/json?${p}`);
+    const r = await fetch(`https://maps.googleapis.com/maps/api/directions/json?${p}`, { signal: AbortSignal.timeout(8000) });
     const data = await r.json();
     if (data.status !== "OK" || !data.routes?.length) return { error: data.status || "no_route" };
 
