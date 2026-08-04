@@ -2688,6 +2688,7 @@ const flightbook = require("./flightbook");
 const concierge = require("./concierge");
 const regroup = require("./regroup");
 const companions = require("./companions");
+const dayrisk = require("./dayrisk");
 
 // A stable key for a meeting so a user's "in person / remote" answer sticks across reads.
 // Prefer the calendar event id; fall back to title+start (both come from the driver).
@@ -7507,6 +7508,31 @@ app.get("/calendar/travel", async (req, res) => {
   } catch (e) {
     console.error("[calendar/travel]", e.message);
     res.status(500).json({ ok: false, error: humanError(e) });
+  }
+});
+
+// GET /day-risks — "what could ruin my day": ranked risks from the next ~48h of booked
+// flights, using the traveler's connection comfort. Weather is added in a later slice; for
+// now it surfaces the strongest data-available signal (tight connections) and stays silent
+// when there's nothing real to say. (dayrisk.assessDay is pure + tested.)
+app.get("/day-risks", auth, async (req, res) => {
+  try {
+    const legs = await sql`
+      SELECT tl.carrier, tl.flight_number, tl.origin, tl.destination, tl.departs_at, tl.arrives_at
+      FROM trip_legs tl JOIN trips t ON t.id = tl.trip_id
+      WHERE t.user_email = ${req.user.email}
+        AND tl.type = 'flight' AND COALESCE(tl.state, 'booked') <> 'proposed'
+        AND tl.departs_at IS NOT NULL
+        AND tl.departs_at <= NOW() + INTERVAL '48 hours'
+        AND COALESCE(tl.arrives_at, tl.departs_at) >= NOW()
+      ORDER BY tl.departs_at ASC`;
+    const prefRows = await sql`SELECT min_connection_mins FROM users WHERE email = ${req.user.email}`;
+    const minConnMins = prefRows[0]?.min_connection_mins || 60;
+    const risks = dayrisk.assessDay({ flights: legs, minConnMins });   // weather omitted (Slice 2)
+    res.json({ ok: true, risks });
+  } catch (e) {
+    console.error("[day-risks]", e.message);
+    res.status(500).json({ ok: false, error: e.message });
   }
 });
 
