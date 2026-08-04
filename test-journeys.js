@@ -9,7 +9,7 @@
 // (each returning home) stay apart, and a huge gap never welds trips together.
 
 const assert = require("assert");
-const { homeSetOf, tripEndsHome, planTripMerges, unionClustersByHome } = require("./journeys");
+const { homeSetOf, tripEndsHome, planTripMerges, unionClustersByHome, auditGrouping } = require("./journeys");
 
 const g = "\x1b[32m", r = "\x1b[31m", d = "\x1b[2m", b = "\x1b[1m", x = "\x1b[0m";
 let pass = 0, fail = 0;
@@ -111,6 +111,40 @@ t("clusters split by a home return stay separate", () => {
   ];
   const out = unionClustersByHome(clusters, ["PIT"]);
   assert.strictEqual(out.length, 2, "merged across a home return");
+});
+
+console.log(`\n${b}auditGrouping — the standing guard for invariant #3${x}`);
+console.log(`${d}──────────────────────────────────────────────────────────${x}`);
+
+t("a lone return leg (EWR→PIT as its own trip) is flagged as a tail fragment", () => {
+  const trips = [{ id: 9, title: "Pittsburgh", legs: [F("EWR", "PIT", "2026-07-30T12:00:00Z", "2026-07-30T14:00:00Z")] }];
+  const v = auditGrouping(trips, ["PIT"]);
+  assert.strictEqual(v.length, 1);
+  assert.match(v[0].reason, /never departed home/);
+});
+
+t("a trip that continues past a homecoming is flagged as welded", () => {
+  const trips = [{ id: 10, title: "Two trips", legs: [
+    F("PIT", "BNA", "2026-07-17T13:00:00Z", "2026-07-17T15:00:00Z"),
+    F("BNA", "PIT", "2026-07-20T12:00:00Z", "2026-07-20T14:00:00Z"),   // home — should end here
+    F("PIT", "BOS", "2026-07-25T12:00:00Z", "2026-07-25T14:00:00Z"),   // but it keeps going
+  ] }];
+  const v = auditGrouping(trips, ["PIT"]);
+  assert.strictEqual(v.length, 1);
+  assert.match(v[0].reason, /spans a return home/);
+});
+
+t("a clean round trip (home → away → home) is NOT flagged", () => {
+  const trips = [{ id: 11, title: "Nashville", legs: [
+    F("PIT", "BNA", "2026-07-17T13:00:00Z", "2026-07-17T15:00:00Z"),
+    F("BNA", "PIT", "2026-07-20T12:00:00Z", "2026-07-20T14:00:00Z"),
+  ] }];
+  assert.strictEqual(auditGrouping(trips, ["PIT"]).length, 0);
+});
+
+t("no home airport → the guard holds no opinion", () => {
+  const trips = [{ id: 9, title: "Pittsburgh", legs: [F("EWR", "PIT", "2026-07-30T12:00:00Z", "2026-07-30T14:00:00Z")] }];
+  assert.strictEqual(auditGrouping(trips, []).length, 0);
 });
 
 console.log(`\n${d}──────────────────────────────────────────────────────────${x}`);

@@ -144,6 +144,43 @@ function unionClustersByHome(clusters, homeAirports, opts = {}) {
   return out;
 }
 
+/**
+ * STANDING GUARD for invariant #3 (FOUNDATION.md). A well-formed trip is one home-to-home
+ * journey. This flags the two pathologies — without changing anything — so they're visible
+ * and can't silently recur:
+ *   • welded:    a home ARRIVAL that isn't the trip's last transport leg → two journeys in one
+ *   • tail-frag: the trip arrives home but never departed from home → a return leg orphaned
+ *                into its own "trip" (the EWR→PIT-as-"Pittsburgh" over-split)
+ * Returns [{ tripId, title, reason }]. Pure; needs home airports (empty → no opinion).
+ */
+function auditGrouping(trips, homeAirports) {
+  const homeSet = homeAirports instanceof Set ? homeAirports : homeSetOf(homeAirports);
+  if (homeSet.size === 0) return [];
+  const out = [];
+  for (const t of trips || []) {
+    const flights = legsOf(t)
+      .filter((l) => isTransport(l) && toTime(l.departs_at) != null)
+      .sort((a, b) => toTime(a.departs_at) - toTime(b.departs_at));
+    if (!flights.length) continue;
+
+    // welded: a homecoming that the trip continues past
+    for (let i = 0; i < flights.length - 1; i++) {
+      if (legArrivesHome(flights[i], homeSet)) {
+        out.push({ tripId: t.id, title: t.title, reason: "spans a return home — should be two trips" });
+        break;
+      }
+    }
+    // tail-fragment: arrives home but never left home (a lone return leg made its own trip)
+    const first = flights[0];
+    const last = flights[flights.length - 1];
+    const departsFromHome = homeSet.has(String((first.origin) || "").toUpperCase().trim());
+    if (legArrivesHome(last, homeSet) && !departsFromHome) {
+      out.push({ tripId: t.id, title: t.title, reason: "arrives home but never departed home — a return-leg fragment" });
+    }
+  }
+  return out;
+}
+
 module.exports = {
-  homeSetOf, legArrivesHome, tripEndsHome, planTripMerges, unionClustersByHome,
+  homeSetOf, legArrivesHome, tripEndsHome, planTripMerges, unionClustersByHome, auditGrouping,
 };

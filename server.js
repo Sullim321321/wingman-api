@@ -5849,6 +5849,7 @@ async function remergeJourneys(userEmail, homeSet, { dryRun = true } = {}) {
 
   const plan = journeys.planTripMerges(tripObjs, homeSet);
   const merges = plan.map((m) => ({ keep_trip_id: m.keepTripId, merge_trip_ids: m.mergeTripIds, would_combine: m.titles }));
+  const groupingViolations = journeys.auditGrouping(tripObjs, homeSet); // invariant #3 standing guard
   let tripsMerged = 0;
   if (!dryRun) {
     for (const m of plan) {
@@ -5862,7 +5863,7 @@ async function remergeJourneys(userEmail, homeSet, { dryRun = true } = {}) {
       await ensureTripEdges(m.keepTripId).catch(() => {}); // re-draw connection edges over reunited legs
     }
   }
-  return { journeys_found: plan.length, trips_merged: tripsMerged, merges };
+  return { journeys_found: plan.length, trips_merged: tripsMerged, merges, grouping_violations: groupingViolations };
 }
 
 // Re-home dining/activity reservations that were imported as their own "trips":
