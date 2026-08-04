@@ -691,6 +691,14 @@ async function bootstrapDB() {
       created_at TIMESTAMPTZ DEFAULT now(),
       UNIQUE (user_email, meeting_key)
     )`;
+    // K3 · indexes for the hottest filters (every request scans these). trips(user_email)
+    // and trip_legs(trip_id) are the two most-queried; the rest cut per-request work as the
+    // user base grows. All additive + IF NOT EXISTS, so safe to (re)run on the live DB.
+    await sql`CREATE INDEX IF NOT EXISTS idx_trips_user ON trips(user_email)`;
+    await sql`CREATE INDEX IF NOT EXISTS idx_trip_legs_trip ON trip_legs(trip_id)`;
+    await sql`CREATE INDEX IF NOT EXISTS idx_loyalty_user ON loyalty_accounts(user_email)`;
+    await sql`CREATE INDEX IF NOT EXISTS idx_gmail_tokens_user ON gmail_tokens(user_email)`;
+    await sql`CREATE INDEX IF NOT EXISTS idx_client_errors_user ON client_errors(user_email, id DESC)`;
     await sql`ALTER TABLE trips ADD COLUMN IF NOT EXISTS companions_count INTEGER DEFAULT 1`;
     await sql`ALTER TABLE trips ADD COLUMN IF NOT EXISTS companion_names JSONB DEFAULT '[]'`;
     await sql`ALTER TABLE trips ADD COLUMN IF NOT EXISTS event_legs JSONB DEFAULT '[]'`;
@@ -2690,6 +2698,20 @@ const concierge = require("./concierge");
 const regroup = require("./regroup");
 const companions = require("./companions");
 const dayrisk = require("./dayrisk");
+
+// K4 · LLM cost control. A light per-user DAILY cap on the expensive model calls so a runaway
+// loop or a heavy day can't silently burn credits. In-memory (resets on restart) — a coarse but
+// honest guardrail for the preview; a DB-backed meter can replace it when there's real volume.
+const _llmUsage = {}; // `${email}|${kind}|${yyyy-mm-dd}` → count
+const LLM_CAPS = { vision_import: 25, curate: 50, concierge: 80 };
+function llmBudgetOk(email, kind) {
+  const cap = LLM_CAPS[kind];
+  if (!cap || !email) return true;
+  const key = `${email}|${kind}|${new Date().toISOString().slice(0, 10)}`;
+  const n = (_llmUsage[key] || 0) + 1;
+  _llmUsage[key] = n;
+  return n <= cap;
+}
 
 // A stable key for a meeting so a user's "in person / remote" answer sticks across reads.
 // Prefer the calendar event id; fall back to title+start (both come from the driver).
@@ -7736,6 +7758,9 @@ app.get("/curate", async (req, res) => {
   const region = String(req.query.region || "").trim();   // optional "State, Country" from the caller
   const place = region ? `${city}, ${region}` : city;
   if (!city) return res.status(400).json({ error: "city required" });
+  if (!llmBudgetOk(email, "curate")) {
+    return res.status(429).json({ error: "You've reached today's curation limit — back tomorrow with fresh picks." });
+  }
   try {
     const brief = await buildTasteBrief(email);
     if (!brief.known) {
@@ -8786,6 +8811,36 @@ app.get("/health", (_req, res) => {
   }
   res.json({ ok: true, ts: now, version: "2.19.0", pollersHealthy, pollers });
 });
+
+// K1 · Stale-poller alert. B3 exposed `stale` on /health, but nothing watched it — a dead
+// watcher just showed a flag no one reads. This checks every 5 min and, when a poller misses
+// 2.5× its interval, logs loudly and (if ADMIN_EMAILS + Resend are configured) emails ONCE per
+// stale episode — so a silently-dead disruption watcher pages a human. Resets on recovery so a
+// future stall alerts again.
+const _pollerAlerted = {};
+setInterval(async () => {
+  const now = Date.now();
+  for (const [name, iv] of Object.entries(POLL_INTERVALS)) {
+    const h = pollHealth[name];
+    const stale = !h || !h.lastRun || (now - h.lastRun) > iv * 2.5;
+    if (stale && !_pollerAlerted[name]) {
+      _pollerAlerted[name] = true;
+      const ago = h && h.lastRun ? `${Math.round((now - h.lastRun) / 60000)}m ago` : "never";
+      const msg = `[watchdog] poller "${name}" is STALE — last run ${ago}. Wingman may be missing disruptions.`;
+      console.error(msg);
+      const admins = (process.env.ADMIN_EMAILS || "").split(",").map((s) => s.trim()).filter(Boolean);
+      const key = process.env.RESEND_API_KEY || "";
+      if (admins.length && key.startsWith("re_")) {
+        try {
+          await resend.emails.send({ from: "Wingman <alerts@wingmantravel.app>", to: admins, subject: `Wingman poller stale: ${name}`, text: msg });
+        } catch (e) { console.error("[watchdog] alert email failed:", e.message); }
+      }
+    } else if (!stale && _pollerAlerted[name]) {
+      _pollerAlerted[name] = false;
+      console.log(`[watchdog] poller "${name}" recovered.`);
+    }
+  }
+}, 5 * 60000);
 
 // D1 · Activation funnel (Roadmap v4). The "aha" for a Guardian product is the moment
 // Wingman CATCHES something for you — the first disruption decision it surfaces. This is
@@ -15802,6 +15857,9 @@ async function saveImportedTrip(userEmail, tripTitle, legs, source) {
 
 app.post("/trips/import/pdf-ocr", auth, pdfOcrUpload.single("pdf"), async (req, res) => {
   if (!req.file) return res.status(400).json({ error: "No PDF file uploaded" });
+  if (!llmBudgetOk(req.email, "vision_import")) {
+    return res.status(429).json({ error: "You've reached today's import limit. Try again tomorrow, or add the trip by hand." });
+  }
   if (!req.file.mimetype.includes("pdf") && !req.file.mimetype.includes("image")) {
     return res.status(400).json({ error: "File must be a PDF or image" });
   }
