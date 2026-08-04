@@ -48,12 +48,30 @@ t("two DIFFERENT hotels are left alone", () => {
   assert.strictEqual(dedupeStays(legs).kept.length, 2, "collapsed two different hotels");
 });
 
-t("the same hotel on two different trips (months apart) is not merged", () => {
+// dedupeStays is always called on ONE trip's legs (WHERE trip_id = …), so "two different
+// trips" never share a call. The real within-trip cases are: a genuine re-stay (keep both)
+// vs a mis-dated duplicate (collapse). Both anchored to the trip's date cluster.
+
+t("a genuine re-stay at the same hotel within a trip (both plausibly dated) is kept", () => {
   const legs = [
-    { id: 1, type: "hotel", property_name: "Kimpton Aertson", departs_at: "2026-07-19T16:00:00Z" },
-    { id: 2, type: "hotel", property_name: "Kimpton Aertson Hotel", departs_at: "2026-11-02T16:00:00Z" },
+    { id: 1, type: "hotel", property_name: "Kimpton Aertson", departs_at: "2026-07-05T16:00:00Z", arrives_at: "2026-07-07T11:00:00Z" },
+    { id: 2, type: "flight", departs_at: "2026-07-10T12:00:00Z" },  // anchors the cluster mid-July
+    { id: 3, type: "hotel", property_name: "Kimpton Aertson Hotel", departs_at: "2026-07-20T16:00:00Z", arrives_at: "2026-07-22T11:00:00Z" },
   ];
-  assert.strictEqual(dedupeStays(legs).kept.length, 2, "merged two separate stays at the same hotel");
+  assert.strictEqual(dedupeStays(legs).kept.filter((l) => l.type === "hotel").length, 2, "collapsed a genuine re-stay");
+});
+
+t("the Dec-31 mis-dated Graduate collapses into the real July stay (#4 via #2)", () => {
+  const legs = [
+    { id: 1, type: "flight", origin: "LGA", destination: "BNA", departs_at: "2026-07-17T13:00:00Z" },
+    { id: 2, type: "hotel", property_name: "Graduate by Hilton Nashville", departs_at: "2026-07-24T16:00:00Z", arrives_at: "2026-07-27T11:00:00Z" },
+    { id: 3, type: "hotel", property_name: "Graduate by Hilton Nashville, TN", departs_at: "2026-12-31T16:00:00Z" }, // mis-parse
+  ];
+  const { kept, removed } = dedupeStays(legs);
+  const hotels = kept.filter((l) => l.type === "hotel");
+  assert.strictEqual(hotels.length, 1, "the mis-dated Graduate wasn't collapsed");
+  assert.strictEqual(hotels[0].id, 2, "kept the wrong copy — should keep the real July stay");
+  assert.ok(removed.some((l) => l.id === 3), "the Dec-31 copy should be the one removed");
 });
 
 t("non-lodging legs pass through untouched", () => {

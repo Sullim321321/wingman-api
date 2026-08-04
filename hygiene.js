@@ -64,25 +64,49 @@ function legScore(l) {
  * suffix / punctuation. Returns { kept, removed } — `removed` are the losers.
  * Non-lodging legs pass through untouched.
  */
+const STAY_OUTLIER_DAYS = 45; // a same-property stay this far from the trip cluster is mis-dated
+
 function dedupeStays(legs) {
-  const groups = new Map();
   const passthrough = [];
+  const stays = [];
   for (const l of legs || []) {
-    if (!isLodging(l)) { passthrough.push(l); continue; }
-    const key = normalizeProperty(l.property_name || l.title);
-    if (!key) { passthrough.push(l); continue; }
-    // Group by property + check-in day (undated stays group on property alone), so
-    // two genuinely different stays at the same hotel on different trips survive.
-    const d = dayOf(l.departs_at);
-    const bucket = `${key}|${d == null ? "x" : Math.round(d / 3)}`; // within ~3 days = same stay
-    if (!groups.has(bucket)) groups.set(bucket, []);
-    groups.get(bucket).push(l);
+    if (isLodging(l) && normalizeProperty(l.property_name || l.title)) stays.push(l);
+    else passthrough.push(l);
   }
+  // The trip's real date cluster: median check-in of ALL dated legs. A same-property stay
+  // far from it is a mis-parse (the Dec-31 Graduate that was really the July one), not a
+  // second booking.
+  const allDays = (legs || []).map((l) => dayOf(l.departs_at)).filter((d) => d != null).sort((a, b) => a - b);
+  const median = allDays.length ? allDays[Math.floor(allDays.length / 2)] : null;
+
+  const byProp = new Map();
+  for (const l of stays) {
+    const k = normalizeProperty(l.property_name || l.title);
+    if (!byProp.has(k)) byProp.set(k, []);
+    byProp.get(k).push(l);
+  }
+
   const kept = [...passthrough], removed = [];
-  for (const [, group] of groups) {
-    group.sort((a, b) => legScore(b) - legScore(a) || (a.id || 0) - (b.id || 0));
-    kept.push(group[0]);
-    for (const loser of group.slice(1)) removed.push(loser);
+  const distToCluster = (l) => {
+    const d = dayOf(l.departs_at);
+    return (median != null && d != null) ? Math.abs(d - median) : Number.MAX_SAFE_INTEGER;
+  };
+  for (const [, group] of byProp) {
+    if (group.length === 1) { kept.push(group[0]); continue; }
+    // Primary = the copy most IN the trip's date cluster, then the most complete.
+    group.sort((a, b) => distToCluster(a) - distToCluster(b) || legScore(b) - legScore(a) || (a.id || 0) - (b.id || 0));
+    const survivors = [group[0]];
+    for (const l of group.slice(1)) {
+      const d = dayOf(l.departs_at);
+      const dupNear = survivors.some((s) => {
+        const sd = dayOf(s.departs_at);
+        return sd != null && d != null && Math.abs(sd - d) <= 3;   // same check-in ≈ same stay
+      });
+      const outlier = median != null && d != null && Math.abs(d - median) > STAY_OUTLIER_DAYS;
+      if (dupNear || outlier || d == null) removed.push(l);          // duplicate / mis-dated / undated copy
+      else survivors.push(l);                                        // a genuine, plausibly-dated re-stay
+    }
+    kept.push(...survivors);
   }
   return { kept, removed };
 }
