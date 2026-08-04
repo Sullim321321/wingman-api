@@ -15923,13 +15923,20 @@ const pdfOcrUpload = multer({ storage: multer.memoryStorage(), limits: { fileSiz
 // Save a set of imported legs as a new trip. Shared by the direct import path and the
 // preview→confirm path so the timezone fix and column-clamping live in exactly one place.
 async function saveImportedTrip(userEmail, tripTitle, legs, source) {
+  // Invariant #4: de-dupe BEFORE insert, so a duplicate or a codeshare (AA4611 / UA3403)
+  // never gets stored in the first place — no clean-up-later. Operates on the in-memory
+  // array; keeps the most complete row (hygiene.legScore). Tested in test-hygiene.js.
+  let clean = legs || [];
+  clean = hygiene.dedupeFlights(clean).kept;
+  clean = hygiene.dedupeCodeshares(clean).kept;
+
   const [newTrip] = await sql`
     INSERT INTO trips (user_email, title, status, source)
     VALUES (${userEmail}, ${String(tripTitle).slice(0, 200)}, 'upcoming', ${source})
     RETURNING id
   `;
   let created = 0;
-  for (const leg of legs || []) {
+  for (const leg of clean) {
     if (!leg) continue;
     // Store flight times as TRUE UTC (airport-wall-clock fix) so an imported flight
     // isn't hours early.
