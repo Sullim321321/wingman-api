@@ -2698,6 +2698,7 @@ const concierge = require("./concierge");
 const regroup = require("./regroup");
 const companions = require("./companions");
 const dayrisk = require("./dayrisk");
+const journeys = require("./journeys");
 
 // K4 · LLM cost control. A light per-user DAILY cap on the expensive model calls so a runaway
 // loop or a heavy day can't silently burn credits. In-memory (resets on restart) — a coarse but
@@ -5764,11 +5765,22 @@ app.post("/trips/tidy", async (req, res) => {
     const dryRun = req.query.apply !== "true";
     const split = await unmergeMegaTrips(email, { dryRun });
     const loose = await cleanupLooseTrips(email, { dryRun });
+    // Final pass: rejoin home-to-home journeys the 5-day-gap split over-shredded (a flight
+    // home is the tail of a trip, not a new trip). Splitting and this merge must run in one
+    // operation, or they undo each other across runs. Only on apply — a dry-run split leaves
+    // nothing to rejoin. Needs the home airport; silently skipped if unset.
+    let rejoined = { journeys_found: 0, trips_merged: 0 };
+    if (!dryRun) {
+      const urow = await sql`SELECT home_airports FROM users WHERE email = ${email}`;
+      const homeSet = journeys.homeSetOf(urow[0] && urow[0].home_airports);
+      rejoined = await remergeJourneys(email, homeSet, { dryRun: false });
+    }
     res.json({
       ok: true,
       dryRun,
       trips_split: split.tripsSplit || 0,
       trips_created: split.tripsCreated || 0,
+      trips_rejoined: rejoined.trips_merged || 0,
       legs_to_review: split.legsOrphaned || 0,
       reservations_rehomed: (loose.reservationsReassigned || 0) + (split.reservationsRehomed || 0),
       details: [...(split.details || []), ...(loose.details || [])],
@@ -5778,6 +5790,80 @@ app.post("/trips/tidy", async (req, res) => {
     res.status(500).json({ ok: false, error: e.message });
   }
 });
+
+// POST /trips/remerge — repair the OPPOSITE failure from tidy: trips the splitter
+// over-shredded. It reunites home-to-home journeys — a run of trips with no return to a
+// home airport between them (a Nashville trip torn into Nashville / a connection / a stay /
+// the flight home). Preview-first: dry-run by default returns exactly what it WOULD combine;
+// the app calls ?apply=true only after the user sees the plan. See journeys.js for the rule
+// and its safety guards (never bridges a home return or a gap > 30 days).
+app.post("/trips/remerge", async (req, res) => {
+  const email = await verifyAccessToken(req);
+  if (!email) return res.status(401).json({ error: "unauthorized" });
+  try {
+    const apply = req.query.apply === "true";
+    const urow = await sql`SELECT home_airports FROM users WHERE email = ${email}`;
+    const homeSet = journeys.homeSetOf(urow[0] && urow[0].home_airports);
+    if (homeSet.size === 0) {
+      return res.json({
+        ok: true, dryRun: !apply, needs_home_airport: true, merges: [],
+        message: "Set your home airport in Travel profile first — reuniting a home-to-home journey needs to know where home is.",
+      });
+    }
+
+    const trips = await sql`
+      SELECT id, title FROM trips
+      WHERE user_email = ${email} AND title NOT IN ('Needs review', 'Reservations')`;
+    const legRows = await sql`
+      SELECT tl.id, tl.trip_id, tl.type, tl.origin, tl.destination, tl.departs_at, tl.arrives_at
+      FROM trip_legs tl JOIN trips t ON t.id = tl.trip_id
+      WHERE t.user_email = ${email} AND t.title NOT IN ('Needs review', 'Reservations')`;
+    const legsByTrip = {};
+    for (const l of legRows) { (legsByTrip[l.trip_id] = legsByTrip[l.trip_id] || []).push(l); }
+    const tripObjs = trips.map((t) => ({ id: t.id, title: t.title, legs: legsByTrip[t.id] || [] }));
+
+    const rep = await remergeJourneys(email, homeSet, { dryRun: !apply });
+    res.json({ ok: true, dryRun: !apply, ...rep });
+  } catch (e) {
+    console.error("[trips/remerge]", e.message);
+    res.status(500).json({ ok: false, error: e.message });
+  }
+});
+
+// Shared repair: reunite home-to-home journeys the splitter over-shredded. Used by
+// /trips/remerge (preview + apply) AND as the final pass of /trips/tidy, so a tidy that
+// splits on 5-day gaps immediately rejoins anything not actually separated by a return home.
+// Without this the split and the merge would fight across runs. Pure decision in journeys.js.
+async function remergeJourneys(userEmail, homeSet, { dryRun = true } = {}) {
+  if (!homeSet || homeSet.size === 0) return { journeys_found: 0, trips_merged: 0, merges: [] };
+  const trips = await sql`
+    SELECT id, title FROM trips
+    WHERE user_email = ${userEmail} AND title NOT IN ('Needs review', 'Reservations')`;
+  const legRows = await sql`
+    SELECT tl.id, tl.trip_id, tl.type, tl.origin, tl.destination, tl.departs_at, tl.arrives_at
+    FROM trip_legs tl JOIN trips t ON t.id = tl.trip_id
+    WHERE t.user_email = ${userEmail} AND t.title NOT IN ('Needs review', 'Reservations')`;
+  const legsByTrip = {};
+  for (const l of legRows) { (legsByTrip[l.trip_id] = legsByTrip[l.trip_id] || []).push(l); }
+  const tripObjs = trips.map((t) => ({ id: t.id, title: t.title, legs: legsByTrip[t.id] || [] }));
+
+  const plan = journeys.planTripMerges(tripObjs, homeSet);
+  const merges = plan.map((m) => ({ keep_trip_id: m.keepTripId, merge_trip_ids: m.mergeTripIds, would_combine: m.titles }));
+  let tripsMerged = 0;
+  if (!dryRun) {
+    for (const m of plan) {
+      for (const mid of m.mergeTripIds) {
+        await sql`UPDATE trip_legs SET trip_id = ${m.keepTripId} WHERE trip_id = ${mid}`;
+        await sql`DELETE FROM trips WHERE id = ${mid} AND user_email = ${userEmail}`;
+        tripsMerged++;
+      }
+      const title = await computeTripTitle(m.keepTripId);
+      if (title) await sql`UPDATE trips SET title = ${title} WHERE id = ${m.keepTripId}`;
+      await ensureTripEdges(m.keepTripId).catch(() => {}); // re-draw connection edges over reunited legs
+    }
+  }
+  return { journeys_found: plan.length, trips_merged: tripsMerged, merges };
+}
 
 // Re-home dining/activity reservations that were imported as their own "trips":
 // move each into the real trip it happened during, then delete the loose trips
