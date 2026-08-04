@@ -6153,7 +6153,12 @@ If nothing new was learned, return {}. Do not repeat things already in the exist
 app.post("/concierge", conciergeLimiter, async (req, res) => {
   const email = await verifyAccessToken(req);
   if (!email) return res.status(401).json({ error: "unauthorized" });
-  const { message: rawMessage, history, location, now, timezone, localTime } = req.body || {};
+  const { message: rawMessage, history, location, now, timezone, localTime, units } = req.body || {};
+  // Temperature units follow the device (locale-aware, matching Home). We store Celsius;
+  // convert for the prompt so the chat speaks °F to US users and °C to everyone else.
+  const useFahrenheit = units === "imperial";
+  const fmtTemp = (c) => (c == null ? c : (useFahrenheit ? Math.round((c * 9) / 5 + 32) : c));
+  const tempSym = useFahrenheit ? "°F" : "°C";
   if (!rawMessage) return res.status(400).json({ error: "message required" });
   // Scrub PII from user message before it reaches Anthropic
   const message = scrubPII(rawMessage);
@@ -6648,7 +6653,7 @@ User: ${firstName ? firstName + ' (' + email + ')' : email}
 ${journeyContext ? journeyContext + "\n" : ""}${memorySection || ''}${instructionsSection}${tasteSection ? `=== USER'S TASTE PROFILE ===\n${tasteSection}\n` : ""}
 ${loyaltySummary ? `=== USER'S LOYALTY ACCOUNTS ===\n${loyaltySummary}\n\nWhen recommending hotels, always factor in which programs the user has status with and suggest properties where their status will be recognized. When advising on flights, factor in their airline status and miles balance — suggest using miles for upgrades when the balance is high.\n` : ""}
 ${locationContext ? `=== USER'S CURRENT LOCATION ===\n${locationContext}\nUse this to give hyper-local recommendations. If the user asks "what should I do" or "where should I eat" without specifying a city, assume they mean right now, right here.\n` : ""}
-${liveWeather ? `=== LIVE WEATHER AT USER'S LOCATION ===\nCurrently ${liveWeather.temp}\u00b0C (feels like ${liveWeather.feels}\u00b0C), ${liveWeather.desc}${liveWeather.windKph ? `, wind ${liveWeather.windKph} km/h` : ''}${liveWeather.humidity ? `, humidity ${liveWeather.humidity}%` : ''}.\nUse this when the user asks about weather, what to wear, or whether to go outside.\n` : ""}
+${liveWeather ? `=== LIVE WEATHER AT USER'S LOCATION ===\nCurrently ${fmtTemp(liveWeather.temp)}${tempSym} (feels like ${fmtTemp(liveWeather.feels)}${tempSym}), ${liveWeather.desc}${liveWeather.windKph ? `, wind ${liveWeather.windKph} km/h` : ''}${liveWeather.humidity ? `, humidity ${liveWeather.humidity}%` : ''}.\nAlways state temperatures in ${tempSym} to match the user's app. Use this when the user asks about weather, what to wear, or whether to go outside.\n` : ""}
 ${placesResults.length > 0 ? `=== NEARBY PLACES (REAL — from Google Maps, verified) ===\nThe following businesses actually exist near the user right now. ONLY recommend places from this list when asked for local recommendations. NEVER invent or hallucinate business names.\n${placesResults.map((p, i) => `${i+1}. ${p.name} — ${p.address || 'nearby'}${p.rating ? ` · ${p.rating}★ (${p.user_ratings_total} reviews)` : ''}${p.open_now === true ? ' · Open now' : p.open_now === false ? ' · Currently closed' : ''}${p.price_level !== null ? ' · ' + ['Free','Inexpensive','Moderate','Expensive','Very expensive'][p.price_level] || '' : ''}\n   Maps: ${p.maps_url}`).join('\n')}\n\nCRITICAL: You MUST only name businesses from the list above. If none match what the user is asking for, say so honestly and describe the type of neighbourhood to look in instead.\nDistances: you may say a place is nearby, but do NOT state a walking time in minutes unless it is given above. You do not know how fast she walks or which way she turns.\n` : `=== NO VERIFIED PLACES DATA ===
 I have NOT looked up any businesses near the user for this message.
 
