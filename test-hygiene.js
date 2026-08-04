@@ -10,7 +10,7 @@
 // small trip is never "cleaned" on a guess.
 
 const assert = require("assert");
-const { normalizeProperty, dedupeStays, staleLegs } = require("./hygiene");
+const { normalizeProperty, dedupeStays, staleLegs, dedupeCodeshares } = require("./hygiene");
 
 const g = "\x1b[32m", r = "\x1b[31m", d = "\x1b[2m", b = "\x1b[1m", x = "\x1b[0m";
 let pass = 0, fail = 0;
@@ -112,6 +112,59 @@ t("too few dated legs = no guessing (never flags)", () => {
     { id: 2, type: "hotel", departs_at: "2026-07-19T20:00:00Z" },
   ];
   assert.strictEqual(staleLegs(legs).length, 0, "flagged on too little evidence");
+});
+
+console.log(`\n${b}Codeshares → one physical flight (#228)${x}`);
+console.log(`${d}──────────────────────────────────────────────────────────${x}`);
+
+t("AA 4611 and UA 3403 — same route, same time — collapse to one", () => {
+  const legs = [
+    { id: 1, type: "flight", flight_number: "AA4611", carrier: "American", origin: "PIT", destination: "ORD", departs_at: "2026-08-10T14:30:00Z", arrives_at: "2026-08-10T15:45:00Z" },
+    { id: 2, type: "flight", flight_number: "UA3403", carrier: "United",   origin: "PIT", destination: "ORD", departs_at: "2026-08-10T14:30:00Z", arrives_at: "2026-08-10T15:45:00Z", confirmation: "XYZ9" },
+  ];
+  const { kept, removed } = dedupeCodeshares(legs);
+  assert.strictEqual(kept.filter((l) => l.type === "flight").length, 1, "the codeshare wasn't collapsed");
+  assert.strictEqual(kept.find((l) => l.type === "flight").id, 2, "kept the wrong copy — should keep the one with a confirmation");
+  assert.strictEqual(removed.length, 1);
+});
+
+t("codeshare with arrival on only one row still collapses", () => {
+  const legs = [
+    { id: 1, type: "flight", flight_number: "AA4611", origin: "PIT", destination: "ORD", departs_at: "2026-08-10T14:30:00Z" },
+    { id: 2, type: "flight", flight_number: "UA3403", origin: "PIT", destination: "ORD", departs_at: "2026-08-10T14:30:00Z", arrives_at: "2026-08-10T15:45:00Z" },
+  ];
+  const { kept, removed } = dedupeCodeshares(legs);
+  assert.strictEqual(kept.filter((l) => l.type === "flight").length, 1);
+  assert.strictEqual(removed.length, 1);
+});
+
+t("SAFETY: two real flights, same route, DIFFERENT times — both kept", () => {
+  const legs = [
+    { id: 1, type: "flight", flight_number: "AA4611", origin: "PIT", destination: "ORD", departs_at: "2026-08-10T14:30:00Z" },
+    { id: 2, type: "flight", flight_number: "UA3403", origin: "PIT", destination: "ORD", departs_at: "2026-08-10T18:05:00Z" },
+  ];
+  const { kept, removed } = dedupeCodeshares(legs);
+  assert.strictEqual(kept.filter((l) => l.type === "flight").length, 2, "collapsed two genuinely different flights");
+  assert.strictEqual(removed.length, 0);
+});
+
+t("SAFETY: same route + departure but CONFLICTING arrivals — both kept", () => {
+  const legs = [
+    { id: 1, type: "flight", flight_number: "AA4611", origin: "PIT", destination: "ORD", departs_at: "2026-08-10T14:30:00Z", arrives_at: "2026-08-10T15:45:00Z" },
+    { id: 2, type: "flight", flight_number: "UA3403", origin: "PIT", destination: "ORD", departs_at: "2026-08-10T14:30:00Z", arrives_at: "2026-08-10T16:20:00Z" },
+  ];
+  const { kept, removed } = dedupeCodeshares(legs);
+  assert.strictEqual(removed.length, 0, "merged despite different arrival times");
+});
+
+t("SAFETY: undated or routeless flights pass through untouched", () => {
+  const legs = [
+    { id: 1, type: "flight", flight_number: "AA4611", origin: "PIT", destination: "ORD" },              // no time
+    { id: 2, type: "flight", flight_number: "UA3403", departs_at: "2026-08-10T14:30:00Z" },             // no route
+  ];
+  const { kept, removed } = dedupeCodeshares(legs);
+  assert.strictEqual(kept.length, 2);
+  assert.strictEqual(removed.length, 0);
 });
 
 console.log(`\n${d}──────────────────────────────────────────────────────────${x}`);

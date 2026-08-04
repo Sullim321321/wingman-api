@@ -42,6 +42,11 @@ const dayOf = (v) => {
   const t = new Date(v).getTime();
   return Number.isNaN(t) ? null : Math.floor(t / 86400000);
 };
+const minuteOf = (v) => {
+  if (v == null || v === "") return null;
+  const t = new Date(v).getTime();
+  return Number.isNaN(t) ? null : Math.floor(t / 60000);
+};
 const isLodging = (l) => l && (LODGING.has(String(l.type || "").toLowerCase()) || !!l.property_name);
 
 // How complete / trustworthy a leg is — used to pick which duplicate to KEEP.
@@ -125,6 +130,55 @@ function dedupeFlights(legs) {
 }
 
 /**
+ * Codeshare identity. Two flight rows are the SAME physical flight — sold under two
+ * carriers' numbers (AA 4611 operated as / marketed as UA 3403) — when they share the
+ * exact route AND the exact departure minute. This is deliberately DIFFERENT from
+ * flightKey(): that one trusts the flight number and so (correctly) keeps genuinely
+ * different flights apart. Here we IGNORE the number, because the number is exactly what
+ * differs in a codeshare. Conservative: requires origin, destination, and a real
+ * departure time. If two rows share route + departure minute they are the same flight —
+ * unless BOTH carry an arrival time and those DISAGREE, which means it isn't one aircraft.
+ */
+function codeshareKey(l) {
+  if (String((l && l.type) || "").toLowerCase() !== "flight") return null;
+  const dep = minuteOf(l && l.departs_at);
+  if (dep == null) return null;
+  const o = String((l && l.origin) || "").toUpperCase().trim();
+  const d = String((l && l.destination) || "").toUpperCase().trim();
+  if (!o || !d) return null;
+  return `${o}|${d}|${dep}`;
+}
+
+/**
+ * Collapse codeshare duplicates — one physical flight imported under two carrier numbers.
+ * Returns { kept, removed }. Keeps the most complete row (legScore). Runs alongside
+ * dedupeFlights, which handles exact same-number duplicates; this handles the cross-number
+ * case flightKey() intentionally leaves alone.
+ */
+function dedupeCodeshares(legs) {
+  const groups = new Map();
+  const passthrough = [];
+  for (const l of legs || []) {
+    const key = codeshareKey(l);
+    if (!key) { passthrough.push(l); continue; }
+    if (!groups.has(key)) groups.set(key, []);
+    groups.get(key).push(l);
+  }
+  const kept = [...passthrough], removed = [];
+  for (const [, group] of groups) {
+    if (group.length < 2) { kept.push(group[0]); continue; }
+    // Safety: if the group carries two or more DIFFERENT arrival times, these aren't the
+    // same aircraft — don't merge any of them.
+    const arrs = new Set(group.map((l) => minuteOf(l.arrives_at)).filter((m) => m != null));
+    if (arrs.size >= 2) { kept.push(...group); continue; }
+    group.sort((a, b) => legScore(b) - legScore(a) || (a.id || 0) - (b.id || 0));
+    kept.push(group[0]);
+    for (const loser of group.slice(1)) removed.push(loser);
+  }
+  return { kept, removed };
+}
+
+/**
  * Flag legs whose date sits far outside the trip's real cluster. Uses the MEDIAN of
  * dated legs as the anchor; anything more than `maxDays` from it is stale. Undated
  * legs are never stale (nothing to judge). With too few dated legs to form a cluster
@@ -138,4 +192,4 @@ function staleLegs(legs, { maxDays = 30 } = {}) {
   return dated.filter((l) => Math.abs(dayOf(l.departs_at) - median) > maxDays);
 }
 
-module.exports = { normalizeProperty, dedupeStays, dedupeFlights, flightKey, staleLegs, legScore };
+module.exports = { normalizeProperty, dedupeStays, dedupeFlights, dedupeCodeshares, flightKey, codeshareKey, staleLegs, legScore };

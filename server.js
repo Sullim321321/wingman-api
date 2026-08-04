@@ -4401,12 +4401,14 @@ app.post("/trips/:id/tidy", async (req, res) => {
     const legs = await sql`SELECT * FROM trip_legs WHERE trip_id = ${req.params.id}`;
     const { removed: dupes } = hygiene.dedupeStays(legs);
     const { removed: dupeFlights } = hygiene.dedupeFlights(legs);
+    const { removed: codeshares } = hygiene.dedupeCodeshares(legs);
     const stale = hygiene.staleLegs(legs);
 
     // Union by id, tagging the reason (a leg can be several; duplicate wins the label).
     const byId = new Map();
     for (const l of dupes) byId.set(l.id, { leg: l, reason: "duplicate" });
     for (const l of dupeFlights) if (!byId.has(l.id)) byId.set(l.id, { leg: l, reason: "duplicate" });
+    for (const l of codeshares) if (!byId.has(l.id)) byId.set(l.id, { leg: l, reason: "duplicate" });
     for (const l of stale) if (!byId.has(l.id)) byId.set(l.id, { leg: l, reason: "stale" });
     const toRemove = [...byId.values()];
 
