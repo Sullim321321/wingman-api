@@ -3962,6 +3962,7 @@ app.get("/trips", async (req, res) => {
             'arrives_at',       tl.arrives_at,
             'confirmation',     tl.confirmation,
             'status',           tl.status,
+            'state',            tl.state,
             'nights',           tl.nights,
             'guests',           tl.guests,
             'station_from',     tl.station_from,
