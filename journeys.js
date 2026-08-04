@@ -25,16 +25,94 @@ const toTime = (v) => {
   return Number.isNaN(t) ? null : t;
 };
 
-// Normalize a home-airports value (array, JSON string, or CSV) into an uppercase code Set.
+// City / metro → its airports. "Usually JFK" is still home when you land at EWR or LGA —
+// home is a METRO, not one airport. This covers the multi-airport metros where it matters
+// (a sister-airport arrival must still count as home) plus common single-airport home cities.
+// Unknown cities resolve to nothing — we never guess a city's airports.
+const METRO_AIRPORTS = {
+  "NEW YORK": ["JFK", "LGA", "EWR"],
+  "LONDON": ["LHR", "LGW", "LCY", "STN", "LTN"],
+  "PARIS": ["CDG", "ORY"],
+  "TOKYO": ["HND", "NRT"],
+  "CHICAGO": ["ORD", "MDW"],
+  "WASHINGTON": ["IAD", "DCA", "BWI"],
+  "SAN FRANCISCO": ["SFO", "OAK", "SJC"],
+  "BAY AREA": ["SFO", "OAK", "SJC"],
+  "LOS ANGELES": ["LAX", "BUR", "LGB", "SNA", "ONT"],
+  "MILAN": ["MXP", "LIN", "BGY"],
+  "ROME": ["FCO", "CIA"],
+  "BERLIN": ["BER"],
+  "HOUSTON": ["IAH", "HOU"],
+  "DALLAS": ["DFW", "DAL"],
+  "TORONTO": ["YYZ", "YTZ"],
+  "MONTREAL": ["YUL"],
+  "MIAMI": ["MIA", "FLL"],
+  "BOSTON": ["BOS"],
+  "STOCKHOLM": ["ARN", "BMA", "NYO"],
+  "MOSCOW": ["SVO", "DME", "VKO"],
+  "ISTANBUL": ["IST", "SAW"],
+  "SEOUL": ["ICN", "GMP"],
+  "TOKYO METRO": ["HND", "NRT"],
+  "OSAKA": ["KIX", "ITM"],
+  "SHANGHAI": ["PVG", "SHA"],
+  "BANGKOK": ["BKK", "DMK"],
+  "SAO PAULO": ["GRU", "CGH"],
+  "BUENOS AIRES": ["EZE", "AEP"],
+  "AMSTERDAM": ["AMS"],
+  "SINGAPORE": ["SIN"],
+  "HONG KONG": ["HKG"],
+  "DUBAI": ["DXB", "DWC"],
+  "SYDNEY": ["SYD"],
+  "PITTSBURGH": ["PIT"],
+  "NASHVILLE": ["BNA"],
+  "SAN JOSE": ["SJC"],
+};
+const CITY_ALIASES = {
+  "NYC": "NEW YORK", "NEW YORK CITY": "NEW YORK", "MANHATTAN": "NEW YORK", "BROOKLYN": "NEW YORK",
+  "LDN": "LONDON",
+  "SF": "SAN FRANCISCO", "SAN FRAN": "SAN FRANCISCO",
+  "LA": "LOS ANGELES",
+  "DC": "WASHINGTON", "WASHINGTON DC": "WASHINGTON", "D.C.": "WASHINGTON",
+};
+
+// Normalize home input (array / JSON string / comma list of airport CODES and/or CITY names)
+// into an uppercase airport-code Set. Codes pass through; city names expand via the metro map.
+// NOTE: split on commas only, never whitespace — city names contain spaces ("New York").
 function homeSetOf(homeAirports) {
   let arr = homeAirports;
   if (typeof arr === "string") {
-    try { arr = JSON.parse(arr); } catch { arr = arr.split(/[,\s]+/); }
+    try { arr = JSON.parse(arr); } catch { arr = arr.split(","); }
   }
   if (!Array.isArray(arr)) arr = arr ? [arr] : [];
-  return new Set(
-    arr.map((c) => String(c || "").toUpperCase().trim()).filter((c) => /^[A-Z]{3}$/.test(c))
-  );
+  const out = new Set();
+  for (const raw of arr) {
+    const tok = String(raw || "").toUpperCase().trim();
+    if (!tok) continue;
+    // City / alias FIRST — a short alias like "NYC" or "LDN" is 3 letters and would otherwise
+    // be mistaken for an airport code.
+    const metro = METRO_AIRPORTS[CITY_ALIASES[tok] || tok];
+    if (metro) { metro.forEach((c) => out.add(c)); continue; }
+    if (/^[A-Z]{3}$/.test(tok)) { out.add(tok); continue; }          // a bare airport code
+    // unknown city → contributes nothing (we won't guess its airports)
+  }
+  return out;
+}
+
+// Which of the given home entries we COULDN'T resolve to airports — so we can tell the user
+// honestly instead of silently ignoring "Reykjavík" or a typo. (Foundation: fail honestly.)
+function unresolvedHomeCities(homeAirports) {
+  let arr = homeAirports;
+  if (typeof arr === "string") { try { arr = JSON.parse(arr); } catch { arr = arr.split(","); } }
+  if (!Array.isArray(arr)) arr = arr ? [arr] : [];
+  const bad = [];
+  for (const raw of arr) {
+    const tok = String(raw || "").toUpperCase().trim();
+    if (!tok) continue;
+    if (METRO_AIRPORTS[CITY_ALIASES[tok] || tok]) continue;
+    if (/^[A-Z]{3}$/.test(tok)) continue;
+    bad.push(String(raw).trim());
+  }
+  return bad;
 }
 
 const isTransport = (l) => AIRPORTy.has(String((l && l.type) || "").toLowerCase());
@@ -182,5 +260,6 @@ function auditGrouping(trips, homeAirports) {
 }
 
 module.exports = {
-  homeSetOf, legArrivesHome, tripEndsHome, planTripMerges, unionClustersByHome, auditGrouping,
+  homeSetOf, unresolvedHomeCities, legArrivesHome, tripEndsHome,
+  planTripMerges, unionClustersByHome, auditGrouping,
 };

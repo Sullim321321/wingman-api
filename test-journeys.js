@@ -9,7 +9,7 @@
 // (each returning home) stay apart, and a huge gap never welds trips together.
 
 const assert = require("assert");
-const { homeSetOf, tripEndsHome, planTripMerges, unionClustersByHome, auditGrouping } = require("./journeys");
+const { homeSetOf, tripEndsHome, planTripMerges, unionClustersByHome, auditGrouping, unresolvedHomeCities } = require("./journeys");
 
 const g = "\x1b[32m", r = "\x1b[31m", d = "\x1b[2m", b = "\x1b[1m", x = "\x1b[0m";
 let pass = 0, fail = 0;
@@ -22,12 +22,45 @@ const F = (o, dst, dep, arr) => ({ type: "flight", origin: o, destination: dst, 
 
 console.log(`\n${b}homeSetOf — parse the many shapes home_airports arrives in${x}`);
 console.log(`${d}──────────────────────────────────────────────────────────${x}`);
-t("array, JSON string, and CSV all normalize to a 3-letter code set", () => {
+t("airport codes (array, JSON string, comma list) normalize to a code set", () => {
   assert.deepStrictEqual([...homeSetOf(["pit"])], ["PIT"]);
   assert.deepStrictEqual([...homeSetOf('["PIT","JFK"]')], ["PIT", "JFK"]);
   assert.deepStrictEqual([...homeSetOf("PIT, jfk")], ["PIT", "JFK"]);
   assert.strictEqual(homeSetOf(null).size, 0);
-  assert.strictEqual(homeSetOf(["Pittsburgh"]).size, 0, "non-code junk was let through");
+});
+
+t("home CITIES expand to all their metro airports", () => {
+  assert.deepStrictEqual([...homeSetOf(["New York"])].sort(), ["EWR", "JFK", "LGA"]);
+  assert.ok(homeSetOf(["London"]).has("LHR") && homeSetOf(["London"]).has("LGW") && homeSetOf(["London"]).has("LCY"));
+});
+
+t("Maddie's real homes — New York + London — cover every home-area airport", () => {
+  const s = homeSetOf(["New York", "London"]);
+  for (const code of ["JFK", "LGA", "EWR", "LHR", "LGW", "LCY"]) assert.ok(s.has(code), `${code} missing from home set`);
+});
+
+t("cities and codes mix; aliases and case are handled", () => {
+  const s = homeSetOf(["nyc", "LHR"]);
+  assert.ok(s.has("JFK") && s.has("EWR") && s.has("LHR"));
+});
+
+t("an unknown home city resolves to nothing AND is reported honestly", () => {
+  assert.strictEqual(homeSetOf(["Atlantis"]).size, 0);
+  assert.deepStrictEqual(unresolvedHomeCities(["New York", "Atlantis"]), ["Atlantis"]);
+});
+
+t("EWR counts as home when New York is home — the Pittsburgh-split correction", () => {
+  const home = homeSetOf(["New York", "London"]);
+  // The Nashville journey ends BNA→EWR (arrives NY = home); the EWR→PIT leg is a SEPARATE trip.
+  const nyTrip = { id: 1, title: "Nashville", legs: [
+    F("LGA", "BNA", "2026-07-17T13:00:00Z", "2026-07-17T15:00:00Z"),
+    F("BNA", "EWR", "2026-07-27T12:00:00Z", "2026-07-27T15:00:00Z"),   // home
+  ] };
+  const pitTrip = { id: 2, title: "Pittsburgh", legs: [
+    F("EWR", "PIT", "2026-07-30T12:00:00Z", "2026-07-30T14:00:00Z"),
+  ] };
+  assert.strictEqual(tripEndsHome(nyTrip, home), true, "arriving EWR should count as home");
+  assert.strictEqual(planTripMerges([nyTrip, pitTrip], home).length, 0, "Pittsburgh must NOT merge into the NY trip");
 });
 
 console.log(`\n${b}The Nashville over-split → one journey (repair)${x}`);
