@@ -76,6 +76,24 @@ t("a clean day with known-good weather has no risks", () => {
   assert.strictEqual(risks.length, 0);
 });
 
+// bags (I2) — honest risk, never a status claim
+const { bagRisk } = require("./dayrisk");
+t("a high tight connection raises a checked-bag caution", () => {
+  const risks = assessDay({
+    flights: [
+      F("2026-08-10T12:00:00Z", "2026-08-10T13:30:00Z"),
+      F("2026-08-10T13:40:00Z", "2026-08-10T15:00:00Z"), // 10 min → high
+    ],
+    minConnMins: 45,
+  });
+  assert.ok(risks.some((r) => r.kind === "bag"));
+  assert.ok(risks.some((r) => r.kind === "bag" && /checked bag/i.test(r.why) && !/where your bag/i.test(r.why)));
+});
+t("a merely-medium connection raises no bag caution", () => {
+  assert.strictEqual(bagRisk([{ kind: "tight_connection", severity: "medium" }]).length, 0);
+});
+t("no connection → no bag risk", () => assert.strictEqual(bagRisk([]).length, 0));
+
 console.log("\n" + "─".repeat(58));
 console.log(fail ? `\x1b[31m${fail} FAILED\x1b[0m, ${pass} passed` : `\x1b[32mall ${pass} passed\x1b[0m`);
 process.exit(fail ? 1 : 0);

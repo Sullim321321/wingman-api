@@ -46,6 +46,22 @@ function tightConnections(flights, minConnMins = 45) {
 }
 
 /**
+ * Bag risk (I2). Honest without a tracking feed: we do NOT claim to know where your bag is.
+ * We reason about it — a checked bag on a tight connection is the first thing that misses the
+ * plane. So on a HIGH-severity tight connection we raise one conditional caution ("if you
+ * checked a bag…"). No feed, no assertion of status — just the risk, stated as a risk.
+ */
+function bagRisk(tightConns) {
+  const worst = (tightConns || []).some((c) => c.severity === "high");
+  if (!worst) return [];
+  return [{
+    kind: "bag",
+    severity: "medium",
+    why: "On a connection this tight, a checked bag often doesn't transfer in time — carry-on is the safer bet.",
+  }];
+}
+
+/**
  * Weather risk at a relevant airport. `null` weather → unknown (we can't see it), not calm.
  * Only genuinely disruptive conditions raise a risk; a cloudy day is not news.
  */
@@ -71,11 +87,12 @@ function weatherRisk(weather, airportLabel = null) {
  * @param minConnMins traveler's comfort (default 45)
  */
 function assessDay({ flights = [], weather = undefined, weatherLabel = null, minConnMins = 45 } = {}) {
-  const risks = [...tightConnections(flights, minConnMins)];
+  const conns = tightConnections(flights, minConnMins);
+  const risks = [...conns, ...bagRisk(conns)];
   // weather === undefined → caller has no weather to offer, skip it entirely.
   // weather === null → we LOOKED and couldn't see it, which is an honest `unknown` risk.
   if (weather !== undefined) risks.push(...weatherRisk(weather, weatherLabel));
   return risks.sort((a, b) => (RANK[b.severity] || 0) - (RANK[a.severity] || 0));
 }
 
-module.exports = { assessDay, tightConnections, weatherRisk, RANK };
+module.exports = { assessDay, tightConnections, bagRisk, weatherRisk, RANK };
