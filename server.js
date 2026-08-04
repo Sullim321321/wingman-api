@@ -7510,8 +7510,16 @@ app.get("/calendar/travel", async (req, res) => {
       return matches[0].property_name;
     };
 
+    // The traveler's home airport anchors an inferred trip's origin — reliable, and it stops
+    // a shaky geocode from proposing a foreign departure (the LIS→EWR-for-a-Pittsburgher bug).
+    const homeRows = await sql`SELECT home_airports FROM users WHERE email = ${email}`;
+    const ha = homeRows[0]?.home_airports;
+    const homeAirport = Array.isArray(ha) && ha.length
+      ? (typeof ha[0] === "string" ? ha[0] : (ha[0]?.code || ha[0]?.iata || null))
+      : null;
+
     // Fill in each proposed trip with a skeleton — fly-in/out targets, nights, hotel.
-    const trips = grouped.trips.map((t) => ({ ...t, itinerary: proposeItinerary(t, { current, hotelOf }) }));
+    const trips = grouped.trips.map((t) => ({ ...t, itinerary: proposeItinerary(t, { current, homeAirport, hotelOf }) }));
 
     // Answerable asks: attach a stable resolve key to each single-driver ask, and drop
     // any the user has already answered so it never nags again.

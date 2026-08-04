@@ -73,10 +73,17 @@ function proposeItinerary(trip, opts = {}) {
 
   const gaps = [];
   const destAir = airportOf(trip.destination);
-  const fromAir = current && current.city ? airportOf(current.city) : null;
+  // Origin for a calendar-IMPLIED trip: anchor on the traveler's HOME airport (user-set,
+  // reliable) first, then their current location. Guessing a foreign origin from a shaky
+  // geocode is how a Pittsburgh traveler ended up with a proposed LIS→EWR flight.
+  const homeAir = opts.homeAirport
+    ? (airportOf(opts.homeAirport) || { code: String(opts.homeAirport).toUpperCase().slice(0, 3) })
+    : null;
+  const currentAir = current && current.city ? airportOf(current.city) : null;
+  const fromAir = homeAir || currentAir;
   if (!fromAir) gaps.push(current && current.city
     ? `couldn't map "${current.city}" to an airport`
-    : "I don't know your home airport (need where you are)");
+    : "I don't know your home airport — set it in Travel profile");
   if (!destAir) gaps.push(`couldn't map "${trip.destination}" to an airport`);
 
   // ── flight in ──────────────────────────────────────────────────────────────
